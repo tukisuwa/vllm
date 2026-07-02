@@ -332,6 +332,10 @@ Implemented so far:
   - adds AutoWeightsLoader-compatible quant cache-scale mapper composition
   - adds module quant-config ignored suffixes
   - keeps model hooks small and consistent across dense model families
+- `vllm/model_executor/models/auto_uma.py`
+  - shared model-side helpers for dense AutoWeightsLoader-style source hooks
+  - keeps model files from depending directly on generic executor internals
+  - is used by Qwen2, Qwen3, Llama, OLMo, OLMo2, Nemotron, EXAONE, and Cohere
 - shared routed-MoE model helper
   - keeps per-family parsing and module resolution in model-side files
   - centralizes local-expert skip decisions and existing FusedMoE/RoutedExperts
@@ -388,8 +392,9 @@ Requirements:
 
 Remaining:
 
-- implement the first real model-side `build_weight_plan(...)`
-- decide where generic helpers should live once more than one model uses them
+- validate the current model-side `build_weight_plan(...)` hooks on more real
+  checkpoints
+- expand shared model-side helpers only where behavior is genuinely common
 - add broader tests around actual vLLM parameter loaders
 
 ### Phase 3: Dense model prototype
@@ -412,6 +417,8 @@ Target behavior:
   OLMo2, and EXAONE where their existing loader skips it
 - plan skips static non-payload entries such as Cohere `rotary_emb.inv_freq`
 - plan skips rotary/cache tensors: implemented through shared auto-plan helper
+- dense model hooks use the shared `auto_uma` model-side helper instead of
+  calling generic executor internals directly
 - plan maps q/k/v into qkv placement before read: implemented through
   `hf_to_vllm_mapper` and `shard_id`
 - plan maps gate/up into gate_up placement before read: implemented for Llama

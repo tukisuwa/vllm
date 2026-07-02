@@ -48,8 +48,6 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
     TensorCatalog,
     WeightPlan,
-    build_auto_weight_plan_for_module,
-    execute_weight_plan,
 )
 from vllm.model_executor.model_loader.weight_utils import (
     row_parallel_weight_loader,
@@ -58,6 +56,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from .auto_uma import build_auto_uma_weight_plan, load_auto_uma_weights_from_source
 from .interfaces import SupportsLoRA, SupportsPP, SupportsQuant
 from .utils import (
     AutoWeightsLoader,
@@ -426,7 +425,7 @@ class CohereForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsQuant):
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
-        return build_auto_weight_plan_for_module(
+        return build_auto_uma_weight_plan(
             self,
             catalog,
             mapper=self.hf_to_vllm_mapper,
@@ -438,4 +437,4 @@ class CohereForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsQuant):
         source: ODirectSafetensorsWeightSource,
         plan: WeightPlan,
     ) -> set[str]:
-        return execute_weight_plan(self, source, plan)
+        return load_auto_uma_weights_from_source(self, source, plan)

@@ -56,8 +56,6 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
     TensorCatalog,
     WeightPlan,
-    build_auto_weight_plan_for_module,
-    execute_weight_plan,
 )
 from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (
@@ -69,6 +67,8 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
+
+from .auto_uma import build_auto_uma_weight_plan, load_auto_uma_weights_from_source
 
 
 class Olmo2Attention(nn.Module):
@@ -427,7 +427,7 @@ class Olmo2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
-        return build_auto_weight_plan_for_module(
+        return build_auto_uma_weight_plan(
             self,
             catalog,
             mapper=self.hf_to_vllm_mapper,
@@ -441,4 +441,4 @@ class Olmo2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
         source: ODirectSafetensorsWeightSource,
         plan: WeightPlan,
     ) -> set[str]:
-        return execute_weight_plan(self, source, plan)
+        return load_auto_uma_weights_from_source(self, source, plan)

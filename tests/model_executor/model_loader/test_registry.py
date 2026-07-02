@@ -1533,11 +1533,11 @@ def test_qwen3_build_weight_plan_uses_quant_cache_mapper_and_ignore_suffixes(
 def test_qwen3_load_weights_from_source_delegates_to_executor(monkeypatch):
     calls = []
 
-    def fake_execute(model, source, plan):
+    def fake_load(model, source, plan):
         calls.append((model, source, plan))
         return {"loaded"}
 
-    monkeypatch.setattr(qwen3, "execute_weight_plan", fake_execute)
+    monkeypatch.setattr(qwen3, "load_auto_uma_weights_from_source", fake_load)
     model = object()
     source = object()
     plan = WeightPlan(())
@@ -1594,11 +1594,11 @@ def test_qwen2_build_weight_plan_uses_catalog_mapper_and_tie_skip(tmp_path):
 def test_qwen2_load_weights_from_source_delegates_to_executor(monkeypatch):
     calls = []
 
-    def fake_execute(model, source, plan):
+    def fake_load(model, source, plan):
         calls.append((model, source, plan))
         return {"loaded"}
 
-    monkeypatch.setattr(qwen2, "execute_weight_plan", fake_execute)
+    monkeypatch.setattr(qwen2, "load_auto_uma_weights_from_source", fake_load)
     model = object()
     source = object()
     plan = WeightPlan(())
@@ -1701,11 +1701,11 @@ def test_llama_build_weight_plan_uses_quant_cache_mapper_and_ignore_suffixes(
 def test_llama_load_weights_from_source_delegates_to_executor(monkeypatch):
     calls = []
 
-    def fake_execute(model, source, plan):
+    def fake_load(model, source, plan):
         calls.append((model, source, plan))
         return {"loaded"}
 
-    monkeypatch.setattr(llama, "execute_weight_plan", fake_execute)
+    monkeypatch.setattr(llama, "load_auto_uma_weights_from_source", fake_load)
     model = object()
     source = object()
     plan = WeightPlan(())
@@ -1762,11 +1762,11 @@ def test_olmo2_build_weight_plan_uses_catalog_mapper_and_tie_skip(tmp_path):
 def test_olmo2_load_weights_from_source_delegates_to_executor(monkeypatch):
     calls = []
 
-    def fake_execute(model, source, plan):
+    def fake_load(model, source, plan):
         calls.append((model, source, plan))
         return {"loaded"}
 
-    monkeypatch.setattr(olmo2, "execute_weight_plan", fake_execute)
+    monkeypatch.setattr(olmo2, "load_auto_uma_weights_from_source", fake_load)
     model = object()
     source = object()
     plan = WeightPlan(())
@@ -1842,11 +1842,11 @@ def test_more_dense_load_weights_from_source_delegates_to_executor(
 ):
     calls = []
 
-    def fake_execute(model, source, plan):
+    def fake_load(model, source, plan):
         calls.append((model, source, plan))
         return {"loaded"}
 
-    monkeypatch.setattr(module, "execute_weight_plan", fake_execute)
+    monkeypatch.setattr(module, "load_auto_uma_weights_from_source", fake_load)
     model = object()
     source = object()
     plan = WeightPlan(())
@@ -1945,11 +1945,11 @@ def test_commandr_build_weight_plan_uses_catalog_mapper_and_static_skips(tmp_pat
 def test_commandr_load_weights_from_source_delegates_to_executor(monkeypatch):
     calls = []
 
-    def fake_execute(model, source, plan):
+    def fake_load(model, source, plan):
         calls.append((model, source, plan))
         return {"loaded"}
 
-    monkeypatch.setattr(commandr, "execute_weight_plan", fake_execute)
+    monkeypatch.setattr(commandr, "load_auto_uma_weights_from_source", fake_load)
     model = object()
     source = object()
     plan = WeightPlan(())

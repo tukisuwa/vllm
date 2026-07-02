@@ -54,11 +54,10 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
     TensorCatalog,
     WeightPlan,
-    build_auto_weight_plan_for_module,
-    execute_weight_plan,
 )
 from vllm.sequence import IntermediateTensors
 
+from .auto_uma import build_auto_uma_weight_plan, load_auto_uma_weights_from_source
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
@@ -463,7 +462,7 @@ class ExaoneForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
-        return build_auto_weight_plan_for_module(
+        return build_auto_uma_weight_plan(
             self,
             catalog,
             mapper=self.hf_to_vllm_mapper,
@@ -475,4 +474,4 @@ class ExaoneForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         source: ODirectSafetensorsWeightSource,
         plan: WeightPlan,
     ) -> set[str]:
-        return execute_weight_plan(self, source, plan)
+        return load_auto_uma_weights_from_source(self, source, plan)

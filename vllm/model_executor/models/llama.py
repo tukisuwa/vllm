@@ -56,13 +56,12 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
     TensorCatalog,
     WeightPlan,
-    build_auto_weight_plan_for_module,
-    execute_weight_plan,
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 
 from .adapters import as_embedding_model, as_seq_cls_model
+from .auto_uma import build_auto_uma_weight_plan, load_auto_uma_weights_from_source
 from .interfaces import (
     EagleModelMixin,
     LocalArgmaxMixin,
@@ -547,7 +546,7 @@ class LlamaForCausalLM(
         return loader.load_weights(weights)
 
     def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
-        return build_auto_weight_plan_for_module(
+        return build_auto_uma_weight_plan(
             self,
             catalog,
             mapper=self.hf_to_vllm_mapper,
@@ -559,7 +558,7 @@ class LlamaForCausalLM(
         source: ODirectSafetensorsWeightSource,
         plan: WeightPlan,
     ) -> set[str]:
-        return execute_weight_plan(self, source, plan)
+        return load_auto_uma_weights_from_source(self, source, plan)
 
 
 class LlamaBidirectionalForSequenceClassification(as_seq_cls_model(LlamaForCausalLM)):
