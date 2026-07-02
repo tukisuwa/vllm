@@ -344,8 +344,18 @@ def _resolve_attr(root: object, path: str) -> object:
 def _infer_output_dim_source_slice(
     param: object,
     record: TensorMeta,
+    *,
+    shard_id: int | str | tuple[int, ...] | None = None,
+    weight_loader: Callable | None = None,
 ) -> tuple[slice | int, ...] | None:
-    """Infer a safe source-side TP row slice for simple output-sharded params."""
+    """Infer a safe source-side TP row slice for output-sharded params.
+
+    vLLM fused loaders (QKV/MergedColumn) normally receive a full checkpoint
+    shard and narrow it to this rank. If we can prove the source tensor is
+    exactly ``tp_size`` copies of the local shard along output dim, we can read
+    only this rank's source rows and temporarily mark the input as already
+    sharded before delegating to the existing weight_loader.
+    """
 
     output_dim = getattr(param, "output_dim", None)
     if output_dim != 0:
@@ -371,7 +381,15 @@ def _infer_output_dim_source_slice(
     if tp_size <= 1 or tp_rank < 0 or tp_rank >= tp_size:
         return None
 
-    shard_size = param_shape[output_dim]
+    shard_size = _infer_output_dim_local_shard_size(
+        param,
+        record,
+        shard_id=shard_id,
+        weight_loader=weight_loader,
+        param_output_size=param_shape[output_dim],
+    )
+    if shard_size is None:
+        return None
     if shard_size <= 0:
         return None
     if record.shape[output_dim] != shard_size * tp_size:
@@ -384,6 +402,49 @@ def _infer_output_dim_source_slice(
 
     start = tp_rank * shard_size
     return (slice(start, start + shard_size), *([slice(None)] * (len(param_shape) - 1)))
+
+
+def _infer_output_dim_local_shard_size(
+    param: object,
+    record: TensorMeta,
+    *,
+    shard_id: int | str | tuple[int, ...] | None,
+    weight_loader: Callable | None,
+    param_output_size: int,
+) -> int | None:
+    if shard_id is None:
+        return param_output_size
+
+    if isinstance(shard_id, tuple):
+        return None
+
+    owner = getattr(weight_loader, "__self__", None)
+    if owner is None:
+        return None
+
+    get_size = getattr(owner, "_get_shard_size_mapping", None)
+    if callable(get_size):
+        try:
+            shard_size = get_size(shard_id)
+        except Exception:
+            shard_size = None
+        if isinstance(shard_size, int) and shard_size > 0:
+            if shard_size <= param_output_size:
+                return shard_size
+            return None
+
+    if isinstance(shard_id, int):
+        output_sizes = getattr(owner, "output_sizes", None)
+        if isinstance(output_sizes, (list, tuple)) and 0 <= shard_id < len(output_sizes):
+            total_size = output_sizes[shard_id]
+            tp_size = getattr(param, "tp_size", None)
+            if isinstance(total_size, int) and isinstance(tp_size, int):
+                if tp_size > 1 and total_size > 0 and total_size % tp_size == 0:
+                    shard_size = total_size // tp_size
+                    if shard_size <= param_output_size:
+                        return shard_size
+
+    return None
 
 
 def _call_weight_loader(
@@ -432,12 +493,20 @@ def execute_weight_plan(
                 continue
             raise
 
+        weight_loader = getattr(param, "weight_loader", None)
+        if not callable(weight_loader):
+            raise RuntimeError(
+                f"Weight plan target {entry.target_name!r} has no weight_loader"
+            )
+
         source_slices = entry.source_slices
         source_is_sharded = entry.source_is_sharded
-        if source_slices is None and entry.shard_id is None:
+        if source_slices is None:
             source_slices = _infer_output_dim_source_slice(
                 param,
                 source.catalog.get(entry.checkpoint_name),
+                shard_id=entry.shard_id,
+                weight_loader=weight_loader,
             )
             source_is_sharded = source_slices is not None
 
@@ -445,12 +514,6 @@ def execute_weight_plan(
             tensor = source.read_full_cpu(entry.checkpoint_name)
         else:
             tensor = source.read_slice_cpu(entry.checkpoint_name, source_slices)
-
-        weight_loader = getattr(param, "weight_loader", None)
-        if not callable(weight_loader):
-            raise RuntimeError(
-                f"Weight plan target {entry.target_name!r} has no weight_loader"
-            )
 
         kwargs = {}
         if entry.shard_id is not None:

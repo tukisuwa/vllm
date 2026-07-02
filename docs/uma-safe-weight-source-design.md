@@ -382,9 +382,12 @@ Target behavior:
 - plan includes AutoWeightsLoader-compatible quant cache-scale mapper and
   ignored suffix handling for Qwen3 and Llama
 - plan can read only local TP shard where possible: implemented for simple
-  output-dimension row shards where the source slice is contiguous; fused
-  q/k/v, gate/up, packed, and input-dimension shards still fall back to full
-  tensor reads
+  output-dimension row shards where the source slice is contiguous
+- plan can also source-slice single `shard_id` fused output shards when the
+  bound vLLM weight loader exposes a local shard-size mapping, covering QKV-like
+  q/k/v and MergedColumn-like gate/up cases in the non-packed path
+- packed, bitsandbytes, tuple/multi-shard fused entries, unknown fused loaders,
+  and input-dimension shards still fall back to full tensor reads
 
 Current limitations:
 
