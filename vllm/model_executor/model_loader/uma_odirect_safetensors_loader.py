@@ -716,17 +716,18 @@ def execute_weight_plan(
             )
             source_is_sharded = source_slices is not None
 
-        if entry.target_slices is not None:
+        if entry.target_slices is not None and not entry.read_into_cpu:
             raise RuntimeError(
-                "WeightPlanEntry.target_slices requires a caller-provided "
-                f"destination tensor and is not supported by execute_weight_plan: "
-                f"{entry.checkpoint_name}"
+                "WeightPlanEntry.target_slices is only supported with "
+                f"read_into_cpu=True: {entry.checkpoint_name}"
             )
 
         if entry.read_into_cpu:
             tensor = source.empty_cpu(
                 entry.checkpoint_name,
-                source_slices=source_slices,
+                source_slices=None
+                if entry.target_slices is not None
+                else source_slices,
             )
             source.read_into_cpu(
                 entry.checkpoint_name,

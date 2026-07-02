@@ -1042,6 +1042,118 @@ def test_uma_odirect_execute_weight_plan_can_read_into_cpu(tmp_path, monkeypatch
     assert stats["tensors_read_sliced"] == 1
 
 
+def test_uma_odirect_execute_weight_plan_can_read_into_target_slice(
+    tmp_path, monkeypatch
+):
+    metadata = {
+        "rows": {"dtype": "F32", "shape": [4, 2], "data_offsets": [0, 32]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 32)
+    calls = []
+
+    class FakeODirectFile:
+        window_size = 64 * 1024 * 1024
+
+        def __init__(self, *_args):
+            self.direct_reads = 0
+            self.window_loads = 0
+            self.window_hits = 0
+            self.bytes_read = 0
+            self.bytes_copied = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback):
+            pass
+
+        def read_record_into_tensor(self, tensor, offset, size, gate=None):
+            calls.append((offset, size, tuple(tensor.shape)))
+            self.direct_reads += 1
+            self.bytes_read += size
+            self.bytes_copied += size
+            tensor.fill_(7)
+            if gate is not None:
+                gate(size)
+
+    class FakeParam:
+        def __init__(self):
+            self.loaded = []
+
+        def weight_loader(self, param, tensor, **kwargs):
+            assert param is self
+            self.loaded.append((tensor.clone(), kwargs))
+
+    class FakeModel:
+        def __init__(self):
+            self.param = FakeParam()
+
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(load_format="uma_odirect_safetensors")
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.uma_odirect_safetensors_loader."
+        "_ODirectFile",
+        FakeODirectFile,
+    )
+    source = ODirectSafetensorsWeightSource(loader, str(tmp_path))
+    model = FakeModel()
+    plan = WeightPlan(
+        (
+            WeightPlanEntry(
+                "rows",
+                "param",
+                source_slices=(slice(1, 3), slice(None)),
+                target_slices=(slice(0, 2), slice(None)),
+                read_into_cpu=True,
+            ),
+        )
+    )
+
+    loaded = execute_weight_plan(model, source, plan)
+
+    rows_record = source.catalog.get("rows")
+    assert loaded == {"param"}
+    assert calls == [(rows_record.offset + 8, 16, (2, 2))]
+    loaded_tensor = model.param.loaded[0][0]
+    assert list(loaded_tensor.shape) == [4, 2]
+    assert loaded_tensor[:2].tolist() == [[7.0, 7.0], [7.0, 7.0]]
+    stats = source.stats_snapshot()
+    assert stats["tensors_read_sliced"] == 1
+
+
+def test_uma_odirect_execute_weight_plan_rejects_target_slices_without_read_into(
+    tmp_path,
+):
+    metadata = {
+        "rows": {"dtype": "F32", "shape": [4, 2], "data_offsets": [0, 32]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 32)
+
+    class FakeModel:
+        param = torch.nn.Parameter(torch.empty(4, 2))
+
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(load_format="uma_odirect_safetensors")
+    )
+    source = ODirectSafetensorsWeightSource(loader, str(tmp_path))
+    plan = WeightPlan(
+        (
+            WeightPlanEntry(
+                "rows",
+                "param",
+                target_slices=(slice(0, 2), slice(None)),
+            ),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="target_slices.*read_into_cpu"):
+        execute_weight_plan(FakeModel(), source, plan)
+
+
 def test_uma_odirect_execute_weight_plan_applies_transform(tmp_path, monkeypatch):
     metadata = {
         "weight": {"dtype": "F32", "shape": [2], "data_offsets": [0, 8]},

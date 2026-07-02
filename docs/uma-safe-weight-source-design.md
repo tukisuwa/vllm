@@ -349,13 +349,18 @@ Implemented so far:
   - fails closed before payload reads for unexpected missing targets
   - supports opt-in `read_into_cpu` entries for caller-controlled CPU staging;
     parameter/device direct placement is still future work
+  - supports `WeightPlanEntry.target_slices` when paired with
+    `read_into_cpu=True`, allowing a model hook to allocate one CPU staging
+    tensor and fill only selected contiguous target views under WeightSource
+    gates
   - supports model-provided tensor transforms after source read and before
     `weight_loader`, keeping special checkpoint transforms such as Mistral
     consolidated-checkpoint q/k permutation out of the storage loader
   - uses `source.empty_cpu(...)` for opt-in CPU staging so allocation gates stay
     under WeightSource control
-  - rejects `WeightPlanEntry.target_slices` for now because the generic executor
-    does not yet own a caller-provided destination tensor
+  - still rejects `WeightPlanEntry.target_slices` without `read_into_cpu=True`
+    because ordinary `weight_loader` calls do not provide a safe destination
+    tensor contract
 - tests for catalog lookup, source construction, full CPU reads, contiguous
   slice reads, source stats, optional model hook dispatch, name-only plan
   building, and basic plan execution
