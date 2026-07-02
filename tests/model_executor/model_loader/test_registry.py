@@ -33,6 +33,7 @@ from vllm.model_executor.models import (
     bloom,
     deepseek_v2,
     exaone,
+    exaone4,
     falcon,
     gemma,
     gemma2,
@@ -40,10 +41,12 @@ from vllm.model_executor.models import (
     gpt_bigcode,
     gpt_j,
     gpt_neox,
+    granite,
     granitemoe,
     granitemoehybrid,
     granitemoeshared,
     internlm2,
+    jais2,
     llama,
     mixtral,
     mistral,
@@ -57,6 +60,7 @@ from vllm.model_executor.models import (
     persimmon,
     phimoe,
     phi,
+    plamo3,
     qwen2,
     qwen2_moe,
     qwen3,
@@ -2660,6 +2664,18 @@ def test_bloom_build_weight_plan_adds_transformer_prefix_and_tie_skip(tmp_path):
             "model.layers.0.self_attn.qkv_proj.weight",
             "k",
         ),
+        (
+            jais2.Jais2ForCausalLM,
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.qkv_proj.weight",
+            "q",
+        ),
+        (
+            exaone4.Exaone4ForCausalLM,
+            "model.layers.0.mlp.up_proj.weight",
+            "model.layers.0.mlp.gate_up_proj.weight",
+            1,
+        ),
     ],
 )
 def test_more_dense_compat_hooks_apply_mapper(
@@ -2722,7 +2738,15 @@ def test_plain_dense_build_weight_plan_uses_auto_mapping(tmp_path, model_cls, na
     assert plan.entries[0].required is True
 
 
-def test_apertus_build_weight_plan_skips_tied_lm_head(tmp_path):
+@pytest.mark.parametrize(
+    "model_cls, mapper",
+    [
+        (apertus.ApertusForCausalLM, apertus.ApertusForCausalLM.hf_to_vllm_mapper),
+        (granite.GraniteForCausalLM, None),
+        (plamo3.Plamo3ForCausalLM, None),
+    ],
+)
+def test_dense_build_weight_plan_skips_tied_lm_head(tmp_path, model_cls, mapper):
     metadata = {
         "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
         "model.layers.0.self_attn.q_proj.weight": {
@@ -2741,21 +2765,27 @@ def test_apertus_build_weight_plan_skips_tied_lm_head(tmp_path):
     class FakeConfig:
         tie_word_embeddings = True
 
-    class FakeApertus:
+    class FakeModel:
         config = FakeConfig()
-        hf_to_vllm_mapper = apertus.ApertusForCausalLM.hf_to_vllm_mapper
+        hf_to_vllm_mapper = mapper
 
         def children(self):
             return []
 
-    plan = apertus.ApertusForCausalLM.build_weight_plan(FakeApertus(), catalog)
+    plan = model_cls.build_weight_plan(FakeModel(), catalog)
     entries = {entry.checkpoint_name: entry for entry in plan.entries}
 
     assert entries["lm_head.weight"].required is False
-    assert entries["model.layers.0.self_attn.q_proj.weight"].target_name == (
-        "model.layers.0.self_attn.qkv_proj.weight"
-    )
-    assert entries["model.layers.0.self_attn.q_proj.weight"].shard_id == "q"
+    if mapper is not None:
+        assert entries["model.layers.0.self_attn.q_proj.weight"].target_name == (
+            "model.layers.0.self_attn.qkv_proj.weight"
+        )
+        assert entries["model.layers.0.self_attn.q_proj.weight"].shard_id == "q"
+    else:
+        assert entries["model.layers.0.self_attn.q_proj.weight"].target_name == (
+            "model.layers.0.self_attn.q_proj.weight"
+        )
+        assert entries["model.layers.0.self_attn.q_proj.weight"].shard_id is None
 
 
 @pytest.mark.parametrize(
@@ -2773,6 +2803,10 @@ def test_apertus_build_weight_plan_skips_tied_lm_head(tmp_path):
         (solar.SolarForCausalLM, solar),
         (gpt_neox.GPTNeoXForCausalLM, gpt_neox),
         (persimmon.PersimmonForCausalLM, persimmon),
+        (granite.GraniteForCausalLM, granite),
+        (jais2.Jais2ForCausalLM, jais2),
+        (exaone4.Exaone4ForCausalLM, exaone4),
+        (plamo3.Plamo3ForCausalLM, plamo3),
     ],
 )
 def test_more_dense_compat_load_weights_from_source_delegates_to_executor(
