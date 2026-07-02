@@ -26,6 +26,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     execute_weight_plan,
 )
 from vllm.model_executor.models import (
+    apertus,
     commandr,
     cohere2_moe,
     deepseek_uma,
@@ -60,6 +61,7 @@ from vllm.model_executor.models import (
     qwen3_5,
     qwen3_moe,
     qwen3_next,
+    step1,
     starcoder2,
 )
 from vllm.model_executor.models.utils import PPMissingLayer, WeightsMapper
@@ -2630,6 +2632,18 @@ def test_bloom_build_weight_plan_adds_transformer_prefix_and_tie_skip(tmp_path):
             "model.layers.0.mlp.gate_up_proj.weight",
             0,
         ),
+        (
+            step1.Step1ForCausalLM,
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.qkv_proj.weight",
+            "q",
+        ),
+        (
+            apertus.ApertusForCausalLM,
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.qkv_proj.weight",
+            "v",
+        ),
     ],
 )
 def test_more_dense_compat_hooks_apply_mapper(
@@ -2647,6 +2661,9 @@ def test_more_dense_compat_hooks_apply_mapper(
 
     class FakeModel:
         hf_to_vllm_mapper = model_cls.hf_to_vllm_mapper
+
+        class config:
+            tie_word_embeddings = False
 
         def children(self):
             return []
@@ -2682,6 +2699,42 @@ def test_mpt_build_weight_plan_uses_plain_auto_mapping(tmp_path):
     assert plan.entries[0].required is True
 
 
+def test_apertus_build_weight_plan_skips_tied_lm_head(tmp_path):
+    metadata = {
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "model.layers.0.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 8)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+
+    class FakeApertus:
+        config = FakeConfig()
+        hf_to_vllm_mapper = apertus.ApertusForCausalLM.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = apertus.ApertusForCausalLM.build_weight_plan(FakeApertus(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["lm_head.weight"].required is False
+    assert entries["model.layers.0.self_attn.q_proj.weight"].target_name == (
+        "model.layers.0.self_attn.qkv_proj.weight"
+    )
+    assert entries["model.layers.0.self_attn.q_proj.weight"].shard_id == "q"
+
+
 @pytest.mark.parametrize(
     "model_cls, module",
     [
@@ -2691,6 +2744,8 @@ def test_mpt_build_weight_plan_uses_plain_auto_mapping(tmp_path):
         (gpt_j.GPTJForCausalLM, gpt_j),
         (mpt.MPTForCausalLM, mpt),
         (orion.OrionForCausalLM, orion),
+        (step1.Step1ForCausalLM, step1),
+        (apertus.ApertusForCausalLM, apertus),
     ],
 )
 def test_more_dense_compat_load_weights_from_source_delegates_to_executor(
