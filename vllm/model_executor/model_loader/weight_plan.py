@@ -412,6 +412,27 @@ class WeightPlanSourceModel(WeightPlanBuilder, WeightPlanExecutor, Protocol):
     """Model that supports the planner/executor WeightSource path."""
 
 
+WeightPlanBuildFn = Callable[[TensorCatalog], WeightPlan]
+WeightPlanExecuteFn = Callable[[object, WeightPlan], set[str]]
+
+
+def resolve_weight_plan_source_hooks(
+    model: object,
+) -> tuple[WeightPlanBuildFn, WeightPlanExecuteFn] | None:
+    """Return model-side planner/executor hooks, or fail on a partial contract."""
+
+    build_weight_plan = getattr(model, "build_weight_plan", None)
+    load_weights_from_source = getattr(model, "load_weights_from_source", None)
+    if not callable(build_weight_plan) and not callable(load_weights_from_source):
+        return None
+    if not callable(build_weight_plan) or not callable(load_weights_from_source):
+        raise RuntimeError(
+            "Models using WeightSource loading must implement both "
+            "build_weight_plan(catalog) and load_weights_from_source(source, plan)"
+        )
+    return build_weight_plan, load_weights_from_source
+
+
 _ROTARY_EMBEDS_UNUSED_WEIGHTS = (
     "rotary_pos_emb.inv_freq",
     "rotary_emb.inv_freq",

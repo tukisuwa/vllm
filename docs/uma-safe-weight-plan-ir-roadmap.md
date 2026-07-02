@@ -609,3 +609,8 @@ This does not change execution behavior yet.  It gives the current
 `build_weight_plan` / `load_weights_from_source` convention a neutral API home
 so future executors can depend on the contract without importing the O_DIRECT
 loader implementation.
+
+The first helper on top of these contracts is
+`resolve_weight_plan_source_hooks(model)`, which centralizes the fail-closed
+check that a model implements both hooks or neither.  The O_DIRECT loader now
+uses this neutral helper instead of open-coding the hook detection.

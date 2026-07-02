@@ -35,6 +35,7 @@ from vllm.model_executor.model_loader.weight_plan import (
     _weight_plan_entry_target_shape,
     build_auto_weight_plan_for_module,
     build_auto_weight_plan_from_catalog,
+    resolve_weight_plan_source_hooks,
     summarize_weight_plan,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -57,6 +58,7 @@ __all__ = [
     "build_auto_weight_plan_for_module",
     "build_auto_weight_plan_from_catalog",
     "execute_weight_plan",
+    "resolve_weight_plan_source_hooks",
     "summarize_weight_plan",
 ]
 
@@ -1568,17 +1570,9 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
         if model_weights_override := model_config.model_weights:
             model_weights = model_weights_override
         source = ODirectSafetensorsWeightSource(self, model_weights)
-        build_weight_plan = getattr(model, "build_weight_plan", None)
-        load_weights_from_source = getattr(model, "load_weights_from_source", None)
-        if callable(build_weight_plan) or callable(load_weights_from_source):
-            if not callable(build_weight_plan) or not callable(
-                load_weights_from_source
-            ):
-                raise RuntimeError(
-                    "Models using UMA-safe source loading must implement both "
-                    "build_weight_plan(catalog) and "
-                    "load_weights_from_source(source, plan)"
-                )
+        source_hooks = resolve_weight_plan_source_hooks(model)
+        if source_hooks is not None:
+            build_weight_plan, load_weights_from_source = source_hooks
             logger.info(
                 "uma_odirect_safetensors using model WeightSource path: %s",
                 type(model).__name__,

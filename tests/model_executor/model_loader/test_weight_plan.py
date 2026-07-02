@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
 from vllm.model_executor.model_loader.weight_plan import (
@@ -9,6 +10,7 @@ from vllm.model_executor.model_loader.weight_plan import (
     WeightPlan,
     WeightPlanEntry,
     build_auto_weight_plan_from_catalog,
+    resolve_weight_plan_source_hooks,
     summarize_weight_plan,
 )
 
@@ -61,3 +63,30 @@ def test_auto_weight_plan_from_catalog_without_odirect_loader():
         WeightPlanEntry("keep.weight", "keep.weight"),
         WeightPlanEntry("skip.weight", "skip.weight", required=False),
     )
+
+
+def test_resolve_weight_plan_source_hooks_requires_complete_contract():
+    class NoHooks:
+        pass
+
+    class BuilderOnly:
+        def build_weight_plan(self, catalog):
+            return catalog
+
+    class CompleteHooks:
+        def build_weight_plan(self, catalog):
+            return catalog
+
+        def load_weights_from_source(self, source, plan):
+            return {"loaded"}
+
+    assert resolve_weight_plan_source_hooks(NoHooks()) is None
+
+    with pytest.raises(RuntimeError, match="must implement both"):
+        resolve_weight_plan_source_hooks(BuilderOnly())
+
+    hooks = resolve_weight_plan_source_hooks(CompleteHooks())
+    assert hooks is not None
+    build_weight_plan, load_weights_from_source = hooks
+    assert build_weight_plan("catalog") == "catalog"
+    assert load_weights_from_source("source", "plan") == {"loaded"}
