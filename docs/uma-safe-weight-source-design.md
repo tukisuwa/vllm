@@ -386,16 +386,19 @@ Target behavior:
 - plan can also source-slice single `shard_id` fused output shards when the
   bound vLLM weight loader exposes a local shard-size mapping, covering QKV-like
   q/k/v and MergedColumn-like gate/up cases in the non-packed path
+- plan can source-slice simple input-dimension TP shards with a single sliced
+  dimension, using bounded strided O_DIRECT reads instead of materializing the
+  full checkpoint tensor first
 - packed, bitsandbytes, tuple/multi-shard fused entries, unknown fused loaders,
-  and input-dimension shards still fall back to full tensor reads
+  and more complex non-contiguous slices still fall back to full tensor reads
 
 Current limitations:
 
 - The first Qwen3 hook still reads each required checkpoint tensor as a CPU
   tensor, then delegates to existing parameter `weight_loader`.
 - It proves model-side planning and skip/map decisions before payload read, but
-  only performs conservative TP-local source slicing for simple contiguous
-  output-dimension shards.
+  only performs conservative TP-local source slicing for simple output-dimension
+  shards and single-dimension input shards.
 - Qwen3 MoE now has a first model-side source hook, but other MoE families and
   full removal of the older compatibility optimization remain Phase 4/5 work.
 

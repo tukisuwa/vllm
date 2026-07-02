@@ -3,6 +3,7 @@
 
 import ctypes
 import json
+import math
 import os
 import sys
 import time
@@ -188,6 +189,68 @@ def _normalize_slice_selection(
     return first_offset, selected_elements, output_shape
 
 
+def _normalize_single_dim_slice_selection(
+    shape: list[int],
+    selection: tuple[slice | int, ...],
+) -> tuple[int, int, int, int, list[int]] | None:
+    """Return a strided row-major selection for one partially-sliced dimension.
+
+    The return tuple is:
+    ``(outer_count, source_dim, start, length, output_shape)``.
+    Each outer item is one contiguous byte range of ``length * inner_count``
+    elements.  This covers common input-dim TP shards such as RowParallelLinear
+    weights without materializing the full checkpoint tensor.
+    """
+
+    if len(selection) != len(shape):
+        raise ValueError(
+            f"Slice rank mismatch: got {len(selection)} indices for shape {shape}"
+        )
+
+    partial_dim = None
+    partial_start = 0
+    partial_length = 0
+    output_shape: list[int] = []
+
+    for idx, (dim, item) in enumerate(zip(shape, selection)):
+        if isinstance(item, bool):
+            raise ValueError(f"Boolean indices are not supported: {selection!r}")
+        if isinstance(item, int):
+            return None
+        if not isinstance(item, slice):
+            raise TypeError(f"Unsupported slice item {item!r}")
+        if item.step not in (None, 1):
+            raise ValueError(f"Only contiguous step=1 slices are supported: {item!r}")
+        start, stop, _step = item.indices(dim)
+        length = max(0, stop - start)
+        output_shape.append(length)
+        is_full_dim = start == 0 and length == dim
+        if is_full_dim:
+            continue
+        if partial_dim is not None:
+            return None
+        partial_dim = idx
+        partial_start = start
+        partial_length = length
+
+    if partial_dim is None:
+        return None
+    if partial_length == 0:
+        return None
+
+    outer_count = math.prod(shape[:partial_dim])
+    inner_count = math.prod(shape[partial_dim + 1 :])
+    if outer_count <= 0 or inner_count <= 0:
+        return None
+    return (
+        outer_count,
+        shape[partial_dim],
+        partial_start,
+        partial_length,
+        output_shape,
+    )
+
+
 @dataclass(frozen=True)
 class TensorMeta:
     """Metadata-only view of one safetensors tensor payload.
@@ -348,23 +411,18 @@ def _infer_output_dim_source_slice(
     shard_id: int | str | tuple[int, ...] | None = None,
     weight_loader: Callable | None = None,
 ) -> tuple[slice | int, ...] | None:
-    """Infer a safe source-side TP row slice for output-sharded params.
+    """Infer a safe source-side TP slice for tensor-parallel params.
 
     vLLM fused loaders (QKV/MergedColumn) normally receive a full checkpoint
     shard and narrow it to this rank. If we can prove the source tensor is
     exactly ``tp_size`` copies of the local shard along output dim, we can read
     only this rank's source rows and temporarily mark the input as already
-    sharded before delegating to the existing weight_loader.
+    sharded before delegating to the existing weight_loader.  RowParallel-like
+    input-dim shards use the same proof but may require strided source reads.
     """
-
-    output_dim = getattr(param, "output_dim", None)
-    if output_dim != 0:
-        return None
     if getattr(param, "is_sharded_weight", False):
         return None
     if getattr(param, "use_bitsandbytes_4bit", False):
-        return None
-    if getattr(param, "packed_dim", None) == output_dim:
         return None
 
     param_data = getattr(param, "data", None)
@@ -381,27 +439,77 @@ def _infer_output_dim_source_slice(
     if tp_size <= 1 or tp_rank < 0 or tp_rank >= tp_size:
         return None
 
-    shard_size = _infer_output_dim_local_shard_size(
-        param,
-        record,
-        shard_id=shard_id,
-        weight_loader=weight_loader,
-        param_output_size=param_shape[output_dim],
-    )
-    if shard_size is None:
+    output_dim = getattr(param, "output_dim", None)
+    if output_dim == 0:
+        if getattr(param, "packed_dim", None) != output_dim:
+            shard_size = _infer_output_dim_local_shard_size(
+                param,
+                record,
+                shard_id=shard_id,
+                weight_loader=weight_loader,
+                param_output_size=param_shape[output_dim],
+            )
+            output_slice = _infer_dim_tp_source_slice(
+                record,
+                param_shape,
+                output_dim,
+                shard_size,
+                tp_rank,
+                tp_size,
+            )
+            if output_slice is not None:
+                return output_slice
+
+    input_dim = getattr(param, "input_dim", None)
+    if shard_id is None and isinstance(input_dim, int):
+        if getattr(param, "packed_dim", None) != input_dim:
+            normalized_input_dim = input_dim
+            if normalized_input_dim < 0:
+                normalized_input_dim += len(param_shape)
+            input_slice = _infer_dim_tp_source_slice(
+                record,
+                param_shape,
+                normalized_input_dim,
+                (
+                    param_shape[normalized_input_dim]
+                    if 0 <= normalized_input_dim < len(param_shape)
+                    else None
+                ),
+                tp_rank,
+                tp_size,
+            )
+            if input_slice is not None:
+                return input_slice
+
+    return None
+
+
+def _infer_dim_tp_source_slice(
+    record: TensorMeta,
+    param_shape: list[int],
+    dim: int,
+    shard_size: int | None,
+    tp_rank: int,
+    tp_size: int,
+) -> tuple[slice | int, ...] | None:
+    if dim < 0:
+        dim += len(param_shape)
+    if dim < 0 or dim >= len(param_shape):
         return None
-    if shard_size <= 0:
+    if shard_size is None or shard_size <= 0:
         return None
-    if record.shape[output_dim] != shard_size * tp_size:
+    if record.shape[dim] != shard_size * tp_size:
         return None
-    for dim, (source_size, target_size) in enumerate(zip(record.shape, param_shape)):
-        if dim == output_dim:
+    for idx, (source_size, target_size) in enumerate(zip(record.shape, param_shape)):
+        if idx == dim:
             continue
         if source_size != target_size:
             return None
 
     start = tp_rank * shard_size
-    return (slice(start, start + shard_size), *([slice(None)] * (len(param_shape) - 1)))
+    slices: list[slice | int] = [slice(None)] * len(param_shape)
+    slices[dim] = slice(start, start + shard_size)
+    return tuple(slices)
 
 
 def _infer_output_dim_local_shard_size(
@@ -789,10 +897,20 @@ class ODirectSafetensorsWeightSource:
         source_slices: tuple[slice | int, ...],
     ) -> torch.Tensor:
         record = self.catalog.get(name)
-        element_offset, element_count, output_shape = _normalize_slice_selection(
-            record.shape,
-            source_slices,
-        )
+        try:
+            element_offset, element_count, output_shape = _normalize_slice_selection(
+                record.shape,
+                source_slices,
+            )
+        except ValueError as exc:
+            strided = _normalize_single_dim_slice_selection(
+                record.shape,
+                source_slices,
+            )
+            if strided is None:
+                raise exc
+            return self._read_strided_slice_cpu(record, strided)
+
         element_size = _DTYPE_NBYTES[record.dtype]
         slice_record = TensorMeta(
             file_path=record.file_path,
@@ -803,6 +921,75 @@ class ODirectSafetensorsWeightSource:
             size=element_count * element_size,
         )
         return self._read_record_cpu(slice_record, sliced=True)
+
+    def _read_strided_slice_cpu(
+        self,
+        record: TensorMeta,
+        strided: tuple[int, int, int, int, list[int]],
+    ) -> torch.Tensor:
+        outer_count, source_dim, start, length, output_shape = strided
+        element_size = _DTYPE_NBYTES[record.dtype]
+        # Recompute inner_count from the sliced dimension instead of relying on
+        # output rank equivalence. This keeps the byte math tied to the source
+        # layout while the returned tensor uses output_shape.
+        partial_dim = next(
+            idx
+            for idx, (src, out) in enumerate(zip(record.shape, output_shape))
+            if src != out
+        )
+        inner_count = math.prod(record.shape[partial_dim + 1 :])
+        segment_elements = length * inner_count
+        segment_bytes = segment_elements * element_size
+        if segment_bytes <= 0:
+            raise RuntimeError(f"Invalid empty strided slice for {record.name}")
+
+        total_elements = math.prod(output_shape)
+        expected_elements = outer_count * segment_elements
+        if total_elements != expected_elements:
+            raise RuntimeError(
+                f"Internal strided slice shape mismatch for {record.name}: "
+                f"output={output_shape}, expected_elements={expected_elements}"
+            )
+
+        self._maybe_gate(f"before reading {record.name}[strided-slice]", force=True)
+        t0 = time.perf_counter()
+        tensor = torch.empty(output_shape, dtype=record.dtype, device="cpu")
+        time_alloc = time.perf_counter() - t0
+        self._maybe_gate(f"after allocating {record.name}[strided-slice]", force=True)
+
+        flat = tensor.reshape(-1)
+        t1 = time.perf_counter()
+        with _ODirectFile(
+            record.file_path,
+            self._loader._chunk_size,
+            self._loader._alignment,
+            self._loader._window_size,
+        ) as odirect_file:
+            self._stats.files_opened += 1
+            for outer_idx in range(outer_count):
+                source_element_offset = (
+                    outer_idx * source_dim * inner_count + start * inner_count
+                )
+                target_element_offset = outer_idx * segment_elements
+                target_view = flat.narrow(0, target_element_offset, segment_elements)
+                odirect_file.read_record_into_tensor(
+                    target_view,
+                    record.offset + source_element_offset * element_size,
+                    segment_bytes,
+                    gate=self._note_loaded_bytes,
+                )
+            self._stats.collect_file(odirect_file)
+        time_read = time.perf_counter() - t1
+
+        selected_bytes = total_elements * element_size
+        self._stats.tensors_read += 1
+        self._stats.tensors_read_sliced += 1
+        self._stats.bytes_tensor_payload += selected_bytes
+        self._stats.bytes_sliced_tensor_payload += selected_bytes
+        self._stats.time_alloc += time_alloc
+        self._stats.time_read += time_read
+        self._maybe_gate(f"after reading {record.name}[strided-slice]", force=True)
+        return tensor
 
     def _read_record_cpu(self, record: TensorMeta, *, sliced: bool) -> torch.Tensor:
         self._maybe_gate(f"before reading {record.name}", force=True)
@@ -1206,6 +1393,8 @@ class _ODirectFile:
                         f"Internal O_DIRECT window miss after loading {self.path}: "
                         f"offset={offset}, size={size}"
                     )
+            if gate is not None:
+                gate(size)
             return
 
         self.read_into_tensor(tensor, offset, size, gate=gate)

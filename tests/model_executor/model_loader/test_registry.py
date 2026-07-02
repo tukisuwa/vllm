@@ -490,9 +490,9 @@ def test_uma_odirect_weight_source_read_contiguous_slice_cpu(tmp_path, monkeypat
 
 
 def test_uma_odirect_weight_source_rejects_noncontiguous_slice(tmp_path, monkeypatch):
-    metadata = {"a": {"dtype": "F32", "shape": [4, 3], "data_offsets": [0, 48]}}
+    metadata = {"a": {"dtype": "F32", "shape": [4, 3, 2], "data_offsets": [0, 96]}}
     path = tmp_path / "model.safetensors"
-    _write_safetensors(path, metadata, b"\0" * 48)
+    _write_safetensors(path, metadata, b"\0" * 96)
 
     loader = UmaODirectSafetensorsModelLoader(
         LoadConfig(load_format="uma_odirect_safetensors")
@@ -501,7 +501,7 @@ def test_uma_odirect_weight_source_rejects_noncontiguous_slice(tmp_path, monkeyp
     source = ODirectSafetensorsWeightSource(loader, str(tmp_path))
 
     with pytest.raises(ValueError, match="not contiguous"):
-        source.read_slice_cpu("a", (slice(None), slice(1, 3)))
+        source.read_slice_cpu("a", (slice(1, 3), slice(1, 3), slice(None)))
 
 
 def test_uma_odirect_weight_source_rejects_stepped_slice(tmp_path, monkeypatch):
@@ -840,6 +840,89 @@ def test_uma_odirect_execute_weight_plan_infers_shard_id_output_tp_slice(
     stats = source.stats_snapshot()
     assert stats["tensors_read_sliced"] == 1
     assert stats["bytes_sliced_tensor_payload"] == 24
+    assert stats["tensors_read_full"] == 0
+
+
+def test_uma_odirect_execute_weight_plan_infers_input_tp_strided_slice(
+    tmp_path, monkeypatch
+):
+    metadata = {
+        "cols": {"dtype": "F32", "shape": [2, 4], "data_offsets": [0, 32]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 32)
+    calls = []
+
+    class FakeODirectFile:
+        window_size = 64 * 1024 * 1024
+
+        def __init__(self, *_args):
+            self.direct_reads = 0
+            self.window_loads = 0
+            self.window_hits = 0
+            self.bytes_read = 0
+            self.bytes_copied = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback):
+            pass
+
+        def read_record_into_tensor(self, tensor, offset, size, gate=None):
+            calls.append((offset, size, tuple(tensor.shape)))
+            self.direct_reads += 1
+            self.bytes_read += size
+            self.bytes_copied += size
+            tensor.fill_(3 + len(calls))
+            if gate is not None:
+                gate(size)
+
+    class FakeParam:
+        input_dim = 1
+        tp_rank = 1
+        tp_size = 2
+
+        def __init__(self):
+            self.data = torch.empty(2, 2)
+            self.loaded = []
+
+        def weight_loader(self, param, tensor, **kwargs):
+            assert param is self
+            assert kwargs == {}
+            assert getattr(self, "is_sharded_weight", False) is True
+            self.loaded.append(tensor.clone())
+
+    class FakeModel:
+        def __init__(self):
+            self.param = FakeParam()
+
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(load_format="uma_odirect_safetensors")
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.uma_odirect_safetensors_loader."
+        "_ODirectFile",
+        FakeODirectFile,
+    )
+    source = ODirectSafetensorsWeightSource(loader, str(tmp_path))
+    model = FakeModel()
+    plan = WeightPlan((WeightPlanEntry("cols", "param"),))
+
+    loaded = execute_weight_plan(model, source, plan)
+
+    cols_record = source.catalog.get("cols")
+    assert loaded == {"param"}
+    assert calls == [
+        (cols_record.offset + 8, 8, (2,)),
+        (cols_record.offset + 24, 8, (2,)),
+    ]
+    assert not hasattr(model.param, "is_sharded_weight")
+    assert model.param.loaded[0].tolist() == [[4.0, 4.0], [5.0, 5.0]]
+    stats = source.stats_snapshot()
+    assert stats["tensors_read_sliced"] == 1
+    assert stats["bytes_sliced_tensor_payload"] == 16
     assert stats["tensors_read_full"] == 0
 
 
