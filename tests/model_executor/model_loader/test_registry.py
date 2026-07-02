@@ -446,6 +446,7 @@ def test_uma_odirect_weight_source_read_full_cpu(tmp_path, monkeypatch):
     assert stats["bytes_tensor_payload"] == 8
     assert stats["bytes_full_tensor_payload"] == 8
     assert stats["bytes_sliced_tensor_payload"] == 0
+    assert stats["bytes_skipped_payload"] == 0
 
 
 def test_uma_odirect_weight_source_read_contiguous_slice_cpu(tmp_path, monkeypatch):
@@ -1232,7 +1233,9 @@ def test_uma_odirect_execute_weight_plan_skips_not_required(tmp_path, monkeypatc
     plan = WeightPlan((WeightPlanEntry("a", "missing", required=False),))
 
     assert execute_weight_plan(FakeModel(), source, plan) == set()
-    assert source.stats_snapshot()["tensors_skipped"] == 1
+    stats = source.stats_snapshot()
+    assert stats["tensors_skipped"] == 1
+    assert stats["bytes_skipped_payload"] == 4
 
 
 def test_uma_odirect_execute_weight_plan_skips_absent_not_required(
@@ -1253,7 +1256,9 @@ def test_uma_odirect_execute_weight_plan_skips_absent_not_required(
     plan = WeightPlan((WeightPlanEntry("missing", "missing", required=False),))
 
     assert execute_weight_plan(FakeModel(), source, plan) == set()
-    assert source.stats_snapshot()["tensors_skipped"] == 1
+    stats = source.stats_snapshot()
+    assert stats["tensors_skipped"] == 1
+    assert stats["bytes_skipped_payload"] == 0
 
 
 def test_uma_odirect_execute_weight_plan_ignores_missing_target_before_read():

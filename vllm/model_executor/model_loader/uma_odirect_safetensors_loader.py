@@ -882,6 +882,7 @@ class _SourceReadStats:
     bytes_tensor_payload: int = 0
     bytes_full_tensor_payload: int = 0
     bytes_sliced_tensor_payload: int = 0
+    bytes_skipped_payload: int = 0
     time_gate: float = 0.0
     time_alloc: float = 0.0
     time_read: float = 0.0
@@ -899,7 +900,8 @@ class _SourceReadStats:
             "tensors_read=%d tensors_read_full=%d tensors_read_sliced=%d "
             "tensors_skipped=%d direct_reads=%d "
             "window_loads=%d window_hits=%d bytes_read=%s bytes_copied=%s "
-            "tensor_payload=%s full_payload=%s sliced_payload=%s",
+            "tensor_payload=%s full_payload=%s sliced_payload=%s "
+            "skipped_payload=%s",
             label,
             self.files_opened,
             self.tensors_read,
@@ -914,6 +916,7 @@ class _SourceReadStats:
             _format_gib(self.bytes_tensor_payload),
             _format_gib(self.bytes_full_tensor_payload),
             _format_gib(self.bytes_sliced_tensor_payload),
+            _format_gib(self.bytes_skipped_payload),
         )
         logger.info(
             "uma_odirect_safetensors source timings (%s): gate=%.3fs "
@@ -939,6 +942,7 @@ class _SourceReadStats:
             "bytes_tensor_payload": self.bytes_tensor_payload,
             "bytes_full_tensor_payload": self.bytes_full_tensor_payload,
             "bytes_sliced_tensor_payload": self.bytes_sliced_tensor_payload,
+            "bytes_skipped_payload": self.bytes_skipped_payload,
             "time_gate": self.time_gate,
             "time_alloc": self.time_alloc,
             "time_read": self.time_read,
@@ -1306,6 +1310,7 @@ class ODirectSafetensorsWeightSource:
             )
             return
         record = self.catalog.get(name)
+        self._stats.bytes_skipped_payload += record.size
         logger.debug(
             "uma_odirect_safetensors skipping tensor %s bytes=%s reason=%s",
             name,

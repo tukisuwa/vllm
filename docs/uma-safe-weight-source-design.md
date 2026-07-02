@@ -307,7 +307,7 @@ Implemented so far:
   - files opened
   - tensors read/skipped
   - direct reads/window reads
-  - bytes read/copied/payload
+  - bytes read/copied/payload/skipped
   - gate/allocation/read timing
 - stable `source.stats_snapshot()` for tests and diagnostics
 - minimal `WeightPlanEntry`, `WeightPlan`, and `execute_weight_plan(...)`
@@ -530,6 +530,12 @@ Static tests:
 Model audit:
 
 - `scripts/audit-vllm-uma-odirect-model.py <model-dir>`
+- reads safetensors metadata only; no tensor payload bytes are read
+- validates the same duplicate name, dtype, shape, range, and overlap rules as
+  the UMA O_DIRECT loader
+- prints total payload bytes, per-file payload bytes, largest tensors, dtype
+  distribution, and coarse tensor-name classes such as per-expert MoE,
+  Granite fused expert tensors, QKV, embeddings, and shared experts
 - should be run before adding a model to the compatibility list
 
 Runtime tests:
