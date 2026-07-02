@@ -308,6 +308,7 @@ def build_auto_weight_plan_from_catalog(
     mapper: object | None = None,
     skip_prefixes: list[str] | None = None,
     skip_substrs: list[str] | None = None,
+    skip_predicate: Callable[[str], bool] | None = None,
     ignore_unexpected_suffixes: list[str] | None = None,
 ) -> WeightPlan:
     """Build a name-mapped plan without reading tensor payloads.
@@ -324,6 +325,15 @@ def build_auto_weight_plan_from_catalog(
     map_name_with_shard = getattr(mapper, "_map_name_with_shard", None)
     entries: list[WeightPlanEntry] = []
     for name in catalog.names():
+        if skip_predicate is not None and skip_predicate(name):
+            entries.append(
+                WeightPlanEntry(
+                    checkpoint_name=name,
+                    target_name=name,
+                    required=False,
+                )
+            )
+            continue
         if any(name.startswith(prefix) for prefix in prefixes) or any(
             substr in name for substr in substrs
         ):
@@ -371,6 +381,7 @@ def build_auto_weight_plan_for_module(
     mapper: object | None = None,
     skip_prefixes: list[str] | None = None,
     skip_substrs: list[str] | None = None,
+    skip_predicate: Callable[[str], bool] | None = None,
 ) -> WeightPlan:
     """Build an AutoWeightsLoader-like plan for a real vLLM module."""
 
@@ -392,6 +403,7 @@ def build_auto_weight_plan_for_module(
         mapper=mapper,
         skip_prefixes=skip_prefixes,
         skip_substrs=skip_substrs,
+        skip_predicate=skip_predicate,
         ignore_unexpected_suffixes=ignore_unexpected_suffixes,
     )
 

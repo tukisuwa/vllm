@@ -1235,9 +1235,10 @@ def test_uma_odirect_build_auto_weight_plan_from_catalog(tmp_path):
             "data_offsets": [8, 12],
         },
         "drop_me.weight": {"dtype": "F32", "shape": [1], "data_offsets": [12, 16]},
+        "spec_layer.weight": {"dtype": "F32", "shape": [1], "data_offsets": [16, 20]},
     }
     path = tmp_path / "model.safetensors"
-    _write_safetensors(path, metadata, b"\0" * 16)
+    _write_safetensors(path, metadata, b"\0" * 20)
     catalog = TensorCatalog.from_safetensors_files(
         [str(path)],
         metadata_limit_bytes=1024 * 1024,
@@ -1255,12 +1256,14 @@ def test_uma_odirect_build_auto_weight_plan_from_catalog(tmp_path):
         catalog,
         mapper=FakeMapper(),
         skip_prefixes=["lm_head."],
+        skip_predicate=lambda name: name.startswith("spec_layer."),
     )
     entries = {entry.checkpoint_name: entry for entry in plan.entries}
 
     assert entries["lm_head.weight"].required is False
     assert entries["model.layers.0.rotary_emb.inv_freq"].required is False
     assert entries["drop_me.weight"].required is False
+    assert entries["spec_layer.weight"].required is False
     q_proj = entries["model.layers.0.self_attn.q_proj.weight"]
     assert q_proj.required is True
     assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"

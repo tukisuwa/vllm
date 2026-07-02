@@ -316,6 +316,8 @@ Implemented so far:
   - routes tensors to a target parameter's `weight_loader`
 - `build_auto_weight_plan_from_catalog(...)`
   - performs prefix/substr skips without reading payload bytes
+  - supports a model-provided skip predicate for non-prefix decisions such as
+    speculative layers or optional per-layer auxiliaries
   - applies `WeightsMapper`-style name and shard mapping before payload reads
   - can mark known ignorable missing suffixes such as `.bias`
   - keeps missing target detection fail-closed in the executor
