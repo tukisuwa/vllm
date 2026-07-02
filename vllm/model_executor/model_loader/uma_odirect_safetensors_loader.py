@@ -612,6 +612,8 @@ class TensorCatalog:
 class _SourceReadStats:
     files_opened: int = 0
     tensors_read: int = 0
+    tensors_read_full: int = 0
+    tensors_read_sliced: int = 0
     tensors_skipped: int = 0
     direct_reads: int = 0
     window_loads: int = 0
@@ -619,6 +621,8 @@ class _SourceReadStats:
     bytes_read: int = 0
     bytes_copied: int = 0
     bytes_tensor_payload: int = 0
+    bytes_full_tensor_payload: int = 0
+    bytes_sliced_tensor_payload: int = 0
     time_gate: float = 0.0
     time_alloc: float = 0.0
     time_read: float = 0.0
@@ -633,12 +637,15 @@ class _SourceReadStats:
     def log(self, label: str) -> None:
         logger.info(
             "uma_odirect_safetensors source stats (%s): files_opened=%d "
-            "tensors_read=%d tensors_skipped=%d direct_reads=%d "
+            "tensors_read=%d tensors_read_full=%d tensors_read_sliced=%d "
+            "tensors_skipped=%d direct_reads=%d "
             "window_loads=%d window_hits=%d bytes_read=%s bytes_copied=%s "
-            "tensor_payload=%s",
+            "tensor_payload=%s full_payload=%s sliced_payload=%s",
             label,
             self.files_opened,
             self.tensors_read,
+            self.tensors_read_full,
+            self.tensors_read_sliced,
             self.tensors_skipped,
             self.direct_reads,
             self.window_loads,
@@ -646,6 +653,8 @@ class _SourceReadStats:
             _format_gib(self.bytes_read),
             _format_gib(self.bytes_copied),
             _format_gib(self.bytes_tensor_payload),
+            _format_gib(self.bytes_full_tensor_payload),
+            _format_gib(self.bytes_sliced_tensor_payload),
         )
         logger.info(
             "uma_odirect_safetensors source timings (%s): gate=%.3fs "
@@ -660,6 +669,8 @@ class _SourceReadStats:
         return {
             "files_opened": self.files_opened,
             "tensors_read": self.tensors_read,
+            "tensors_read_full": self.tensors_read_full,
+            "tensors_read_sliced": self.tensors_read_sliced,
             "tensors_skipped": self.tensors_skipped,
             "direct_reads": self.direct_reads,
             "window_loads": self.window_loads,
@@ -667,6 +678,8 @@ class _SourceReadStats:
             "bytes_read": self.bytes_read,
             "bytes_copied": self.bytes_copied,
             "bytes_tensor_payload": self.bytes_tensor_payload,
+            "bytes_full_tensor_payload": self.bytes_full_tensor_payload,
+            "bytes_sliced_tensor_payload": self.bytes_sliced_tensor_payload,
             "time_gate": self.time_gate,
             "time_alloc": self.time_alloc,
             "time_read": self.time_read,
@@ -705,7 +718,7 @@ class ODirectSafetensorsWeightSource:
 
     def read_full_cpu(self, name: str) -> torch.Tensor:
         record = self.catalog.get(name)
-        return self._read_record_cpu(record)
+        return self._read_record_cpu(record, sliced=False)
 
     def read_slice_cpu(
         self,
@@ -726,9 +739,9 @@ class ODirectSafetensorsWeightSource:
             offset=record.offset + element_offset * element_size,
             size=element_count * element_size,
         )
-        return self._read_record_cpu(slice_record)
+        return self._read_record_cpu(slice_record, sliced=True)
 
-    def _read_record_cpu(self, record: TensorMeta) -> torch.Tensor:
+    def _read_record_cpu(self, record: TensorMeta, *, sliced: bool) -> torch.Tensor:
         self._maybe_gate(f"before reading {record.name}", force=True)
         with _ODirectFile(
             record.file_path,
@@ -746,6 +759,12 @@ class ODirectSafetensorsWeightSource:
             self._stats.collect_file(odirect_file)
         self._stats.tensors_read += 1
         self._stats.bytes_tensor_payload += record.size
+        if sliced:
+            self._stats.tensors_read_sliced += 1
+            self._stats.bytes_sliced_tensor_payload += record.size
+        else:
+            self._stats.tensors_read_full += 1
+            self._stats.bytes_full_tensor_payload += record.size
         self._stats.time_alloc += time_alloc
         self._stats.time_read += time_read
         self._maybe_gate(f"after reading {record.name}", force=True)

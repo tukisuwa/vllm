@@ -495,6 +495,7 @@ Runtime metrics to record:
 - skipped bytes
 - full-tensor fallback bytes
 - slice/direct-read bytes
+- full vs sliced tensor read counts and payload bytes from source stats
 
 ## Design rules
 

@@ -428,9 +428,13 @@ def test_uma_odirect_weight_source_read_full_cpu(tmp_path, monkeypatch):
     stats = source.stats_snapshot()
     assert stats["files_opened"] == 1
     assert stats["tensors_read"] == 1
+    assert stats["tensors_read_full"] == 1
+    assert stats["tensors_read_sliced"] == 0
     assert stats["bytes_read"] == 8
     assert stats["bytes_copied"] == 8
     assert stats["bytes_tensor_payload"] == 8
+    assert stats["bytes_full_tensor_payload"] == 8
+    assert stats["bytes_sliced_tensor_payload"] == 0
 
 
 def test_uma_odirect_weight_source_read_contiguous_slice_cpu(tmp_path, monkeypatch):
@@ -481,6 +485,8 @@ def test_uma_odirect_weight_source_read_contiguous_slice_cpu(tmp_path, monkeypat
     assert calls == [(record.offset + 12, 24, (2, 3))]
     assert tensor.tolist() == [[7.0, 7.0, 7.0], [7.0, 7.0, 7.0]]
     assert source.stats_snapshot()["bytes_tensor_payload"] == 24
+    assert source.stats_snapshot()["tensors_read_sliced"] == 1
+    assert source.stats_snapshot()["bytes_sliced_tensor_payload"] == 24
 
 
 def test_uma_odirect_weight_source_rejects_noncontiguous_slice(tmp_path, monkeypatch):
@@ -739,6 +745,10 @@ def test_uma_odirect_execute_weight_plan_infers_output_tp_slice(
         [9.0, 9.0, 9.0],
         [9.0, 9.0, 9.0],
     ]
+    stats = source.stats_snapshot()
+    assert stats["tensors_read_sliced"] == 1
+    assert stats["bytes_sliced_tensor_payload"] == 24
+    assert stats["tensors_read_full"] == 0
 
 
 def test_uma_odirect_execute_weight_plan_skips_not_required(tmp_path, monkeypatch):
