@@ -101,6 +101,8 @@ from vllm.model_executor.models import (
     opt,
     olmoe,
     ouro,
+    param2moe,
+    param2moe_uma,
     persimmon,
     phimoe,
     phi,
@@ -7730,6 +7732,148 @@ def test_longcat_flash_source_load_finalizes_mla_weights(monkeypatch):
     ) == {"model.layers.0.mlp.experts.w13_weight"}
     assert source.reads == ["model.layers.0.mlp.experts.1.gate_proj.weight"]
     assert model.finalized is True
+
+
+def test_param2moe_source_plan_splits_fused_qkv_and_maps_names_before_read():
+    qkv_name = "model.layers.0.attention.query_key_value.weight"
+    local_name = "model.layers.0.mlp.experts.1.gate_proj.weight"
+    remote_name = "model.layers.0.mlp.experts.2.down_proj.weight"
+    bias_name = "model.layers.0.mlp.gate.expert_bias"
+    catalog = TensorCatalog([
+        TensorMeta("model.safetensors", qkv_name, torch.float32, [8, 1], 0, 32),
+        TensorMeta("model.safetensors", local_name, torch.float32, [1], 32, 4),
+        TensorMeta("model.safetensors", remote_name, torch.float32, [1], 36, 4),
+        TensorMeta(
+            "model.safetensors",
+            "model.layers.0.mlp.shared_experts.gate_proj.weight",
+            torch.float32,
+            [1],
+            40,
+            4,
+        ),
+        TensorMeta("model.safetensors", bias_name, torch.float32, [2], 44, 8),
+    ])
+
+    class FakeConfig:
+        num_attention_heads = 2
+        num_key_value_heads = 1
+        head_dim = 2
+        hidden_size = 4
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.mlp.experts"
+        w13_weight = object()
+        w2_weight = object()
+        quant_method = object()
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 1 else -1
+
+        def weight_loader(self, **_kwargs):
+            return True
+
+    class FakeMLP:
+        def __init__(self, experts):
+            self.experts = experts
+
+    class FakeLayer:
+        def __init__(self, experts):
+            self.mlp = FakeMLP(experts)
+
+    class FakeInnerModel:
+        def __init__(self, experts):
+            self.layers = [FakeLayer(experts)]
+
+    class FakeOuter:
+        tie_word_embeddings = False
+        config = FakeConfig()
+
+        def __init__(self):
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+        def children(self):
+            return []
+
+    plan = param2moe_uma.build_param2moe_weight_plan(FakeOuter(), catalog)
+    routed = {entry.checkpoint_name: entry for entry in plan.routed_entries}
+    assert routed[local_name].param_name == "w13_weight"
+    assert routed[local_name].shard_id == "w1"
+    assert routed[local_name].local_required is True
+    assert routed[remote_name].param_name == "w2_weight"
+    assert routed[remote_name].shard_id == "w2"
+    assert routed[remote_name].local_required is False
+
+    auto_entries = {entry.checkpoint_name: [] for entry in plan.auto_plan.entries}
+    for entry in plan.auto_plan.entries:
+        auto_entries[entry.checkpoint_name].append(entry)
+    assert local_name not in auto_entries
+    assert remote_name not in auto_entries
+
+    qkv_entries = auto_entries[qkv_name]
+    assert [(entry.target_name, entry.shard_id, entry.source_slices)
+            for entry in qkv_entries] == [
+        (
+            "model.layers.0.self_attn.qkv_proj.weight",
+            "q",
+            (slice(0, 4), slice(None)),
+        ),
+        (
+            "model.layers.0.self_attn.qkv_proj.weight",
+            "k",
+            (slice(4, 6), slice(None)),
+        ),
+        (
+            "model.layers.0.self_attn.qkv_proj.weight",
+            "v",
+            (slice(6, 8), slice(None)),
+        ),
+    ]
+    shared_entry = auto_entries[
+        "model.layers.0.mlp.shared_experts.gate_proj.weight"
+    ][0]
+    assert (
+        shared_entry.target_name
+        == "model.layers.0.mlp.shared_experts.gate_up_proj.weight"
+    )
+    assert shared_entry.shard_id == 0
+    bias_entry = auto_entries[bias_name][0]
+    assert (
+        bias_entry.target_name
+        == "model.layers.0.mlp.gate.e_score_correction_bias"
+    )
+    assert torch.equal(bias_entry.transform(torch.tensor([1.0, 3.0])),
+                       torch.tensor([-1.0, 1.0]))
+
+
+def test_param2moe_source_hook_delegates_to_helper(monkeypatch):
+    calls = []
+
+    def fake_build(model, catalog):
+        calls.append(("build", model, catalog))
+        return "plan"
+
+    def fake_load(model, source, plan):
+        calls.append(("load", model, source, plan))
+        return {"loaded"}
+
+    monkeypatch.setattr(param2moe, "build_param2moe_weight_plan", fake_build)
+    monkeypatch.setattr(param2moe, "load_param2moe_weights_from_source", fake_load)
+
+    class FakeParam2MoE(param2moe.Param2MoEForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+
+    model = FakeParam2MoE()
+    catalog = object()
+    source = object()
+
+    assert model.build_weight_plan(catalog) == "plan"
+    assert model.load_weights_from_source(source, "plan") == {"loaded"}
+    assert calls == [
+        ("build", model, catalog),
+        ("load", model, source, "plan"),
+    ]
 
 
 def test_qwen_moe_source_plan_handles_nested_language_model_before_read():

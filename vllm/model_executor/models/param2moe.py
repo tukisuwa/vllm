@@ -49,10 +49,19 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
+from .param2moe_uma import (
+    Param2MoeSourcePlan,
+    build_param2moe_weight_plan,
+    load_param2moe_weights_from_source,
+)
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -860,3 +869,13 @@ class Param2MoEForCausalLM(
     ) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(_rename_and_normalize_weights(weights))
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> Param2MoeSourcePlan:
+        return build_param2moe_weight_plan(self, catalog)
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: Param2MoeSourcePlan,
+    ) -> set[str]:
+        return load_param2moe_weights_from_source(self, source, plan)
