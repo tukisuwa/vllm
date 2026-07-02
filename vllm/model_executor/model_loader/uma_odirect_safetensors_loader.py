@@ -1720,6 +1720,13 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
             extra_config, "direct_qwen35_moe", False
         )
         self._direct_per_expert_moe = direct_per_expert_moe or direct_qwen35_moe
+        if self._direct_per_expert_moe:
+            logger.warning(
+                "uma_odirect_safetensors direct_per_expert_moe/direct_qwen35_moe "
+                "is deprecated. Prefer model-side build_weight_plan() and "
+                "load_weights_from_source() hooks; the compatibility path is "
+                "only used for models without those hooks."
+            )
 
         if self._alignment & (self._alignment - 1) != 0:
             raise ValueError("alignment must be a power of two")
@@ -2065,6 +2072,13 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
                 "uma_odirect_safetensors using model WeightSource path: %s",
                 type(model).__name__,
             )
+            if self._direct_per_expert_moe:
+                logger.warning(
+                    "uma_odirect_safetensors ignoring deprecated "
+                    "direct_per_expert_moe/direct_qwen35_moe because %s "
+                    "implements model-side WeightSource hooks",
+                    type(model).__name__,
+                )
             plan = build_weight_plan(source.catalog)
             try:
                 load_weights_from_source(source, plan)

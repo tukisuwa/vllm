@@ -287,8 +287,10 @@ Implemented so far:
   - uses the same O_DIRECT full-record read helper as the iterator path
   - keeps allocation/read memory gates on the pull path
 - `source.read_slice_cpu(name, source_slices)`
-  - supports only row-major contiguous slices
-  - rejects stepped or non-contiguous slices instead of full-tensor fallback
+  - supports row-major contiguous slices and simple single-dimension strided
+    slices
+  - rejects stepped or more complex non-contiguous slices instead of full-tensor
+    fallback
   - records only the requested payload bytes in source stats
 - `source.read_into_cpu(name, dst, source_slices=None)`
   - reads full, contiguous slice, or supported single-dimension strided slice
@@ -432,8 +434,9 @@ model-specific knowledge out of the loader.
 
 Remaining work:
 
-- remove or deprecate the older loader-side `direct_per_expert_moe`
-  compatibility path once the model hook is validated on a real Qwen3 MoE load
+- remove the older loader-side `direct_per_expert_moe` compatibility path once
+  the model hook is validated on a real Qwen3 MoE load. It is now logged as
+  deprecated, and ignored when a model-side WeightSource hook is available.
 - validate Qwen3.5/Qwen3Next MoE and Qwen3.5 MoE conditional generation on real
   checkpoints; they share the model-side helper but have not been real-loaded
   yet
