@@ -78,6 +78,7 @@ from vllm.model_executor.models import (
     stablelm,
     step1,
     starcoder2,
+    telechat2,
 )
 from vllm.model_executor.models.utils import PPMissingLayer, WeightsMapper
 
@@ -1419,6 +1420,94 @@ def test_uma_odirect_execute_weight_plan_rejects_target_slices_without_read_into
 
     with pytest.raises(RuntimeError, match="target_slices.*read_into_cpu"):
         execute_weight_plan(FakeModel(), source, plan)
+
+
+def test_uma_odirect_telechat2_plan_uses_segmented_key_value_reads():
+    catalog = TensorCatalog(
+        [
+            TensorMeta(
+                "model.safetensors",
+                "transformer.h.0.self_attention.key_value.weight",
+                torch.float32,
+                [8, 3],
+                0,
+                96,
+            ),
+            TensorMeta(
+                "model.safetensors",
+                "transformer.h.0.self_attention.query.weight",
+                torch.float32,
+                [4, 3],
+                96,
+                48,
+            ),
+            TensorMeta(
+                "model.safetensors",
+                "transformer.h.0.mlp.gate_proj.weight",
+                torch.float32,
+                [6, 3],
+                144,
+                72,
+            ),
+            TensorMeta(
+                "model.safetensors",
+                "transformer.word_embeddings.weight",
+                torch.float32,
+                [4, 3],
+                216,
+                48,
+            ),
+            TensorMeta(
+                "model.safetensors",
+                "lm_head.weight",
+                torch.float32,
+                [4, 3],
+                264,
+                48,
+            ),
+        ]
+    )
+
+    plan = telechat2._telechat2_uma_weight_plan(
+        nn.Module(),
+        catalog,
+        mapper=telechat2.TeleChat2ForCausalLM.hf_to_vllm_mapper,
+        total_num_heads=2,
+        head_dim=2,
+        skip_prefixes=["lm_head."],
+    )
+
+    required_entries = [entry for entry in plan if entry.required]
+    skipped_entries = [entry for entry in plan if not entry.required]
+
+    assert [entry.target_name for entry in required_entries] == [
+        "model.layers.0.self_attn.qkv_proj.weight",
+        "model.layers.0.self_attn.qkv_proj.weight",
+        "model.layers.0.self_attn.qkv_proj.weight",
+        "model.layers.0.mlp.gate_up_proj.weight",
+        "model.embed_tokens.weight",
+    ]
+    assert [entry.shard_id for entry in required_entries] == [
+        "k",
+        "v",
+        "q",
+        0,
+        None,
+    ]
+    k_entry, v_entry = required_entries[:2]
+    assert k_entry.read_into_cpu is True
+    assert v_entry.read_into_cpu is True
+    assert k_entry.staging_shape == (4, 3)
+    assert v_entry.staging_shape == (4, 3)
+    assert k_entry.read_segments == (
+        WeightPlanReadSegment((slice(0, 2), slice(None)), (slice(0, 2), slice(None))),
+        WeightPlanReadSegment((slice(4, 6), slice(None)), (slice(2, 4), slice(None))),
+    )
+    assert v_entry.read_segments == (
+        WeightPlanReadSegment((slice(2, 4), slice(None)), (slice(0, 2), slice(None))),
+        WeightPlanReadSegment((slice(6, 8), slice(None)), (slice(2, 4), slice(None))),
+    )
+    assert skipped_entries[0].checkpoint_name == "lm_head.weight"
 
 
 def test_uma_odirect_execute_weight_plan_applies_transform(tmp_path, monkeypatch):

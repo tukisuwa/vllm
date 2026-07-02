@@ -456,7 +456,7 @@ Status: started with `Qwen2ForCausalLM`, `Qwen3ForCausalLM`,
 `Plamo3ForCausalLM`, `ArceeForCausalLM`, `SeedOssForCausalLM`,
 `HyperCLOVAXForCausalLM`, `Lfm2ForCausalLM`, `MiMoForCausalLM`,
 `OlmoForCausalLM`, `Olmo2ForCausalLM`, `NemotronForCausalLM`,
-`ExaoneForCausalLM`, and `CohereForCausalLM`.
+`ExaoneForCausalLM`, `CohereForCausalLM`, and `TeleChat2ForCausalLM`.
 
 Start with Llama/Qwen dense, not MoE.
 
@@ -480,6 +480,9 @@ Target behavior:
 - plan remaps BLOOM checkpoint names with the existing `transformer.` prefix
   rule before payload read
 - plan skips static non-payload entries such as Cohere `rotary_emb.inv_freq`
+- plan uses segmented CPU staging reads for TeleChat2 `key_value` tensors,
+  assembling K and V staging tensors from alternating source head blocks before
+  delegating to the existing qkv parameter loader
 - plan skips rotary/cache tensors: implemented through shared auto-plan helper
 - dense model hooks use the shared `auto_uma` model-side helper instead of
   calling generic executor internals directly

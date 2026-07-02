@@ -26,9 +26,17 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+    WeightPlan,
+    WeightPlanEntry,
+    WeightPlanReadSegment,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.llama import LlamaForCausalLM, LlamaModel
 
+from .auto_uma import build_auto_uma_weight_plan, load_auto_uma_weights_from_source
 from .llama import LlamaDecoderLayer
 from .utils import (
     AutoWeightsLoader,
@@ -36,6 +44,118 @@ from .utils import (
     WeightsMapper,
     is_pp_missing_parameter,
 )
+
+
+def _telechat2_key_value_entries(
+    catalog: TensorCatalog,
+    entry: WeightPlanEntry,
+    *,
+    total_num_heads: int,
+    head_dim: int,
+) -> tuple[WeightPlanEntry, WeightPlanEntry]:
+    record = catalog.get(entry.checkpoint_name)
+    if len(record.shape) != 2:
+        raise RuntimeError(
+            "TeleChat2 key_value checkpoint tensor must be 2D: "
+            f"{entry.checkpoint_name} shape={record.shape}"
+        )
+    expected_rows = total_num_heads * head_dim * 2
+    if record.shape[0] != expected_rows:
+        raise RuntimeError(
+            "TeleChat2 key_value checkpoint tensor has unexpected rows: "
+            f"{entry.checkpoint_name} rows={record.shape[0]} expected={expected_rows}"
+        )
+
+    target_name = entry.target_name.replace("key_value", "qkv_proj", 1)
+    input_size = record.shape[1]
+    staging_shape = (total_num_heads * head_dim, input_size)
+    k_segments: list[WeightPlanReadSegment] = []
+    v_segments: list[WeightPlanReadSegment] = []
+    for head_idx in range(total_num_heads):
+        source_base = head_idx * head_dim * 2
+        target_base = head_idx * head_dim
+        target_slice = (slice(target_base, target_base + head_dim), slice(None))
+        k_segments.append(
+            WeightPlanReadSegment(
+                (slice(source_base, source_base + head_dim), slice(None)),
+                target_slice,
+            )
+        )
+        v_segments.append(
+            WeightPlanReadSegment(
+                (
+                    slice(source_base + head_dim, source_base + 2 * head_dim),
+                    slice(None),
+                ),
+                target_slice,
+            )
+        )
+
+    return (
+        WeightPlanEntry(
+            entry.checkpoint_name,
+            target_name,
+            read_into_cpu=True,
+            read_segments=tuple(k_segments),
+            staging_shape=staging_shape,
+            shard_id="k",
+            ignore_missing=entry.ignore_missing,
+        ),
+        WeightPlanEntry(
+            entry.checkpoint_name,
+            target_name,
+            read_into_cpu=True,
+            read_segments=tuple(v_segments),
+            staging_shape=staging_shape,
+            shard_id="v",
+            ignore_missing=entry.ignore_missing,
+        ),
+    )
+
+
+def _telechat2_uma_weight_plan(
+    model: nn.Module,
+    catalog: TensorCatalog,
+    *,
+    mapper: WeightsMapper,
+    total_num_heads: int,
+    head_dim: int,
+    skip_prefixes: list[str] | None = None,
+) -> WeightPlan:
+    base_plan = build_auto_uma_weight_plan(
+        model,
+        catalog,
+        mapper=mapper | LlamaModel.hf_to_vllm_mapper,
+        skip_prefixes=skip_prefixes,
+    )
+    entries: list[WeightPlanEntry] = []
+    for entry in base_plan:
+        if not entry.required:
+            entries.append(entry)
+            continue
+        if ".self_attn.key_value." in entry.target_name:
+            entries.extend(
+                _telechat2_key_value_entries(
+                    catalog,
+                    entry,
+                    total_num_heads=total_num_heads,
+                    head_dim=head_dim,
+                )
+            )
+            continue
+        if ".self_attn.query." in entry.target_name:
+            entries.append(
+                WeightPlanEntry(
+                    entry.checkpoint_name,
+                    entry.target_name.replace("query", "qkv_proj", 1),
+                    transform=entry.transform,
+                    shard_id="q",
+                    ignore_missing=entry.ignore_missing,
+                )
+            )
+            continue
+        entries.append(entry)
+    return WeightPlan(tuple(entries))
 
 
 class TeleChat2Model(LlamaModel):
@@ -151,3 +271,22 @@ class TeleChat2ForCausalLM(LlamaForCausalLM):
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
+        total_num_heads = self.config.n_head
+        head_dim = self.config.hidden_size // total_num_heads
+        return _telechat2_uma_weight_plan(
+            self,
+            catalog,
+            mapper=self.hf_to_vllm_mapper,
+            total_num_heads=total_num_heads,
+            head_dim=head_dim,
+            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: WeightPlan,
+    ) -> set[str]:
+        return load_auto_uma_weights_from_source(self, source, plan)
