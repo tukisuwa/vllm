@@ -302,12 +302,20 @@ _TensorRecord = TensorMeta
 
 
 @dataclass(frozen=True)
+class WeightPlanReadSegment:
+    source_slices: tuple[slice | int, ...]
+    target_slices: tuple[slice | int, ...]
+
+
+@dataclass(frozen=True)
 class WeightPlanEntry:
     checkpoint_name: str
     target_name: str
     required: bool = True
     source_slices: tuple[slice | int, ...] | None = None
     target_slices: tuple[slice | int, ...] | None = None
+    read_segments: tuple[WeightPlanReadSegment, ...] | None = None
+    staging_shape: tuple[int, ...] | None = None
     transform: Callable[[torch.Tensor], torch.Tensor] | None = None
     source_is_sharded: bool = False
     read_into_cpu: bool = False
@@ -376,6 +384,25 @@ def _weight_plan_entry_payload_size(
     return element_count * _DTYPE_NBYTES[record.dtype]
 
 
+def _weight_plan_entry_target_shape(
+    record: TensorMeta,
+    source_slices: tuple[slice | int, ...] | None,
+) -> tuple[int, ...]:
+    if source_slices is None:
+        return tuple(record.shape)
+    try:
+        _element_offset, _element_count, output_shape = _normalize_slice_selection(
+            record.shape,
+            source_slices,
+        )
+        return tuple(output_shape)
+    except ValueError as exc:
+        strided = _normalize_single_dim_slice_selection(record.shape, source_slices)
+        if strided is None:
+            raise exc
+        return tuple(strided[4])
+
+
 def summarize_weight_plan(catalog: "TensorCatalog", plan: WeightPlan) -> WeightPlanSummary:
     """Summarize planned payload reads from metadata only.
 
@@ -414,16 +441,34 @@ def summarize_weight_plan(catalog: "TensorCatalog", plan: WeightPlan) -> WeightP
 
         required_entries += 1
         record = catalog.get(entry.checkpoint_name)
-        payload_size = _weight_plan_entry_payload_size(record, entry.source_slices)
-        if entry.read_into_cpu:
+        if entry.read_segments is not None:
+            if not entry.read_into_cpu:
+                raise RuntimeError(
+                    "WeightPlanEntry.read_segments is only supported with "
+                    f"read_into_cpu=True: {entry.checkpoint_name}"
+                )
+            if entry.source_slices is not None or entry.target_slices is not None:
+                raise RuntimeError(
+                    "WeightPlanEntry.read_segments cannot be combined with "
+                    f"source_slices/target_slices: {entry.checkpoint_name}"
+                )
             read_into_entries += 1
+            payload_size = sum(
+                _weight_plan_entry_payload_size(record, segment.source_slices)
+                for segment in entry.read_segments
+            )
             read_into_payload_bytes += payload_size
-        elif entry.source_slices is not None:
-            sliced_read_entries += 1
-            sliced_payload_bytes += payload_size
         else:
-            full_read_entries += 1
-            full_payload_bytes += payload_size
+            payload_size = _weight_plan_entry_payload_size(record, entry.source_slices)
+            if entry.read_into_cpu:
+                read_into_entries += 1
+                read_into_payload_bytes += payload_size
+            elif entry.source_slices is not None:
+                sliced_read_entries += 1
+                sliced_payload_bytes += payload_size
+            else:
+                full_read_entries += 1
+                full_payload_bytes += payload_size
 
     return WeightPlanSummary(
         entries=len(plan.entries),
@@ -849,8 +894,54 @@ def execute_weight_plan(
                 "WeightPlanEntry.target_slices is only supported with "
                 f"read_into_cpu=True: {entry.checkpoint_name}"
             )
+        if entry.read_segments is not None:
+            if not entry.read_into_cpu:
+                raise RuntimeError(
+                    "WeightPlanEntry.read_segments is only supported with "
+                    f"read_into_cpu=True: {entry.checkpoint_name}"
+                )
+            if entry.staging_shape is None:
+                raise RuntimeError(
+                    "WeightPlanEntry.read_segments requires staging_shape: "
+                    f"{entry.checkpoint_name}"
+                )
+            if entry.source_slices is not None or entry.target_slices is not None:
+                raise RuntimeError(
+                    "WeightPlanEntry.read_segments cannot be combined with "
+                    f"source_slices/target_slices: {entry.checkpoint_name}"
+                )
 
-        if entry.read_into_cpu:
+        if entry.read_segments is not None:
+            empty_cpu_shape = getattr(source, "empty_cpu_shape", None)
+            if not callable(empty_cpu_shape):
+                raise RuntimeError(
+                    "WeightSource does not support segmented CPU staging for "
+                    f"{entry.checkpoint_name}"
+                )
+            tensor = empty_cpu_shape(entry.checkpoint_name, entry.staging_shape)
+            for segment in entry.read_segments:
+                source_shape = _weight_plan_entry_target_shape(
+                    record,
+                    segment.source_slices,
+                )
+                target = _select_contiguous_target_view(
+                    tensor,
+                    segment.target_slices,
+                    entry.checkpoint_name,
+                )
+                if tuple(target.shape) != source_shape:
+                    raise RuntimeError(
+                        "WeightPlanEntry.read_segments target shape mismatch for "
+                        f"{entry.checkpoint_name}: target={list(target.shape)}, "
+                        f"source_slice={list(source_shape)}"
+                    )
+                source.read_into_cpu(
+                    entry.checkpoint_name,
+                    tensor,
+                    source_slices=segment.source_slices,
+                    target_slices=segment.target_slices,
+                )
+        elif entry.read_into_cpu:
             tensor = source.empty_cpu(
                 entry.checkpoint_name,
                 source_slices=None
@@ -1248,12 +1339,18 @@ class ODirectSafetensorsWeightSource:
     ) -> torch.Tensor:
         record = self.catalog.get(name)
         shape = _source_tensor_shape(record, source_slices)
+        return self.empty_cpu_shape(name, tuple(shape))
+
+    def empty_cpu_shape(self, name: str, shape: tuple[int, ...]) -> torch.Tensor:
+        record = self.catalog.get(name)
+        if not all(isinstance(dim, int) and dim >= 0 for dim in shape):
+            raise RuntimeError(f"Invalid CPU staging shape for {name}: {shape!r}")
         nbytes = math.prod(shape) * _DTYPE_NBYTES[record.dtype]
         force_allocation_gate = nbytes >= self._loader._allocation_gate_min_bytes
         if force_allocation_gate:
             self._maybe_gate(f"before allocating {name}", force=True)
         t0 = time.perf_counter()
-        tensor = torch.empty(shape, dtype=record.dtype, device="cpu")
+        tensor = torch.empty(list(shape), dtype=record.dtype, device="cpu")
         self._stats.time_alloc += time.perf_counter() - t0
         if force_allocation_gate:
             self._maybe_gate(f"after allocating {name}", force=True)

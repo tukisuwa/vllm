@@ -22,6 +22,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     UmaODirectSafetensorsModelLoader,
     WeightPlan,
     WeightPlanEntry,
+    WeightPlanReadSegment,
     build_auto_weight_plan_from_catalog,
     execute_weight_plan,
     summarize_weight_plan,
@@ -900,7 +901,8 @@ def test_uma_odirect_weight_plan_summary_counts_payload_bytes():
             TensorMeta("model.safetensors", "full", torch.float32, [2], 0, 8),
             TensorMeta("model.safetensors", "rows", torch.float32, [4, 2], 8, 32),
             TensorMeta("model.safetensors", "cols", torch.float32, [2, 4], 40, 32),
-            TensorMeta("model.safetensors", "skip", torch.float32, [3], 72, 12),
+            TensorMeta("model.safetensors", "kv", torch.float32, [4, 2], 72, 32),
+            TensorMeta("model.safetensors", "skip", torch.float32, [3], 104, 12),
         ]
     )
     plan = WeightPlan(
@@ -917,6 +919,22 @@ def test_uma_odirect_weight_plan_summary_counts_payload_bytes():
                 source_slices=(slice(0, 1), slice(None)),
                 read_into_cpu=True,
             ),
+            WeightPlanEntry(
+                "kv",
+                "kv_param",
+                read_into_cpu=True,
+                staging_shape=(2, 2),
+                read_segments=(
+                    WeightPlanReadSegment(
+                        (slice(0, 1), slice(None)),
+                        (slice(0, 1), slice(None)),
+                    ),
+                    WeightPlanReadSegment(
+                        (slice(2, 3), slice(None)),
+                        (slice(1, 2), slice(None)),
+                    ),
+                ),
+            ),
             WeightPlanEntry("skip", "missing", required=False),
             WeightPlanEntry("absent_skip", "missing", required=False),
         )
@@ -924,18 +942,18 @@ def test_uma_odirect_weight_plan_summary_counts_payload_bytes():
 
     summary = summarize_weight_plan(catalog, plan)
 
-    assert summary.entries == 5
-    assert summary.required_entries == 3
+    assert summary.entries == 6
+    assert summary.required_entries == 4
     assert summary.skipped_entries == 2
     assert summary.missing_skipped_entries == 1
     assert summary.full_read_entries == 1
     assert summary.sliced_read_entries == 1
-    assert summary.read_into_entries == 1
+    assert summary.read_into_entries == 2
     assert summary.full_payload_bytes == 8
     assert summary.sliced_payload_bytes == 16
-    assert summary.read_into_payload_bytes == 16
+    assert summary.read_into_payload_bytes == 32
     assert summary.skipped_payload_bytes == 12
-    assert summary.total_read_payload_bytes == 40
+    assert summary.total_read_payload_bytes == 56
 
 
 def test_uma_odirect_weight_plan_summary_rejects_missing_required():
@@ -1194,6 +1212,183 @@ def test_uma_odirect_execute_weight_plan_can_read_into_target_slice(
     assert loaded_tensor[:2].tolist() == [[7.0, 7.0], [7.0, 7.0]]
     stats = source.stats_snapshot()
     assert stats["tensors_read_sliced"] == 1
+
+
+def test_uma_odirect_execute_weight_plan_can_read_segments_into_staging():
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", "kv", torch.float32, [4, 2], 0, 32),
+        ]
+    )
+
+    class FakeSource:
+        def __init__(self):
+            self.catalog = catalog
+            self.calls = []
+
+        def empty_cpu_shape(self, name, shape):
+            assert name == "kv"
+            return torch.zeros(shape, dtype=torch.float32)
+
+        def read_into_cpu(self, name, dst, *, source_slices=None, target_slices=None):
+            self.calls.append((name, source_slices, target_slices))
+            value = len(self.calls)
+            dst[target_slices].fill_(value)
+
+    class FakeParam:
+        def __init__(self):
+            self.loaded = []
+
+        def weight_loader(self, param, tensor, **kwargs):
+            assert param is self
+            assert kwargs == {}
+            self.loaded.append(tensor.clone())
+
+    class FakeModel:
+        def __init__(self):
+            self.param = FakeParam()
+
+    source = FakeSource()
+    model = FakeModel()
+    plan = WeightPlan(
+        (
+            WeightPlanEntry(
+                "kv",
+                "param",
+                read_into_cpu=True,
+                staging_shape=(2, 2),
+                read_segments=(
+                    WeightPlanReadSegment(
+                        (slice(0, 1), slice(None)),
+                        (slice(0, 1), slice(None)),
+                    ),
+                    WeightPlanReadSegment(
+                        (slice(2, 3), slice(None)),
+                        (slice(1, 2), slice(None)),
+                    ),
+                ),
+            ),
+        )
+    )
+
+    loaded = execute_weight_plan(model, source, plan)
+
+    assert loaded == {"param"}
+    assert source.calls == [
+        (
+            "kv",
+            (slice(0, 1), slice(None)),
+            (slice(0, 1), slice(None)),
+        ),
+        (
+            "kv",
+            (slice(2, 3), slice(None)),
+            (slice(1, 2), slice(None)),
+        ),
+    ]
+    assert model.param.loaded[0].tolist() == [[1.0, 1.0], [2.0, 2.0]]
+
+
+def test_uma_odirect_execute_weight_plan_rejects_bad_read_segments():
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", "kv", torch.float32, [4, 2], 0, 32),
+        ]
+    )
+
+    class FakeSource:
+        def __init__(self):
+            self.catalog = catalog
+
+        def empty_cpu_shape(self, _name, shape):
+            return torch.zeros(shape, dtype=torch.float32)
+
+        def read_into_cpu(self, *_args, **_kwargs):
+            raise AssertionError("read should not be reached")
+
+    class FakeParam:
+        def weight_loader(self, _param, _tensor, **_kwargs):
+            raise AssertionError("load should not be reached")
+
+    class FakeModel:
+        param = FakeParam()
+
+    source = FakeSource()
+    segment = WeightPlanReadSegment(
+        (slice(0, 1), slice(None)),
+        (slice(0, 1), slice(None)),
+    )
+
+    with pytest.raises(RuntimeError, match="read_segments.*read_into_cpu"):
+        execute_weight_plan(
+            FakeModel(),
+            source,
+            WeightPlan(
+                (
+                    WeightPlanEntry(
+                        "kv",
+                        "param",
+                        read_segments=(segment,),
+                        staging_shape=(1, 2),
+                    ),
+                )
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match="read_segments requires staging_shape"):
+        execute_weight_plan(
+            FakeModel(),
+            source,
+            WeightPlan(
+                (
+                    WeightPlanEntry(
+                        "kv",
+                        "param",
+                        read_into_cpu=True,
+                        read_segments=(segment,),
+                    ),
+                )
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match="target shape mismatch"):
+        execute_weight_plan(
+            FakeModel(),
+            source,
+            WeightPlan(
+                (
+                    WeightPlanEntry(
+                        "kv",
+                        "param",
+                        read_into_cpu=True,
+                        staging_shape=(2, 2),
+                        read_segments=(
+                            WeightPlanReadSegment(
+                                (slice(0, 2), slice(None)),
+                                (slice(0, 1), slice(None)),
+                            ),
+                        ),
+                    ),
+                )
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match="read_segments cannot be combined"):
+        summarize_weight_plan(
+            catalog,
+            WeightPlan(
+                (
+                    WeightPlanEntry(
+                        "kv",
+                        "param",
+                        read_into_cpu=True,
+                        source_slices=(slice(0, 1), slice(None)),
+                        read_segments=(segment,),
+                        staging_shape=(1, 2),
+                    ),
+                )
+            ),
+        )
 
 
 def test_uma_odirect_execute_weight_plan_rejects_target_slices_without_read_into(

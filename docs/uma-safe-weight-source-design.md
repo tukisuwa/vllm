@@ -154,6 +154,12 @@ class WeightSource:
         source_slices: tuple[slice | int, ...],
     ) -> torch.Tensor: ...
 
+    def empty_cpu_shape(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+    ) -> torch.Tensor: ...
+
     def skip(self, name: str, reason: str) -> None: ...
 ```
 
@@ -179,12 +185,19 @@ Model-side declaration of required checkpoint reads and placements.
 
 ```python
 @dataclass(frozen=True)
+class WeightPlanReadSegment:
+    source_slices: tuple[slice | int, ...]
+    target_slices: tuple[slice | int, ...]
+
+@dataclass(frozen=True)
 class WeightPlanEntry:
     checkpoint_name: str
     target_name: str
     required: bool = True
     source_slices: tuple[slice | int, ...] | None = None
     target_slices: tuple[slice | int, ...] | None = None
+    read_segments: tuple[WeightPlanReadSegment, ...] | None = None
+    staging_shape: tuple[int, ...] | None = None
     shard_id: str | int | None = None
     expert_id: int | None = None
     transform: Callable[[torch.Tensor], torch.Tensor] | None = None
@@ -246,6 +259,16 @@ for entry in plan.entries:
     if entry.can_read_into_param_cpu_view:
         source.read_into_cpu(entry.checkpoint_name, cpu_view, ...)
         param.weight_loader(param, cpu_view, ...)
+    elif entry.read_segments is not None:
+        tensor = source.empty_cpu_shape(entry.checkpoint_name, entry.staging_shape)
+        for segment in entry.read_segments:
+            source.read_into_cpu(
+                entry.checkpoint_name,
+                tensor,
+                source_slices=segment.source_slices,
+                target_slices=segment.target_slices,
+            )
+        param.weight_loader(param, tensor, ...)
     elif entry.source_slices is not None:
         tensor = source.read_slice_cpu(entry.checkpoint_name, entry.source_slices)
         param.weight_loader(param, tensor, ...)
@@ -308,6 +331,11 @@ Implemented so far:
 - `source.empty_cpu(name, source_slices=None)`
   - allocates a correctly shaped CPU staging tensor under WeightSource
     allocation gates and timing stats
+- `source.empty_cpu_shape(name, shape)`
+  - allocates a caller-shaped CPU staging tensor under the same WeightSource
+    allocation gates and timing stats
+  - is used by segmented plan entries that assemble multiple source slices into
+    one staging tensor before calling the existing parameter `weight_loader`
 - source-level stats for model hook reads and compatibility iterator reads
   - files opened
   - tensors read/skipped
@@ -360,6 +388,10 @@ Implemented so far:
     consolidated-checkpoint q/k permutation out of the storage loader
   - uses `source.empty_cpu(...)` for opt-in CPU staging so allocation gates stay
     under WeightSource control
+  - uses `source.empty_cpu_shape(...)` and `WeightPlanReadSegment` for
+    segmented CPU staging reads, allowing a model hook to assemble selected
+    contiguous source slices into one CPU tensor without full checkpoint tensor
+    materialization
   - still rejects `WeightPlanEntry.target_slices` without `read_into_cpu=True`
     because ordinary `weight_loader` calls do not provide a safe destination
     tensor contract
@@ -642,8 +674,9 @@ Runtime metrics to record:
 
 - Which model-side transforms should graduate from callables into named,
   inspectable plan operations?
-- Can we expose destination CPU views for direct `read_into` without violating
-  PyTorch storage assumptions?
+- Can we expose destination parameter/device views for direct `read_into`
+  without violating PyTorch storage assumptions?  CPU segmented staging is now
+  implemented, but direct parameter/device placement is still open.
 - Which tensor slices are contiguous enough to read directly from safetensors
   without reading an enclosing large range?
 - How should online quantization and `uses_meta_device` models integrate?
