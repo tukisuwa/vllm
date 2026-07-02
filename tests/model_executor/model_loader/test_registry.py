@@ -573,6 +573,83 @@ def test_uma_odirect_weight_source_read_into_cpu_full_and_slices(
     assert stats["bytes_sliced_tensor_payload"] == 40
 
 
+def test_uma_odirect_weight_source_read_into_cpu_target_slices(
+    tmp_path, monkeypatch
+):
+    metadata = {
+        "full": {"dtype": "F32", "shape": [2, 2], "data_offsets": [0, 16]},
+        "rows": {"dtype": "F32", "shape": [4, 2], "data_offsets": [16, 48]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 48)
+    calls = []
+
+    class FakeODirectFile:
+        window_size = 64 * 1024 * 1024
+
+        def __init__(self, *_args):
+            self.direct_reads = 0
+            self.window_loads = 0
+            self.window_hits = 0
+            self.bytes_read = 0
+            self.bytes_copied = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback):
+            pass
+
+        def read_record_into_tensor(self, tensor, offset, size, gate=None):
+            calls.append((offset, size, tuple(tensor.shape)))
+            self.direct_reads += 1
+            self.bytes_read += size
+            self.bytes_copied += size
+            tensor.fill_(len(calls))
+            if gate is not None:
+                gate(size)
+
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(load_format="uma_odirect_safetensors")
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.uma_odirect_safetensors_loader."
+        "_ODirectFile",
+        FakeODirectFile,
+    )
+
+    source = ODirectSafetensorsWeightSource(loader, str(tmp_path))
+    dst = torch.zeros(4, 2)
+    source.read_into_cpu("full", dst, target_slices=(slice(1, 3), slice(None)))
+    source.read_into_cpu(
+        "rows",
+        dst,
+        source_slices=(slice(2, 4), slice(None)),
+        target_slices=(slice(0, 2), slice(None)),
+    )
+
+    full_record = source.catalog.get("full")
+    rows_record = source.catalog.get("rows")
+    assert calls == [
+        (full_record.offset, 16, (2, 2)),
+        (rows_record.offset + 16, 16, (2, 2)),
+    ]
+    assert dst.tolist() == [
+        [2.0, 2.0],
+        [2.0, 2.0],
+        [1.0, 1.0],
+        [0.0, 0.0],
+    ]
+
+    with pytest.raises(RuntimeError, match="target slice .*contiguous"):
+        source.read_into_cpu(
+            "full",
+            torch.zeros(2, 4),
+            target_slices=(slice(None), slice(1, 3)),
+        )
+
+
 def test_uma_odirect_weight_source_empty_cpu_uses_source_shape(tmp_path, monkeypatch):
     metadata = {"a": {"dtype": "F32", "shape": [2, 4], "data_offsets": [0, 32]}}
     path = tmp_path / "model.safetensors"

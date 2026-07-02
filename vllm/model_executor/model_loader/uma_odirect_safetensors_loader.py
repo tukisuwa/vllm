@@ -251,6 +251,34 @@ def _normalize_single_dim_slice_selection(
     )
 
 
+def _select_contiguous_target_view(
+    dst: torch.Tensor,
+    target_slices: tuple[slice | int, ...] | None,
+    name: str,
+) -> torch.Tensor:
+    if target_slices is None:
+        return dst
+    if len(target_slices) != dst.ndim:
+        raise RuntimeError(
+            f"read_into_cpu target slice rank mismatch for {name}: "
+            f"got {len(target_slices)} indices for dst shape {list(dst.shape)}"
+        )
+    try:
+        target = dst[target_slices]
+    except Exception as exc:
+        raise RuntimeError(
+            f"read_into_cpu invalid target slice for {name}: {target_slices!r}"
+        ) from exc
+    if not isinstance(target, torch.Tensor):
+        raise RuntimeError(f"read_into_cpu target slice for {name} is not a tensor")
+    if not target.is_contiguous():
+        raise RuntimeError(
+            f"read_into_cpu target slice for {name} must be contiguous: "
+            f"{target_slices!r}"
+        )
+    return target
+
+
 @dataclass(frozen=True)
 class TensorMeta:
     """Metadata-only view of one safetensors tensor payload.
@@ -278,6 +306,7 @@ class WeightPlanEntry:
     target_name: str
     required: bool = True
     source_slices: tuple[slice | int, ...] | None = None
+    target_slices: tuple[slice | int, ...] | None = None
     source_is_sharded: bool = False
     read_into_cpu: bool = False
     shard_id: str | int | None = None
@@ -651,6 +680,13 @@ def execute_weight_plan(
             )
             source_is_sharded = source_slices is not None
 
+        if entry.target_slices is not None:
+            raise RuntimeError(
+                "WeightPlanEntry.target_slices requires a caller-provided "
+                f"destination tensor and is not supported by execute_weight_plan: "
+                f"{entry.checkpoint_name}"
+            )
+
         if entry.read_into_cpu:
             tensor = source.empty_cpu(
                 entry.checkpoint_name,
@@ -660,6 +696,7 @@ def execute_weight_plan(
                 entry.checkpoint_name,
                 tensor,
                 source_slices=source_slices,
+                target_slices=entry.target_slices,
             )
         elif source_slices is None:
             tensor = source.read_full_cpu(entry.checkpoint_name)
@@ -990,6 +1027,7 @@ class ODirectSafetensorsWeightSource:
         dst: torch.Tensor,
         *,
         source_slices: tuple[slice | int, ...] | None = None,
+        target_slices: tuple[slice | int, ...] | None = None,
     ) -> None:
         record = self.catalog.get(name)
         if dst.device.type != "cpu":
@@ -1005,13 +1043,15 @@ class ODirectSafetensorsWeightSource:
         if not dst.is_contiguous():
             raise RuntimeError(f"read_into_cpu requires a contiguous dst for {name}")
 
+        target = _select_contiguous_target_view(dst, target_slices, name)
+
         if source_slices is None:
-            if list(dst.shape) != record.shape:
+            if list(target.shape) != record.shape:
                 raise RuntimeError(
                     f"read_into_cpu shape mismatch for {name}: "
-                    f"dst={list(dst.shape)}, source={record.shape}"
+                    f"dst={list(target.shape)}, source={record.shape}"
                 )
-            self._read_record_into_cpu(record, dst, sliced=False)
+            self._read_record_into_cpu(record, target, sliced=False)
             return
 
         try:
@@ -1026,18 +1066,18 @@ class ODirectSafetensorsWeightSource:
             )
             if strided is None:
                 raise exc
-            if list(dst.shape) != strided[4]:
+            if list(target.shape) != strided[4]:
                 raise RuntimeError(
                     f"read_into_cpu shape mismatch for {name}: "
-                    f"dst={list(dst.shape)}, source_slice={strided[4]}"
+                    f"dst={list(target.shape)}, source_slice={strided[4]}"
                 )
-            self._read_strided_slice_into_cpu(record, strided, dst)
+            self._read_strided_slice_into_cpu(record, strided, target)
             return
 
-        if list(dst.shape) != output_shape:
+        if list(target.shape) != output_shape:
             raise RuntimeError(
                 f"read_into_cpu shape mismatch for {name}: "
-                f"dst={list(dst.shape)}, source_slice={output_shape}"
+                f"dst={list(target.shape)}, source_slice={output_shape}"
             )
         element_size = _DTYPE_NBYTES[record.dtype]
         slice_record = TensorMeta(
@@ -1048,7 +1088,7 @@ class ODirectSafetensorsWeightSource:
             offset=record.offset + element_offset * element_size,
             size=element_count * element_size,
         )
-        self._read_record_into_cpu(slice_record, dst, sliced=True)
+        self._read_record_into_cpu(slice_record, target, sliced=True)
 
     def _read_strided_slice_cpu(
         self,

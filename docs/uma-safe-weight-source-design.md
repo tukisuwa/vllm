@@ -292,9 +292,11 @@ Implemented so far:
   - rejects stepped or more complex non-contiguous slices instead of full-tensor
     fallback
   - records only the requested payload bytes in source stats
-- `source.read_into_cpu(name, dst, source_slices=None)`
+- `source.read_into_cpu(name, dst, source_slices=None, target_slices=None)`
   - reads full, contiguous slice, or supported single-dimension strided slice
     directly into a caller-provided contiguous CPU tensor
+  - can place the read into a contiguous target slice of that CPU tensor; more
+    complex non-contiguous target views fail closed
   - validates destination dtype, shape, device, and contiguity fail-closed
   - is implemented as a WeightSource primitive; model executors do not yet use
     it for parameter placement by default
@@ -338,6 +340,8 @@ Implemented so far:
     parameter/device direct placement is still future work
   - uses `source.empty_cpu(...)` for opt-in CPU staging so allocation gates stay
     under WeightSource control
+  - rejects `WeightPlanEntry.target_slices` for now because the generic executor
+    does not yet own a caller-provided destination tensor
 - tests for catalog lookup, source construction, full CPU reads, contiguous
   slice reads, source stats, optional model hook dispatch, name-only plan
   building, and basic plan execution
