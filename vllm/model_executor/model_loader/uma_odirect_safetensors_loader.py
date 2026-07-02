@@ -886,6 +886,7 @@ class _SourceReadStats:
     time_gate: float = 0.0
     time_alloc: float = 0.0
     time_read: float = 0.0
+    time_consumer: float = 0.0
 
     def collect_file(self, file: "_ODirectFile") -> None:
         self.direct_reads += getattr(file, "direct_reads", 0)
@@ -920,11 +921,12 @@ class _SourceReadStats:
         )
         logger.info(
             "uma_odirect_safetensors source timings (%s): gate=%.3fs "
-            "alloc=%.3fs read_copy=%.3fs",
+            "alloc=%.3fs read_copy=%.3fs consumer=%.3fs",
             label,
             self.time_gate,
             self.time_alloc,
             self.time_read,
+            self.time_consumer,
         )
 
     def snapshot(self) -> dict[str, int | float]:
@@ -946,6 +948,7 @@ class _SourceReadStats:
             "time_gate": self.time_gate,
             "time_alloc": self.time_alloc,
             "time_read": self.time_read,
+            "time_consumer": self.time_consumer,
         }
 
 
@@ -972,10 +975,78 @@ class ODirectSafetensorsWeightSource:
     def iter_full_tensors(
         self,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        yield from self._loader._iter_records(
-            self.files,
-            self.catalog,
+        records = self.catalog.records()
+        logger.info(
+            "uma_odirect_safetensors using O_DIRECT source iterator: files=%d "
+            "tensors=%d total=%s chunk_size=%d window_size=%d alignment=%d",
+            len(self.files),
+            len(records),
+            _format_gib(self.catalog.total_bytes()),
+            self._loader._chunk_size,
+            self._loader._window_size,
+            self._loader._alignment,
         )
+        consumer_profile = (
+            _ConsumerProfile()
+            if os.environ.get("VLLM_UMA_LOAD_PROFILE", "").lower()
+            in ("1", "true", "yes", "on")
+            else None
+        )
+
+        current_path: str | None = None
+        odirect_file: _ODirectFile | None = None
+        try:
+            for record in records:
+                if record.file_path != current_path:
+                    if odirect_file is not None:
+                        self._stats.collect_file(odirect_file)
+                        odirect_file.close()
+                    current_path = record.file_path
+                    odirect_file = _ODirectFile(
+                        current_path,
+                        self._loader._chunk_size,
+                        self._loader._alignment,
+                        self._loader._window_size,
+                    )
+                    self._stats.files_opened += 1
+
+                assert odirect_file is not None
+                tensor, time_alloc, time_read = self._loader._read_record_tensor(
+                    record,
+                    odirect_file,
+                    self._note_loaded_bytes,
+                    gate_memory=lambda reason: self._maybe_gate(reason, force=True),
+                )
+                self._stats.tensors_read += 1
+                self._stats.tensors_read_full += 1
+                self._stats.bytes_tensor_payload += record.size
+                self._stats.bytes_full_tensor_payload += record.size
+                self._stats.time_alloc += time_alloc
+                self._stats.time_read += time_read
+
+                t0 = time.perf_counter()
+                yield record.name, tensor
+                elapsed_consumer = time.perf_counter() - t0
+                self._stats.time_consumer += elapsed_consumer
+                if consumer_profile is not None:
+                    consumer_profile.record(record, elapsed_consumer)
+        finally:
+            if sys.exc_info()[0] is None:
+                self._maybe_gate("final", force=True)
+            else:
+                try:
+                    self._maybe_gate("final", force=True)
+                except Exception:
+                    logger.warning(
+                        "uma_odirect_safetensors final source gate failed while "
+                        "another load error was already being raised",
+                        exc_info=True,
+                    )
+            if odirect_file is not None:
+                self._stats.collect_file(odirect_file)
+                odirect_file.close()
+            if consumer_profile is not None:
+                consumer_profile.log()
 
     def read_full_cpu(self, name: str) -> torch.Tensor:
         record = self.catalog.get(name)
@@ -2021,4 +2092,7 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
             "uma_odirect_safetensors using compatibility iterator path: %s",
             type(model).__name__,
         )
-        model.load_weights(source.iter_full_tensors())
+        try:
+            model.load_weights(source.iter_full_tensors())
+        finally:
+            source.log_stats("compat-iterator")

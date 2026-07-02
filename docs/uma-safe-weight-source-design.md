@@ -306,12 +306,14 @@ Implemented so far:
 - `source.empty_cpu(name, source_slices=None)`
   - allocates a correctly shaped CPU staging tensor under WeightSource
     allocation gates and timing stats
-- source-level stats for model hook reads
+- source-level stats for model hook reads and compatibility iterator reads
   - files opened
   - tensors read/skipped
   - direct reads/window reads
   - bytes read/copied/payload/skipped
   - gate/allocation/read timing
+- compatibility iterator path now uses `ODirectSafetensorsWeightSource`
+  orchestration and logs the same source stats as model-side WeightPlan loads
 - stable `source.stats_snapshot()` for tests and diagnostics
 - minimal `WeightPlanEntry`, `WeightPlan`, and `execute_weight_plan(...)`
   - supports required/skipped entries

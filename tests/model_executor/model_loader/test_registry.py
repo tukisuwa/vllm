@@ -459,6 +459,67 @@ def test_uma_odirect_weight_source_read_full_cpu(tmp_path, monkeypatch):
     assert stats["bytes_skipped_payload"] == 0
 
 
+def test_uma_odirect_weight_source_iter_full_tensors_updates_source_stats(
+    tmp_path, monkeypatch
+):
+    metadata = {
+        "a": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "b": {"dtype": "F32", "shape": [2], "data_offsets": [4, 12]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 12)
+
+    class FakeODirectFile:
+        window_size = 64 * 1024 * 1024
+
+        def __init__(self, *_args):
+            self.direct_reads = 0
+            self.window_loads = 0
+            self.window_hits = 0
+            self.bytes_read = 0
+            self.bytes_copied = 0
+            self.closed = False
+
+        def read_record_into_tensor(self, tensor, _offset, size, gate=None):
+            self.direct_reads += 1
+            self.bytes_read += size
+            self.bytes_copied += size
+            tensor.fill_(size)
+            if gate is not None:
+                gate(size)
+
+        def close(self):
+            self.closed = True
+
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(load_format="uma_odirect_safetensors")
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.uma_odirect_safetensors_loader."
+        "_ODirectFile",
+        FakeODirectFile,
+    )
+
+    source = ODirectSafetensorsWeightSource(loader, str(tmp_path))
+    items = list(source.iter_full_tensors())
+
+    assert [name for name, _tensor in items] == ["a", "b"]
+    assert items[0][1].tolist() == [4.0]
+    assert items[1][1].tolist() == [8.0, 8.0]
+    stats = source.stats_snapshot()
+    assert stats["files_opened"] == 1
+    assert stats["tensors_read"] == 2
+    assert stats["tensors_read_full"] == 2
+    assert stats["tensors_read_sliced"] == 0
+    assert stats["direct_reads"] == 2
+    assert stats["bytes_read"] == 12
+    assert stats["bytes_copied"] == 12
+    assert stats["bytes_tensor_payload"] == 12
+    assert stats["bytes_full_tensor_payload"] == 12
+    assert stats["bytes_sliced_tensor_payload"] == 0
+
+
 def test_uma_odirect_weight_source_read_contiguous_slice_cpu(tmp_path, monkeypatch):
     metadata = {"a": {"dtype": "F32", "shape": [4, 3], "data_offsets": [0, 48]}}
     path = tmp_path / "model.safetensors"
