@@ -232,10 +232,10 @@ Responsibilities:
   unsupported dtypes;
 - expose shape, dtype, file, and byte range.
 
-This already exists in prototype form inside
-`uma_odirect_safetensors_loader.py`.
+This started as a prototype inside `uma_odirect_safetensors_loader.py` and is
+now being extracted into neutral model-loader IR modules.
 
-### 2. Weight Semantics
+### 2. SemanticSpec / Weight Semantics
 
 Model/module/parameter-side declaration of how checkpoint names map to runtime
 parameters.
@@ -271,7 +271,29 @@ The important property is not the exact class names.  The important property is
 that these are inspectable declarations rather than arbitrary file I/O or
 loader-specific Python branches.
 
-### 3. PlacementPlan / WeightPlan
+At this layer, the declaration is still abstract.  It should not decide which
+checkpoint tensor actually exists, which file offset will be read, or which
+rank-local slice this worker owns.  Those decisions belong to later planning
+stages.
+
+### 3. ResolvedWeightBinding
+
+Catalog-resolved binding between semantic declarations and checkpoint metadata.
+
+It answers:
+
+- which checkpoint tensors match each semantic source pattern;
+- whether a tensor is missing, optional, tied, duplicate, or ambiguous;
+- which legacy name mapping, if any, was used;
+- which target runtime parameter each source group binds to;
+- whether the binding is valid before rank-local placement is considered.
+
+This prevents model-name resolution from leaking into storage executors.  A
+storage executor should receive resolved records and byte ranges, not infer
+whether `q_proj.weight`, `query.weight`, or a fused checkpoint tensor is the
+right source for a model family.
+
+### 4. RankLocalPlacementPlan / WeightPlan
 
 Rank-local, executable IR.
 
@@ -286,11 +308,47 @@ It answers:
 - how much payload will be read before execution starts.
 
 The current `WeightPlan`, `WeightPlanEntry`, and `WeightPlanReadSegment` are a
-good prototype, but they are still named and packaged as part of the
-UMA-specific loader.  The roadmap is to move them toward a generic model
-executor loading IR.
+good prototype.  `WeightPlan` is intentionally kept as the Phase 1 name to
+avoid churn, but it should narrow toward `RankLocalPlacementPlan` semantics over
+time.  Later phases should introduce aliases or replacements for clearer names
+such as `SemanticWeightSpec`, `ResolvedWeightBinding`, `PlacementPlan`, and
+`ReadSchedule`.
 
-### 4. PlanExecutor
+### 5. ExecutorCapability
+
+Executor capability contract used to validate whether a placement plan can be
+scheduled safely.
+
+Examples:
+
+```text
+ODirectSafetensorsPlanExecutor:
+  supports_partial_read = true
+  supports_strided_read = false
+  requires_alignment = true
+  max_staging_bytes = configured
+  allows_mmap = false
+  fail_closed = true
+
+OrdinarySafetensorsPlanExecutor:
+  supports_partial_read = maybe
+  supports_full_tensor_fallback = true
+  allows_page_cache = true
+  fail_closed = false
+```
+
+The planner should combine:
+
+```text
+PlacementPlan + ExecutorCapability
+  -> ExecutableReadSchedule
+```
+
+This keeps unsupported slices, transforms, layouts, staging sizes, and fallback
+policies out of ad hoc executor branches.  UMA-safe executors should reject
+unsupported plans before payload reads.
+
+### 6. PlanExecutor
 
 Executes a `PlacementPlan`.
 
@@ -317,7 +375,7 @@ UMA-specific executor requirements:
 Non-UMA executors may choose faster or more permissive behavior while using the
 same plan.
 
-### 5. ReadSchedulePlan
+### 7. ReadSchedulePlan
 
 Executor-facing schedule derived from a `PlacementPlan`.
 
@@ -340,6 +398,10 @@ This keeps range coalescing model-independent.  It also avoids treating
 read scheduling is the architectural layer that prevents repeated large reads
 for many small tensors.
 
+Placement and scheduling should remain separate.  Placement describes what this
+rank needs and where it goes; scheduling describes how an executor groups,
+orders, gates, and releases concrete reads.
+
 ## What This Means for the Current Branch
 
 The current branch is valid as an operational mitigation, but it should be
@@ -360,6 +422,10 @@ Avoid doing:
 - adding a new external loader path without making it consume the same plan;
 - allowing hidden fallback from plan execution to the legacy full-tensor
   iterator in UMA-safe mode.
+- growing `build_auto_weight_plan_*` into an implicit semantic dispatcher.
+  Auto-plan helpers should remain limited to trivial exact-name compatibility
+  cases; fused, quantized, expert-parallel, transformed, or non-local layouts
+  should require explicit semantic specs or model hooks.
 
 Near-term model hooks should be written as if they are future plan builders, not
 as one-off loaders.  They should build entries, summarize read volume, and then
@@ -493,3 +559,32 @@ For this branch, the next useful work is:
 This lets the branch keep solving the immediate UMA safety problem while moving
 toward a loader architecture that does not grow a new special-case path for
 every model and every load format.
+
+## Implementation Notes
+
+### 2026-07-03 Phase 1 start
+
+The first extraction step moved the metadata and plan representation out of the
+O_DIRECT safetensors loader into:
+
+```text
+vllm/model_executor/model_loader/weight_plan.py
+```
+
+The neutral module now owns:
+
+- `TensorMeta`
+- `TensorCatalog`
+- `WeightPlan`
+- `WeightPlanEntry`
+- `WeightPlanReadSegment`
+- `WeightPlanSummary`
+- `summarize_weight_plan`
+- `build_auto_weight_plan_from_catalog`
+- `build_auto_weight_plan_for_module`
+
+`uma_odirect_safetensors_loader.py` imports and re-exports these names for
+compatibility, so existing model hooks can continue importing from the old
+loader path while future hooks can import the neutral IR directly.  A small
+unit test was added for plan construction and summary accounting without
+instantiating the O_DIRECT loader.
