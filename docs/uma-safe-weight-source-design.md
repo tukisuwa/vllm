@@ -435,8 +435,9 @@ Current limitations:
 
 ### Phase 4: Qwen MoE prototype
 
-Status: started with `Qwen3MoeForCausalLM`, `Qwen3NextForCausalLM`,
-`Qwen3_5MoeForCausalLM`, and `Qwen3_5MoeForConditionalGeneration`.
+Status: started with `Qwen2MoeForCausalLM`, `Qwen3MoeForCausalLM`,
+`Qwen3NextForCausalLM`, `Qwen3_5MoeForCausalLM`, and
+`Qwen3_5MoeForConditionalGeneration`.
 
 Replace `direct_per_expert_moe` with a model-side plan for Qwen MoE.
 
@@ -450,6 +451,8 @@ Target behavior:
   Qwen-family MoE per-expert gate/up/down naming
 - quant payload and scale suffixes are handled by the model plan, not by loader:
   implemented for suffix-based Qwen-family MoE routed expert targets
+- Qwen2 MoE reuses the Qwen-family helper while preserving its HF-to-vLLM
+  mapper for QKV, dense MLP, and shared expert dense projections
 - nested `language_model.model.layers` wrappers are supported for Qwen3.5 MoE
   conditional generation
 
@@ -505,7 +508,7 @@ Expected current behavior:
 | --- | --- | --- |
 | Dense safetensors | Should work if normal vLLM load works | Phase 3 |
 | Sharded dense safetensors | Should work if no duplicate names | Phase 3 |
-| Qwen routed MoE | Base path should work if normal vLLM load works | Phase 4 model hook; loader-side direct path removed |
+| Qwen2/Qwen3 routed MoE | Base path should work if normal vLLM load works | Phase 4 model hook; loader-side direct path removed |
 | Mixtral routed MoE | Base path should work if normal vLLM load works | Phase 5 initial model hook |
 | DeepSeek V2/V3 routed MoE | Base path should work if normal vLLM load works | Conservative Phase 5 hook; shared-expert fusion and FP8 indexer WK fusion rejected |
 | Granite MoE / Granite MoE Shared | Base path should work if normal vLLM load works | Phase 5 initial model hook |

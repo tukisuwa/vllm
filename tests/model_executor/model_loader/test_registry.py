@@ -32,6 +32,7 @@ from vllm.model_executor.models import (
     granitemoeshared,
     llama,
     mixtral,
+    qwen2_moe,
     qwen3,
     qwen3_5,
     qwen3_moe,
@@ -2188,6 +2189,7 @@ def test_granitemoe_hybrid_source_hook_uses_hybrid_options(monkeypatch):
 @pytest.mark.parametrize(
     "model_cls, module",
     [
+        (qwen2_moe.Qwen2MoeForCausalLM, qwen2_moe),
         (qwen3_moe.Qwen3MoeForCausalLM, qwen3_moe),
         (qwen3_next.Qwen3NextForCausalLM, qwen3_next),
         (qwen3_5.Qwen3_5MoeForCausalLM, qwen3_5),
@@ -2228,6 +2230,39 @@ def test_qwen_moe_source_hook_delegates_to_shared_helper(
     assert calls[0][0] == "build"
     assert calls[0][1] is model
     assert calls[0][2] is catalog
+    assert calls[1] == ("load", model, source, "plan")
+
+
+def test_qwen2_moe_source_hook_passes_hf_mapper_and_tie_skip(monkeypatch):
+    calls = []
+
+    def fake_build(model, catalog, **kwargs):
+        calls.append(("build", model, catalog, kwargs))
+        return "plan"
+
+    def fake_load(model, source, plan):
+        calls.append(("load", model, source, plan))
+        return {"loaded"}
+
+    monkeypatch.setattr(qwen2_moe, "build_qwen_moe_weight_plan", fake_build)
+    monkeypatch.setattr(qwen2_moe, "load_qwen_moe_weights_from_source", fake_load)
+
+    class FakeConfig:
+        tie_word_embeddings = True
+
+    class FakeQwen2Moe(qwen2_moe.Qwen2MoeForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = FakeConfig()
+
+    model = FakeQwen2Moe()
+    catalog = object()
+    source = object()
+
+    assert model.build_weight_plan(catalog) == "plan"
+    assert model.load_weights_from_source(source, "plan") == {"loaded"}
+    assert calls[0][3]["mapper"] is qwen2_moe.Qwen2MoeForCausalLM.hf_to_vllm_mapper
+    assert calls[0][3]["skip_prefixes"] == ["lm_head."]
     assert calls[1] == ("load", model, source, "plan")
 
 
