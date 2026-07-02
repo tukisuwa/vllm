@@ -30,6 +30,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 from vllm.model_executor.models import (
     apertus,
     arcee,
+    chatglm,
     commandr,
     cohere2_moe,
     deepseek_uma,
@@ -2636,6 +2637,50 @@ def test_minimax_m2_build_weight_plan_replays_inner_mapper_and_mtp_skip(tmp_path
     assert entries["lm_head.weight"].required is True
 
 
+def test_chatglm_build_weight_plan_replays_transformer_child_mapper(tmp_path):
+    metadata = {
+        "transformer.embedding.word_embeddings.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [0, 4],
+        },
+        "transformer.encoder.layers.0.self_attention.query_key_value.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "transformer.output_layer.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [8, 12],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 12)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeChatGLM:
+        def children(self):
+            return []
+
+    plan = chatglm.ChatGLMForCausalLM.build_weight_plan(FakeChatGLM(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["transformer.embedding.word_embeddings.weight"].target_name == (
+        "transformer.embedding.weight"
+    )
+    qkv = entries["transformer.encoder.layers.0.self_attention.query_key_value.weight"]
+    assert qkv.target_name == (
+        "transformer.encoder.layers.0.self_attention.query_key_value.weight"
+    )
+    assert entries["transformer.output_layer.weight"].target_name == (
+        "transformer.output_layer.weight"
+    )
+
+
 @pytest.mark.parametrize(
     "model_cls, module",
     [
@@ -2649,6 +2694,7 @@ def test_minimax_m2_build_weight_plan_replays_inner_mapper_and_mtp_skip(tmp_path
         (mamba2.Mamba2ForCausalLM, mamba2),
         (hrm_text.HrmTextForCausalLM, hrm_text),
         (minimax_m2.MiniMaxM2ForCausalLM, minimax_m2),
+        (chatglm.ChatGLMForCausalLM, chatglm),
     ],
 )
 def test_more_dense_load_weights_from_source_delegates_to_executor(

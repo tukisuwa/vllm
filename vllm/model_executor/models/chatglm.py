@@ -6,6 +6,7 @@
 
 import json
 from collections.abc import Iterable
+from dataclasses import replace
 from itertools import islice
 
 import torch
@@ -30,9 +31,15 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+    WeightPlan,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.chatglm import ChatGLMConfig
 
+from .auto_uma import build_auto_uma_weight_plan, load_auto_uma_weights_from_source
 from .interfaces import SupportsLoRA, SupportsPP, SupportsQuant
 from .utils import (
     AutoWeightsLoader,
@@ -447,6 +454,35 @@ class ChatGLMForCausalLM(ChatGLMBaseModel, SupportsLoRA, SupportsPP, SupportsQua
             )
 
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
+        def name_transform(name: str):
+            if name.startswith("transformer."):
+                return name[len("transformer.") :], None
+            return name, None
+
+        plan = build_auto_uma_weight_plan(
+            self,
+            catalog,
+            mapper=ChatGLMModel.hf_to_vllm_mapper,
+            name_transform=name_transform,
+        )
+        entries = []
+        for entry in plan:
+            if entry.checkpoint_name.startswith("transformer."):
+                entries.append(
+                    replace(entry, target_name=f"transformer.{entry.target_name}")
+                )
+            else:
+                entries.append(entry)
+        return WeightPlan(tuple(entries))
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: WeightPlan,
+    ) -> set[str]:
+        return load_auto_uma_weights_from_source(self, source, plan)
 
     def forward(
         self,
