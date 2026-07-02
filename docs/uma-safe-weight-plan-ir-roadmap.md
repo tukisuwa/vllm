@@ -614,3 +614,9 @@ The first helper on top of these contracts is
 `resolve_weight_plan_source_hooks(model)`, which centralizes the fail-closed
 check that a model implements both hooks or neither.  The O_DIRECT loader now
 uses this neutral helper instead of open-coding the hook detection.
+
+The neutral module also defines the initial `ExecutorCapability` dataclass and
+an `ExecutorCapability.uma_odirect()` constructor.  This is not wired into read
+scheduling yet, but it gives future schedule validation a model-independent
+place to express fail-closed behavior, mmap policy, alignment requirements, and
+staging limits.

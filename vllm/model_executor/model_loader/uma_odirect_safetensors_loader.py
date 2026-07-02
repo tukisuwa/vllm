@@ -20,6 +20,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.weight_plan import (
     _DTYPE_NBYTES,
+    ExecutorCapability,
     TensorCatalog,
     TensorMeta,
     WeightPlan,
@@ -45,6 +46,7 @@ logger = init_logger(__name__)
 
 __all__ = [
     "ODirectSafetensorsWeightSource",
+    "ExecutorCapability",
     "TensorCatalog",
     "TensorMeta",
     "UmaODirectSafetensorsModelLoader",

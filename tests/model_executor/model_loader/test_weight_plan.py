@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from vllm.model_executor.model_loader.weight_plan import (
+    ExecutorCapability,
     TensorCatalog,
     TensorMeta,
     WeightPlan,
@@ -90,3 +91,15 @@ def test_resolve_weight_plan_source_hooks_requires_complete_contract():
     build_weight_plan, load_weights_from_source = hooks
     assert build_weight_plan("catalog") == "catalog"
     assert load_weights_from_source("source", "plan") == {"loaded"}
+
+
+def test_executor_capability_uma_odirect_defaults_fail_closed():
+    capability = ExecutorCapability.uma_odirect(max_staging_bytes=1024)
+
+    assert capability.supports_partial_read is True
+    assert capability.supports_strided_read is True
+    assert capability.requires_alignment is True
+    assert capability.allows_mmap is False
+    assert capability.supports_full_tensor_fallback is False
+    assert capability.fail_closed is True
+    assert capability.max_staging_bytes == 1024

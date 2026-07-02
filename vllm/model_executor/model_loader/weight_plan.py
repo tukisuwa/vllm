@@ -412,6 +412,36 @@ class WeightPlanSourceModel(WeightPlanBuilder, WeightPlanExecutor, Protocol):
     """Model that supports the planner/executor WeightSource path."""
 
 
+@dataclass(frozen=True)
+class ExecutorCapability:
+    """Executor features used to validate a plan before scheduling reads."""
+
+    supports_partial_read: bool
+    supports_strided_read: bool
+    requires_alignment: bool
+    allows_mmap: bool
+    supports_full_tensor_fallback: bool
+    fail_closed: bool
+    max_staging_bytes: int | None = None
+
+    @classmethod
+    def uma_odirect(
+        cls,
+        *,
+        max_staging_bytes: int | None = None,
+        supports_strided_read: bool = True,
+    ) -> "ExecutorCapability":
+        return cls(
+            supports_partial_read=True,
+            supports_strided_read=supports_strided_read,
+            requires_alignment=True,
+            allows_mmap=False,
+            supports_full_tensor_fallback=False,
+            fail_closed=True,
+            max_staging_bytes=max_staging_bytes,
+        )
+
+
 WeightPlanBuildFn = Callable[[TensorCatalog], WeightPlan]
 WeightPlanExecuteFn = Callable[[object, WeightPlan], set[str]]
 
