@@ -43,6 +43,7 @@ from vllm.model_executor.models import (
     gemma,
     gemma2,
     gemma3,
+    glm4,
     gpt_bigcode,
     gpt_j,
     gpt_neox,
@@ -2778,6 +2779,47 @@ def test_mistral3_build_weight_plan_uses_multimodal_mapper(tmp_path):
     assert entries["lm_head.weight"].target_name == "language_model.lm_head.weight"
 
 
+def test_glm4_build_weight_plan_skips_tied_lm_head_and_spec_layers(tmp_path):
+    metadata = {
+        "model.layers.0.self_attn.qkv_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [0, 4],
+        },
+        "model.layers.2.self_attn.qkv_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [8, 12]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 12)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+        num_hidden_layers = 2
+        num_nextn_predict_layers = 1
+
+    class FakeGlm4:
+        config = FakeConfig()
+        _weight_skip_prefixes = glm4.Glm4ForCausalLM._weight_skip_prefixes
+
+        def children(self):
+            return []
+
+    plan = glm4.Glm4ForCausalLM.build_weight_plan(FakeGlm4(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["model.layers.0.self_attn.qkv_proj.weight"].required is True
+    assert entries["model.layers.2.self_attn.qkv_proj.weight"].required is False
+    assert entries["lm_head.weight"].required is False
+
+
 @pytest.mark.parametrize(
     "model_cls, module",
     [
@@ -2794,6 +2836,7 @@ def test_mistral3_build_weight_plan_uses_multimodal_mapper(tmp_path):
         (chatglm.ChatGLMForCausalLM, chatglm),
         (nemotron_nas.DeciLMForCausalLM, nemotron_nas),
         (mistral3.Mistral3ForConditionalGeneration, mistral3),
+        (glm4.Glm4ForCausalLM, glm4),
     ],
 )
 def test_more_dense_load_weights_from_source_delegates_to_executor(
