@@ -18,6 +18,7 @@ from vllm.model_executor.model_loader.uma_safetensors_loader import (
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
     TensorCatalog,
+    TensorMeta,
     UmaODirectSafetensorsModelLoader,
     WeightPlan,
     WeightPlanEntry,
@@ -26,7 +27,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     build_auto_weight_plan_from_catalog,
     execute_weight_plan,
 )
-from vllm.model_executor.models import llama, qwen3
+from vllm.model_executor.models import llama, qwen3, qwen3_moe
 from vllm.model_executor.models.utils import WeightsMapper
 
 
@@ -1020,6 +1021,90 @@ def test_llama_load_weights_from_source_delegates_to_executor(monkeypatch):
 
     assert loaded == {"loaded"}
     assert calls == [(model, source, plan)]
+
+
+def test_qwen3_moe_source_plan_skips_nonlocal_experts_before_read():
+    names = [
+        "model.layers.0.mlp.experts.0.gate_proj.weight",
+        "model.layers.0.mlp.experts.1.gate_proj.weight",
+    ]
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", names[0], torch.float32, [1], 0, 4),
+            TensorMeta("model.safetensors", names[1], torch.float32, [1], 4, 4),
+        ]
+    )
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.mlp.experts.routed_experts"
+        w13_weight = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 0 else -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeExperts:
+        def __init__(self, routed_experts):
+            self.routed_experts = routed_experts
+
+    class FakeMLP:
+        def __init__(self, routed_experts):
+            self.experts = FakeExperts(routed_experts)
+
+    class FakeLayer:
+        def __init__(self, routed_experts):
+            self.mlp = FakeMLP(routed_experts)
+
+    class FakeInnerModel:
+        def __init__(self, routed_experts):
+            self.layers = [FakeLayer(routed_experts)]
+
+    class FakeConfig:
+        tie_word_embeddings = False
+
+    class FakeQwen3Moe(qwen3_moe.Qwen3MoeForCausalLM):
+        hf_to_vllm_mapper = None
+
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = FakeConfig()
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            return torch.ones(1)
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    model = FakeQwen3Moe()
+    source = FakeSource(catalog)
+
+    plan = model.build_weight_plan(catalog)
+    assert len(plan.auto_plan.entries) == 0
+    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+
+    loaded = model.load_weights_from_source(source, plan)
+
+    assert source.reads == [names[0]]
+    assert source.skips == [(names[1], "non-local routed expert")]
+    assert loaded == {"model.layers.0.mlp.experts.routed_experts.w13_weight"}
+    assert model.routed_experts.calls[0]["expert_id"] == 0
+    assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
 
 def test_uma_odirect_model_source_hook_requires_both_methods(tmp_path, monkeypatch):
