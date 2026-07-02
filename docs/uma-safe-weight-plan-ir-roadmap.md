@@ -1024,3 +1024,21 @@ entries rather than rows.  Source stats also compare actual `bytes_read` to the
 scheduled expectation after execution and warn when actual exceeds expected by
 more than 10%, making read-amplification regression detection permanent in the
 load logs.
+
+DGX Spark validation after the Stage 2 follow-up:
+
+```text
+Model                         Expected   Actual   Amplification  Load time
+PrimeIntellect tiny MoE        1.25 GiB  1.25 GiB         1.00x     0.77 s
+tiny-random-qwen3.5 MoE        0.01 GiB  0.01 GiB         1.00x     0.40 s
+Qwen3.6 35B NVFP4             22.23 GiB 22.23 GiB         1.02x    23.46 s
+```
+
+All three runs matched the scheduled expectation exactly, no
+`actual read amplification exceeded` warnings were emitted, swap stayed at 0,
+and memory PSI stayed at 0.  The PrimeIntellect tiny MoE case dropped from the
+Stage 1 value of 1.85 GiB to 1.25 GiB, confirming that routed reads no longer
+depend on incidental auto-plan catalog ordering.  Phase 2.5 is therefore closed
+for the current branch: expected read amplification is reported before
+execution and actual-vs-expected drift is now a standing load-log regression
+signal.
