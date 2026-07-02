@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import ctypes
+import inspect
 import json
 import math
 import os
@@ -814,7 +815,23 @@ def _call_weight_loader(
     if source_is_sharded:
         setattr(param, "is_sharded_weight", True)
     try:
-        weight_loader(param, tensor, **kwargs)
+        call_kwargs = dict(kwargs)
+        extra_args: list[object] = []
+        if "shard_id" in call_kwargs:
+            signature = inspect.signature(weight_loader)
+            params = signature.parameters
+            accepts_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in params.values()
+            )
+            if "shard_id" not in params and not accepts_kwargs:
+                # Several vLLM weight_loader_v2 implementations name this
+                # argument loaded_shard_id and expect it positionally.  Keep the
+                # plan IR field generic while preserving the layer call
+                # convention.
+                if "loaded_shard_id" in params:
+                    extra_args.append(call_kwargs.pop("shard_id"))
+        weight_loader(param, tensor, *extra_args, **call_kwargs)
     finally:
         if source_is_sharded:
             if had_attr:

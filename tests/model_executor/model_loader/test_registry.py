@@ -1808,9 +1808,89 @@ def test_uma_odirect_execute_weight_plan_infers_shard_id_output_tp_slice(
         [7.0, 7.0, 7.0],
     ]
     assert model.param.layer.loaded[0][1] == "q"
+
+
+def test_uma_odirect_execute_weight_plan_passes_loaded_shard_id_positionally(
+    tmp_path, monkeypatch
+):
+    metadata = {
+        "q": {"dtype": "F32", "shape": [4, 6], "data_offsets": [0, 96]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 96)
+
+    class FakeODirectFile:
+        window_size = 64 * 1024 * 1024
+
+        def __init__(self, *_args):
+            self.direct_reads = 0
+            self.window_loads = 0
+            self.window_hits = 0
+            self.bytes_read = 0
+            self.bytes_copied = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback):
+            pass
+
+        def read_record_into_tensor(self, tensor, _offset, size, gate=None):
+            self.direct_reads += 1
+            self.bytes_read += size
+            self.bytes_copied += size
+            tensor.fill_(3)
+            if gate is not None:
+                gate(size)
+
+    class FakeQKVLayer:
+        def __init__(self):
+            self.loaded = []
+
+        def _get_shard_size_mapping(self, shard_id):
+            return {"q": 2}.get(shard_id)
+
+        def weight_loader(self, param, tensor, loaded_shard_id=None):
+            assert loaded_shard_id == "q"
+            assert getattr(param, "is_sharded_weight", False) is True
+            self.loaded.append((tensor.clone(), loaded_shard_id))
+
+    class FakeParam:
+        output_dim = 0
+        tp_rank = 1
+        tp_size = 2
+
+        def __init__(self):
+            self.data = torch.empty(4, 6)
+            self.layer = FakeQKVLayer()
+            self.weight_loader = self.layer.weight_loader
+
+    class FakeModel:
+        def __init__(self):
+            self.param = FakeParam()
+
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(load_format="uma_odirect_safetensors")
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.uma_odirect_safetensors_loader."
+        "_ODirectFile",
+        FakeODirectFile,
+    )
+    source = ODirectSafetensorsWeightSource(loader, str(tmp_path))
+    model = FakeModel()
+    plan = WeightPlan((WeightPlanEntry("q", "param", shard_id="q"),))
+
+    loaded = execute_weight_plan(model, source, plan)
+
+    assert loaded == {"param"}
+    assert not hasattr(model.param, "is_sharded_weight")
+    assert model.param.layer.loaded[0][0].shape == (2, 6)
+    assert model.param.layer.loaded[0][1] == "q"
     stats = source.stats_snapshot()
     assert stats["tensors_read_sliced"] == 1
-    assert stats["bytes_sliced_tensor_payload"] == 24
+    assert stats["bytes_sliced_tensor_payload"] == 48
     assert stats["tensors_read_full"] == 0
 
 
