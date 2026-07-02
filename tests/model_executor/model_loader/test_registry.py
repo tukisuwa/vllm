@@ -79,6 +79,7 @@ from vllm.model_executor.models import (
     mamba2,
     minimax_m2,
     mistral3,
+    nemotron_h,
     mixtral,
     mistral,
     mpt,
@@ -3284,6 +3285,117 @@ def test_exaone_moe_source_plan_skips_nonlocal_and_preserves_shared_auto_load():
     assert model.model.layers[1].mlp.shared_experts.shared_calls[0]["shard_id"] == 1
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
+
+
+def test_nemotron_h_moe_source_plan_skips_nonlocal_and_replays_mapper():
+    names = [
+        "backbone.layers.1.mixer.experts.0.up_proj.weight",
+        "backbone.layers.1.mixer.experts.1.up_proj.weight",
+        "backbone.layers.1.mixer.experts.0.down_proj.weight",
+        "backbone.layers.0.mixer.up_proj.weight",
+        "mtp.layers.0.mixer.up_proj.weight",
+    ]
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", names[0], torch.float32, [1], 0, 4),
+            TensorMeta("model.safetensors", names[1], torch.float32, [1], 4, 4),
+            TensorMeta("model.safetensors", names[2], torch.float32, [1], 8, 4),
+            TensorMeta("model.safetensors", names[3], torch.float32, [1, 1], 12, 4),
+            TensorMeta("model.safetensors", names[4], torch.float32, [1], 16, 4),
+        ]
+    )
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.1.mixer.experts"
+        w13_weight = object()
+        w2_weight = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 0 else -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeDenseMixer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.up_proj = nn.Linear(1, 1, bias=False)
+            nn.init.zeros_(self.up_proj.weight)
+
+    class FakeMoeMixer:
+        def __init__(self, routed_experts):
+            self.experts = routed_experts
+
+    class FakeLayer(nn.Module):
+        def __init__(self, mixer):
+            super().__init__()
+            self.mixer = mixer
+
+    class FakeInnerModel(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.layers = nn.ModuleList([
+                FakeLayer(FakeDenseMixer()),
+                FakeLayer(FakeMoeMixer(routed_experts)),
+            ])
+
+    class FakeNemotronH(nemotron_h.NemotronHForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            if name == names[3]:
+                return torch.tensor([[5.0]])
+            return torch.ones(1)
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    model = FakeNemotronH()
+    source = FakeSource(catalog)
+
+    plan = model.build_weight_plan(catalog)
+    auto_entries = {
+        entry.checkpoint_name: entry for entry in plan.auto_plan.entries
+    }
+    assert auto_entries[names[3]].target_name == (
+        "model.layers.0.mixer.up_proj.weight"
+    )
+    assert auto_entries[names[4]].required is False
+    assert [entry.checkpoint_name for entry in plan.routed_entries] == names[:3]
+    assert [entry.local_required for entry in plan.routed_entries] == [
+        True,
+        False,
+        True,
+    ]
+    assert [entry.shard_id for entry in plan.routed_entries] == ["w1", "w1", "w2"]
+
+    loaded = model.load_weights_from_source(source, plan)
+
+    assert source.reads == [names[3], names[0], names[2]]
+    assert source.skips == [
+        (names[4], "weight plan marked not required"),
+        (names[1], "non-local routed expert"),
+    ]
+    assert "model.layers.0.mixer.up_proj.weight" in loaded
+    assert "model.layers.1.mixer.experts.w13_weight" in loaded
+    assert "model.layers.1.mixer.experts.w2_weight" in loaded
+    assert [call["expert_id"] for call in model.routed_experts.calls] == [0, 0]
+    assert [call["shard_id"] for call in model.routed_experts.calls] == ["w1", "w2"]
 
 
 def test_arctic_build_weight_plan_maps_child_loader_decisions(tmp_path, monkeypatch):

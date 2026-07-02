@@ -63,6 +63,10 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     HasInnerState,
@@ -83,6 +87,11 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
     sequence_parallel_chunk,
+)
+from vllm.model_executor.models.nemotron_h_uma import (
+    NemotronHMoeSourcePlan,
+    build_nemotron_h_moe_weight_plan,
+    load_nemotron_h_moe_weights_from_source,
 )
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
@@ -949,3 +958,18 @@ class NemotronHForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_prefixes=["mtp"])
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> NemotronHMoeSourcePlan:
+        return build_nemotron_h_moe_weight_plan(
+            self,
+            catalog,
+            mapper=self.hf_to_vllm_mapper,
+            skip_prefixes=["mtp"],
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: NemotronHMoeSourcePlan,
+    ) -> set[str]:
+        return load_nemotron_h_moe_weights_from_source(self, source, plan)

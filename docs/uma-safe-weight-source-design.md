@@ -692,6 +692,12 @@ Add model-side plans only where needed:
   - skips non-local routed experts before payload read
   - preserves tied `lm_head` / MTP skips, shared-expert gate-up mapping, and
     GPTQ/modelopt optional suffix handling through the model-side plan
+- Nemotron-H MoE
+  - initial hook implemented for non-gated
+    `mixer.experts.<expert>.{up,down}_proj.*` tensors
+  - maps `up_proj` into the FusedMoE `w1` slot and `down_proj` into `w2`
+  - skips non-local routed experts before payload read
+  - preserves `backbone` to `model` prefix mapping and MTP skip
 
 Each model family should implement its own plan builder instead of adding
 loader-side conditionals.
@@ -724,6 +730,7 @@ Expected current behavior:
 | MiniMaxM2 MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for `mlp.experts` w1/w2/w3 tensors, non-local expert skip, inner qkv mapper replay, and MTP skip |
 | AFMoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts while preserving qkv, shared-expert, and router mappings |
 | EXAONE MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts, shared-expert mapper replay, and lm_head/MTP skips |
+| Nemotron-H MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for non-gated `mixer.experts` up/down tensors and MTP skip |
 | Other routed MoE | Base path should work if normal vLLM load works | Not yet implemented |
 | Non-safetensors | Not supported | Not supported |
 | Remote HF path | Not supported by UMA-safe loader | Not supported |
