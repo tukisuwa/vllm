@@ -294,6 +294,52 @@ can account for transform memory instead of trusting arbitrary code.  Today a
 `transform` callable can allocate unbounded CPU memory invisibly to the
 planner, which is a UMA-safety hole.
 
+#### Transform op registry design (2026-07-03)
+
+Inventory of every tensor transform in the tree today (name-only rewrites in
+`name_transform` hooks need no ops and are Phase 3 NameResolver work, not
+transform work):
+
+```text
+zero_mean       sarvam, param2moe   x - x.mean()            allocates ~2x
+squeeze(dim=0)  ernie45_moe         view                    ~1x
+l2_normalize    bailing_moe         F.normalize(dim=0)      allocates ~2x
+qk_rope_permute llama4, mistral     model-bound closures    allocates ~2x
+patch_reshape   bagel               vit patch embedding     ~1x (view/reshape)
+(composition)   bailing_moe         chained callables       product
+```
+
+(The mistral and bagel entries were found during migration, in the model
+files rather than the `*_uma.py` hooks — the inventory must include model
+files that implement `build_weight_plan` directly.)
+
+The vocabulary is four ops plus ordered composition, which answers the open
+question about the minimal op set.  Design:
+
+- `TransformOp(op: str, args: tuple[int | float | str | bool, ...] = ())` —
+  frozen, serializable; composition is an ordered tuple of ops on the entry
+  (`WeightPlanEntry.transform_ops`), replacing callable chaining;
+- a module-level registry in `weight_plan.py`:
+  `register_weight_transform(name, fn, *, extra_staging_factor)`; duplicate
+  names fail; generic ops (`zero_mean`, `squeeze`, `l2_normalize`) register
+  at import, model-specific ops (`llama4_qk_rope_permute`) register from the
+  model hook module with **pure arguments computed at build time** (head
+  counts, dims from config) — implementations must not capture the model;
+- unknown op names fail during plan validation (before payload reads), not
+  at execution;
+- `WeightPlanSummary` gains transform staging accounting
+  (payload × (factor − 1) per entry, peak across entries since execution is
+  serial), which `ExecutorCapability.max_staging_bytes` can later veto;
+- `name_transform` hook results migrate from `(name, Callable | None)` to
+  `(name, tuple[TransformOp, ...])`; the legacy `transform` field is removed
+  once the four families migrate.
+
+Migration order: (1) registry + entry field + executor application +
+validation, legacy field kept temporarily; (2) migrate the three generic-op
+families; (3) extract llama4's rope permute into a pure-args op — the only
+nontrivial case because today's closure captures the model, and it needs a
+llama4-family real-load check; (4) delete the legacy `transform` field.
+
 At this layer, the declaration is still abstract.  It should not decide which
 checkpoint tensor actually exists, which file offset will be read, or which
 rank-local slice this worker owns.  Those decisions belong to later planning
@@ -1070,3 +1116,31 @@ path with `named_modules(remove_duplicate=False)`, preferring paths that match
 the expert module's `layer_name`.  Routed entries that need a module-level
 custom loader carry `loader_target_name`, so `execute_weight_plan()` no longer
 has a hard-coded `routed_experts` fallback or parent-loader guessing logic.
+
+### 2026-07-03 transform op registry, stages 1-2
+
+`weight_plan.py` now owns the named transform registry:
+
+- `TransformOp(op, args)` — frozen, serializable op reference; composition is
+  an ordered tuple in the new `WeightPlanEntry.transform_ops` field;
+- `register_weight_transform(name, fn, *, extra_staging_factor)` — idempotent
+  for identical re-registration, fails closed on conflicting names;
+- generic ops registered at import: `zero_mean`, `squeeze(dim)`,
+  `l2_normalize(dim, eps)`;
+- `summarize_weight_plan` resolves each required entry's ops (unknown op
+  names fail before any payload read) and reports
+  `peak_transform_staging_bytes` from declared staging factors;
+- the executor applies `transform_ops` after the legacy `transform` callable;
+  `build_auto_weight_plan_from_catalog` accepts both forms from
+  `name_transform` hooks during the transition.
+
+Migrated to named ops: sarvam (`zero_mean`, including the model-file copy in
+`sarvam.py`), param2moe (`zero_mean`), ernie45_moe (`squeeze`), bailing_moe
+(`l2_normalize`, with `_compose_name_transform` now concatenating op tuples
+instead of chaining callables).  mimo_v2's attention-sink rewrite passes
+`transform_ops` through.
+
+Still on the legacy callable (stage 3, model-bound closures that need
+pure-args extraction): llama4 `permute_qk_weight_for_rotary`, mistral's
+QK permute, and bagel's patch-embedding reshape.  The legacy `transform`
+field is removed after those migrate (stage 4).

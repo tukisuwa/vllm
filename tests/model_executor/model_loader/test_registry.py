@@ -23,9 +23,11 @@ from vllm.model_executor.model_loader.uma_safetensors_loader import (
 from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
     TensorMeta,
+    TransformOp,
     WeightPlan,
     WeightPlanEntry,
     WeightPlanReadSegment,
+    apply_transform_ops,
     build_auto_weight_plan_from_catalog,
     summarize_weight_plan,
 )
@@ -8033,8 +8035,12 @@ def test_param2moe_source_plan_splits_fused_qkv_and_maps_names_before_read():
         bias_entry.target_name
         == "model.layers.0.mlp.gate.e_score_correction_bias"
     )
-    assert torch.equal(bias_entry.transform(torch.tensor([1.0, 3.0])),
-                       torch.tensor([-1.0, 1.0]))
+    assert bias_entry.transform is None
+    assert bias_entry.transform_ops == (TransformOp("zero_mean"),)
+    assert torch.equal(
+        apply_transform_ops(bias_entry.transform_ops, torch.tensor([1.0, 3.0])),
+        torch.tensor([-1.0, 1.0]),
+    )
 
 
 def test_param2moe_source_hook_delegates_to_helper(monkeypatch):

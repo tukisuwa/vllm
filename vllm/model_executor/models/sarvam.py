@@ -59,6 +59,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
 )
 from vllm.model_executor.model_loader.weight_plan import (
+    TransformOp,
     TensorCatalog,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -807,7 +808,7 @@ class SarvamMoEForCausalLM(BailingMoeForCausalLM):
     @staticmethod
     def _uma_name_transform(name: str):
         if _is_gate_expert_bias_name(name):
-            return name, _zero_mean_tensor
+            return name, (TransformOp("zero_mean"),)
         return name, None
 
     def build_weight_plan(self, catalog: TensorCatalog) -> BailingMoeSourcePlan:

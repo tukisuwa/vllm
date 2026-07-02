@@ -13,6 +13,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 )
 from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
+    TransformOp,
     WeightPlan,
 )
 
@@ -101,17 +102,11 @@ def _is_gate_expert_bias_name(name: str) -> bool:
     )
 
 
-def _zero_mean_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.numel() == 0:
-        return tensor
-    return tensor - tensor.mean()
-
-
 def _name_transform(
     name: str,
-) -> tuple[str, Callable[[torch.Tensor], torch.Tensor] | None] | None:
+) -> tuple[str, tuple[TransformOp, ...] | None] | None:
     if _is_gate_expert_bias_name(name):
-        return name, _zero_mean_tensor
+        return name, (TransformOp("zero_mean"),)
     return None
 
 

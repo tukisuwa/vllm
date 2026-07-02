@@ -174,6 +174,7 @@ def _apply_attention_sink_slices(
                     required=entry.required,
                     source_slices=(slice(head_start, head_start + heads_per_rank),),
                     transform=entry.transform,
+                    transform_ops=entry.transform_ops,
                     ignore_missing=entry.ignore_missing,
                 )
             )

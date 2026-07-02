@@ -24,6 +24,7 @@ from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
     TensorMeta,
     ReadScheduleSummary,
+    TransformOp,
     WeightPlan,
     WeightPlanBuilder,
     WeightPlanEntry,
@@ -36,8 +37,10 @@ from vllm.model_executor.model_loader.weight_plan import (
     _resolve_attr,
     _TensorRecord,
     _weight_plan_entry_target_shape,
+    apply_transform_ops,
     build_auto_weight_plan_for_module,
     build_auto_weight_plan_from_catalog,
+    register_weight_transform,
     resolve_weight_plan,
     resolve_weight_plan_source_hooks,
     schedule_weight_plan_reads,
@@ -54,6 +57,7 @@ __all__ = [
     "ExecutorCapability",
     "TensorCatalog",
     "TensorMeta",
+    "TransformOp",
     "UmaODirectSafetensorsModelLoader",
     "WeightPlan",
     "WeightPlanBuilder",
@@ -62,9 +66,11 @@ __all__ = [
     "WeightPlanReadSegment",
     "WeightPlanSourceModel",
     "WeightPlanSummary",
+    "apply_transform_ops",
     "build_auto_weight_plan_for_module",
     "build_auto_weight_plan_from_catalog",
     "execute_weight_plan",
+    "register_weight_transform",
     "resolve_weight_plan",
     "resolve_weight_plan_source_hooks",
     "schedule_weight_plan_reads",
@@ -439,6 +445,8 @@ def execute_weight_plan(
             tensor = source.read_slice_cpu(entry.checkpoint_name, source_slices)
         if entry.transform is not None:
             tensor = entry.transform(tensor)
+        if entry.transform_ops:
+            tensor = apply_transform_ops(entry.transform_ops, tensor)
 
         kwargs = {}
         if entry.shard_id is not None:

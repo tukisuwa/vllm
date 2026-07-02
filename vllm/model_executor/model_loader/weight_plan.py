@@ -210,6 +210,119 @@ class WeightPlanReadSegment:
 
 
 @dataclass(frozen=True)
+class TransformOp:
+    """Named, serializable tensor transform reference.
+
+    ``op`` must name a transform registered via ``register_weight_transform``;
+    ``args`` are static arguments resolved at plan-build time (never model or
+    tensor references), so a plan containing ops can be serialized and diffed.
+    Composition is an ordered tuple of ops on the plan entry.
+    """
+
+    op: str
+    args: tuple[int | float | str | bool, ...] = ()
+
+
+@dataclass(frozen=True)
+class _RegisteredTransform:
+    fn: Callable[..., torch.Tensor]
+    extra_staging_factor: float
+
+
+_TRANSFORM_REGISTRY: dict[str, _RegisteredTransform] = {}
+
+
+def register_weight_transform(
+    name: str,
+    fn: Callable[..., torch.Tensor],
+    *,
+    extra_staging_factor: float,
+) -> None:
+    """Register a named weight transform op.
+
+    ``extra_staging_factor`` declares the transient extra CPU staging the op
+    allocates, as a multiple of its input payload bytes (0.0 for views and
+    in-place ops, 1.0 for ops that materialize one same-sized output), so the
+    planner can account for transform memory instead of trusting arbitrary
+    code.  Re-registering the same function under the same name is a no-op;
+    registering a different function under an existing name fails closed.
+    """
+
+    if not name:
+        raise ValueError("Weight transform op name must be non-empty")
+    if extra_staging_factor < 0:
+        raise ValueError(
+            f"Weight transform op {name!r} has negative staging factor"
+        )
+    existing = _TRANSFORM_REGISTRY.get(name)
+    if existing is not None:
+        if (
+            existing.fn is fn
+            and existing.extra_staging_factor == extra_staging_factor
+        ):
+            return
+        raise RuntimeError(
+            f"Weight transform op {name!r} is already registered with a "
+            "different implementation"
+        )
+    _TRANSFORM_REGISTRY[name] = _RegisteredTransform(fn, extra_staging_factor)
+
+
+def _resolve_transform_op(op: TransformOp) -> _RegisteredTransform:
+    registered = _TRANSFORM_REGISTRY.get(op.op)
+    if registered is None:
+        raise RuntimeError(
+            f"Unknown weight transform op {op.op!r}; transform ops must be "
+            "registered before plan validation (fail closed)"
+        )
+    return registered
+
+
+def apply_transform_ops(
+    ops: tuple[TransformOp, ...],
+    tensor: torch.Tensor,
+) -> torch.Tensor:
+    for op in ops:
+        tensor = _resolve_transform_op(op).fn(tensor, *op.args)
+    return tensor
+
+
+def transform_ops_extra_staging_factor(ops: tuple[TransformOp, ...]) -> float:
+    """Total transient staging multiple for one entry's op chain.
+
+    Ops in a chain run serially and release their input after producing the
+    output, so summing factors is a conservative upper bound.
+    """
+
+    return sum(_resolve_transform_op(op).extra_staging_factor for op in ops)
+
+
+def _transform_zero_mean(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.numel() == 0:
+        return tensor
+    return tensor - tensor.mean()
+
+
+def _transform_squeeze(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+    return tensor.squeeze(dim)
+
+
+def _transform_l2_normalize(
+    tensor: torch.Tensor,
+    dim: int = 0,
+    eps: float = 1e-7,
+) -> torch.Tensor:
+    return torch.nn.functional.normalize(tensor, dim=dim, p=2, eps=eps)
+
+
+register_weight_transform("zero_mean", _transform_zero_mean, extra_staging_factor=1.0)
+register_weight_transform("squeeze", _transform_squeeze, extra_staging_factor=0.0)
+register_weight_transform(
+    "l2_normalize", _transform_l2_normalize, extra_staging_factor=1.0
+)
+
+
+@dataclass(frozen=True)
 class WeightPlanEntry:
     checkpoint_name: str
     target_name: str
@@ -219,6 +332,7 @@ class WeightPlanEntry:
     read_segments: tuple[WeightPlanReadSegment, ...] | None = None
     staging_shape: tuple[int, ...] | None = None
     transform: Callable[[torch.Tensor], torch.Tensor] | None = None
+    transform_ops: tuple[TransformOp, ...] = ()
     source_is_sharded: bool = False
     read_into_cpu: bool = False
     shard_id: str | int | None = None
@@ -251,6 +365,7 @@ class WeightPlanSummary:
     read_into_payload_bytes: int
     skipped_payload_bytes: int
     missing_skipped_payload_bytes: int
+    peak_transform_staging_bytes: int = 0
 
     @property
     def total_read_payload_bytes(self) -> int:
@@ -892,6 +1007,7 @@ def summarize_weight_plan(
     read_into_payload_bytes = 0
     skipped_payload_bytes = 0
     missing_skipped_payload_bytes = 0
+    peak_transform_staging_bytes = 0
 
     for entry in plan:
         has_record = catalog.has(entry.checkpoint_name)
@@ -939,6 +1055,15 @@ def summarize_weight_plan(
                 full_read_entries += 1
                 full_payload_bytes += payload_size
 
+        if entry.transform_ops:
+            # Resolving ops here also fails closed on unregistered op names
+            # before any payload byte is read.
+            extra_factor = transform_ops_extra_staging_factor(entry.transform_ops)
+            peak_transform_staging_bytes = max(
+                peak_transform_staging_bytes,
+                int(payload_size * extra_factor),
+            )
+
     return WeightPlanSummary(
         entries=len(plan.entries),
         required_entries=required_entries,
@@ -952,6 +1077,7 @@ def summarize_weight_plan(
         read_into_payload_bytes=read_into_payload_bytes,
         skipped_payload_bytes=skipped_payload_bytes,
         missing_skipped_payload_bytes=missing_skipped_payload_bytes,
+        peak_transform_staging_bytes=peak_transform_staging_bytes,
     )
 
 
@@ -1183,7 +1309,14 @@ def build_auto_weight_plan_from_catalog(
     mapper: object | None = None,
     name_transform: (
         Callable[
-            [str], tuple[str, Callable[[torch.Tensor], torch.Tensor] | None] | None
+            [str],
+            tuple[
+                str,
+                tuple[TransformOp, ...]
+                | Callable[[torch.Tensor], torch.Tensor]
+                | None,
+            ]
+            | None,
         ]
         | None
     ) = None,
@@ -1208,6 +1341,7 @@ def build_auto_weight_plan_from_catalog(
     for checkpoint_name in catalog.names():
         name = checkpoint_name
         transform = None
+        transform_ops: tuple[TransformOp, ...] = ()
         if name_transform is not None:
             transformed = name_transform(checkpoint_name)
             if transformed is None:
@@ -1219,7 +1353,16 @@ def build_auto_weight_plan_from_catalog(
                     )
                 )
                 continue
-            name, transform = transformed
+            name, raw_transform = transformed
+            # Transitional contract: named TransformOp tuples are the target
+            # form; opaque callables remain accepted until every hook
+            # migrates.
+            if raw_transform is None:
+                pass
+            elif isinstance(raw_transform, tuple):
+                transform_ops = raw_transform
+            else:
+                transform = raw_transform
         if skip_predicate is not None and skip_predicate(name):
             entries.append(
                 WeightPlanEntry(
@@ -1227,6 +1370,7 @@ def build_auto_weight_plan_from_catalog(
                     target_name=name,
                     required=False,
                     transform=transform,
+                    transform_ops=transform_ops,
                 )
             )
             continue
@@ -1239,6 +1383,7 @@ def build_auto_weight_plan_from_catalog(
                     target_name=name,
                     required=False,
                     transform=transform,
+                    transform_ops=transform_ops,
                 )
             )
             continue
@@ -1264,6 +1409,7 @@ def build_auto_weight_plan_from_catalog(
                 checkpoint_name=checkpoint_name,
                 target_name=target_name,
                 transform=transform,
+                transform_ops=transform_ops,
                 shard_id=shard_id,
                 ignore_missing=any(
                     target_name.endswith(suffix) for suffix in ignored_suffixes

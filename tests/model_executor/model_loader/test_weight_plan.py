@@ -10,13 +10,17 @@ from vllm.model_executor.model_loader.weight_plan import (
     ExecutorCapability,
     TensorCatalog,
     TensorMeta,
+    TransformOp,
     WeightPlan,
     WeightPlanEntry,
+    apply_transform_ops,
     build_auto_weight_plan_from_catalog,
+    register_weight_transform,
     resolve_weight_plan,
     resolve_weight_plan_source_hooks,
     schedule_weight_plan_reads,
     summarize_weight_plan,
+    transform_ops_extra_staging_factor,
     verify_loaded_weights,
 )
 
@@ -269,3 +273,117 @@ def test_schedule_weight_plan_reads_estimates_strided_ranges_without_expansion()
     assert schedule.summary.expected_window_loads == 2
     assert schedule.summary.expected_window_hits == 4
     assert schedule.summary.expected_bytes_read == 16
+
+
+def test_register_weight_transform_is_idempotent_and_fails_on_conflict():
+    def op_a(tensor):
+        return tensor
+
+    register_weight_transform("test_op_a", op_a, extra_staging_factor=0.0)
+    register_weight_transform("test_op_a", op_a, extra_staging_factor=0.0)
+
+    def op_b(tensor):
+        return tensor
+
+    with pytest.raises(RuntimeError, match="already registered"):
+        register_weight_transform("test_op_a", op_b, extra_staging_factor=0.0)
+
+
+def test_apply_transform_ops_chains_in_order_with_args():
+    tensor = torch.ones(1, 4)
+
+    result = apply_transform_ops(
+        (
+            TransformOp("squeeze", (0,)),
+            TransformOp("zero_mean"),
+        ),
+        tensor,
+    )
+
+    assert result.shape == (4,)
+    assert torch.allclose(result, torch.zeros(4))
+
+
+def test_builtin_transform_ops_match_family_semantics():
+    tensor = torch.tensor([[3.0, 4.0]])
+
+    normalized = apply_transform_ops((TransformOp("l2_normalize", (1,)),), tensor)
+    assert torch.allclose(normalized, torch.tensor([[0.6, 0.8]]))
+
+    empty = apply_transform_ops((TransformOp("zero_mean"),), torch.empty(0))
+    assert empty.numel() == 0
+
+
+def test_summarize_weight_plan_fails_closed_on_unknown_transform_op():
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", "w", torch.float32, [4], 0, 16),
+        ]
+    )
+    plan = WeightPlan(
+        (
+            WeightPlanEntry(
+                "w",
+                "w",
+                transform_ops=(TransformOp("does_not_exist"),),
+            ),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="Unknown weight transform op"):
+        summarize_weight_plan(catalog, plan)
+
+
+def test_summarize_weight_plan_accounts_transform_staging():
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", "big", torch.float32, [8], 0, 32),
+            TensorMeta("model.safetensors", "small", torch.float32, [2], 32, 8),
+        ]
+    )
+    plan = WeightPlan(
+        (
+            WeightPlanEntry(
+                "big",
+                "big",
+                transform_ops=(TransformOp("zero_mean"),),
+            ),
+            WeightPlanEntry(
+                "small",
+                "small",
+                transform_ops=(
+                    TransformOp("zero_mean"),
+                    TransformOp("l2_normalize"),
+                ),
+            ),
+        )
+    )
+
+    summary = summarize_weight_plan(catalog, plan)
+
+    # big: 32 bytes x factor 1.0; small: 8 bytes x factor 2.0 -> peak is big.
+    assert summary.peak_transform_staging_bytes == 32
+    assert transform_ops_extra_staging_factor(
+        (TransformOp("zero_mean"), TransformOp("l2_normalize"))
+    ) == 2.0
+
+
+def test_summarize_weight_plan_ignores_transform_ops_on_skipped_entries():
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", "w", torch.float32, [4], 0, 16),
+        ]
+    )
+    plan = WeightPlan(
+        (
+            WeightPlanEntry(
+                "w",
+                "w",
+                required=False,
+                transform_ops=(TransformOp("does_not_exist"),),
+            ),
+        )
+    )
+
+    summary = summarize_weight_plan(catalog, plan)
+    assert summary.peak_transform_staging_bytes == 0

@@ -13,6 +13,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 )
 from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
+    TransformOp,
     WeightPlan,
 )
 
@@ -110,15 +111,11 @@ def _get_routed_experts_for_layer(model: Any, layer_id: int) -> Any | None:
     return _resolve_routed_experts_for_layer(model, layer_id).routed_experts
 
 
-def _squeeze_first_dim(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.squeeze(0)
-
-
 def _name_transform(
     name: str,
-) -> tuple[str, Callable[[torch.Tensor], torch.Tensor] | None] | None:
+) -> tuple[str, tuple[TransformOp, ...] | None] | None:
     if "e_score_correction_bias" in name:
-        return name.replace("moe_statics", "gate"), _squeeze_first_dim
+        return name.replace("moe_statics", "gate"), (TransformOp("squeeze", (0,)),)
     return name, None
 
 

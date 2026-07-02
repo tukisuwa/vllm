@@ -12,6 +12,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 )
 from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
+    TransformOp,
     WeightPlan,
     WeightPlanEntry,
 )
@@ -30,10 +31,6 @@ Param2MoeRoutedEntry = RoutedMoeEntry
 Param2MoeSourcePlan = WeightPlan
 
 
-def _zero_mean_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor - tensor.mean()
-
-
 def _param2moe_name_transform(name: str):
     name = name.replace("model.word_embeddings.", "model.embed_tokens.")
     name = name.replace(".attention.query_key_value.", ".self_attn.qkv_proj.")
@@ -46,7 +43,7 @@ def _param2moe_name_transform(name: str):
             ".mlp.gate.expert_bias",
             ".mlp.gate.e_score_correction_bias",
         )
-        return name, _zero_mean_tensor
+        return name, (TransformOp("zero_mean"),)
     return name, None
 
 

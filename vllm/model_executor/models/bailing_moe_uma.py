@@ -6,13 +6,13 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
 )
 from vllm.model_executor.model_loader.weight_plan import (
+    TransformOp,
     TensorCatalog,
     WeightPlan,
 )
@@ -29,7 +29,7 @@ from .utils import PPMissingLayer, WeightsMapper
 BailingMoeRoutedEntry = RoutedMoeEntry
 BailingMoeSourcePlan = WeightPlan
 NameTransform = Callable[
-    [str], tuple[str, Callable[[torch.Tensor], torch.Tensor] | None] | None
+    [str], tuple[str, tuple[TransformOp, ...] | None] | None
 ]
 
 
@@ -111,34 +111,23 @@ def _get_routed_experts_for_layer(model: Any, layer_id: int) -> Any | None:
     return _resolve_routed_experts_for_layer(model, layer_id).routed_experts
 
 
-def _normalize_lm_head(tensor: torch.Tensor) -> torch.Tensor:
-    return F.normalize(tensor, dim=0, p=2, eps=1e-7)
-
-
 def _compose_name_transform(
     first: NameTransform | None,
     second: NameTransform,
 ) -> NameTransform:
     def transform(
         name: str,
-    ) -> tuple[str, Callable[[torch.Tensor], torch.Tensor] | None] | None:
+    ) -> tuple[str, tuple[TransformOp, ...] | None] | None:
         first_result = first(name) if first is not None else (name, None)
         if first_result is None:
             return None
-        intermediate_name, first_transform = first_result
+        intermediate_name, first_ops = first_result
         second_result = second(intermediate_name)
         if second_result is None:
             return None
-        final_name, second_transform = second_result
-        if first_transform is None:
-            return final_name, second_transform
-        if second_transform is None:
-            return final_name, first_transform
-
-        def chained(tensor: torch.Tensor) -> torch.Tensor:
-            return second_transform(first_transform(tensor))
-
-        return final_name, chained
+        final_name, second_ops = second_result
+        # Composition of named ops is tuple concatenation, applied in order.
+        return final_name, (*(first_ops or ()), *(second_ops or ())) or None
 
     return transform
 
@@ -149,9 +138,9 @@ def _bailing_name_transform(model: nn.Module) -> NameTransform:
 
     def transform(
         name: str,
-    ) -> tuple[str, Callable[[torch.Tensor], torch.Tensor] | None] | None:
+    ) -> tuple[str, tuple[TransformOp, ...] | None] | None:
         if norm_head and "lm_head.weight" in name:
-            return name, _normalize_lm_head
+            return name, (TransformOp("l2_normalize"),)
         return name, None
 
     return transform
