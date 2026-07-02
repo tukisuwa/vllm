@@ -218,6 +218,7 @@ class WeightPlanEntry:
     shard_id: str | int | None = None
     expert_id: int | None = None
     weight_name: str | None = None
+    ignore_missing: bool = False
 
 
 @dataclass(frozen=True)
@@ -242,6 +243,7 @@ def build_auto_weight_plan_from_catalog(
     mapper: object | None = None,
     skip_prefixes: list[str] | None = None,
     skip_substrs: list[str] | None = None,
+    ignore_unexpected_suffixes: list[str] | None = None,
 ) -> WeightPlan:
     """Build a name-mapped plan without reading tensor payloads.
 
@@ -253,6 +255,7 @@ def build_auto_weight_plan_from_catalog(
 
     prefixes = skip_prefixes or []
     substrs = [*(skip_substrs or []), *_ROTARY_EMBEDS_UNUSED_WEIGHTS]
+    ignored_suffixes = ignore_unexpected_suffixes or []
     map_name_with_shard = getattr(mapper, "_map_name_with_shard", None)
     entries: list[WeightPlanEntry] = []
     for name in catalog.names():
@@ -288,6 +291,9 @@ def build_auto_weight_plan_from_catalog(
                 checkpoint_name=name,
                 target_name=target_name,
                 shard_id=shard_id,
+                ignore_missing=any(
+                    target_name.endswith(suffix) for suffix in ignored_suffixes
+                ),
             )
         )
     return WeightPlan(tuple(entries))
@@ -315,12 +321,19 @@ def execute_weight_plan(
             source.skip(entry.checkpoint_name, "weight plan marked not required")
             continue
 
+        try:
+            param = _resolve_attr(model, entry.target_name)
+        except RuntimeError:
+            if entry.ignore_missing:
+                source.skip(entry.checkpoint_name, "weight plan target is ignored")
+                continue
+            raise
+
         if entry.source_slices is None:
             tensor = source.read_full_cpu(entry.checkpoint_name)
         else:
             tensor = source.read_slice_cpu(entry.checkpoint_name, entry.source_slices)
 
-        param = _resolve_attr(model, entry.target_name)
         weight_loader = getattr(param, "weight_loader", None)
         if not callable(weight_loader):
             raise RuntimeError(

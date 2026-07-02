@@ -27,6 +27,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     execute_weight_plan,
 )
 from vllm.model_executor.models import qwen3
+from vllm.model_executor.models.utils import WeightsMapper
 
 
 @register_model_loader("custom_load_format")
@@ -701,6 +702,52 @@ def test_uma_odirect_execute_weight_plan_skips_absent_not_required(
     assert source.stats_snapshot()["tensors_skipped"] == 1
 
 
+def test_uma_odirect_execute_weight_plan_ignores_missing_target_before_read():
+    class FakeSource:
+        def __init__(self):
+            self.skipped = []
+            self.reads = 0
+
+        def skip(self, name, reason):
+            self.skipped.append((name, reason))
+
+        def read_full_cpu(self, _name):
+            self.reads += 1
+            raise AssertionError("missing ignored target should not be read")
+
+    plan = WeightPlan(
+        (
+            WeightPlanEntry(
+                "bias",
+                "missing.bias",
+                ignore_missing=True,
+            ),
+        )
+    )
+    source = FakeSource()
+
+    assert execute_weight_plan(object(), source, plan) == set()
+    assert source.reads == 0
+    assert source.skipped == [("bias", "weight plan target is ignored")]
+
+
+def test_uma_odirect_execute_weight_plan_missing_target_fails_before_read():
+    class FakeSource:
+        def __init__(self):
+            self.reads = 0
+
+        def read_full_cpu(self, _name):
+            self.reads += 1
+            raise AssertionError("missing target should fail before read")
+
+    source = FakeSource()
+    plan = WeightPlan((WeightPlanEntry("weight", "missing.weight"),))
+
+    with pytest.raises(RuntimeError, match="Cannot resolve"):
+        execute_weight_plan(object(), source, plan)
+    assert source.reads == 0
+
+
 def test_uma_odirect_build_auto_weight_plan_from_catalog(tmp_path):
     metadata = {
         "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
@@ -747,6 +794,26 @@ def test_uma_odirect_build_auto_weight_plan_from_catalog(tmp_path):
     assert q_proj.shard_id == "q"
 
 
+def test_uma_odirect_build_auto_weight_plan_marks_ignored_suffix(tmp_path):
+    metadata = {
+        "linear.bias": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 4)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    plan = build_auto_weight_plan_from_catalog(
+        catalog,
+        ignore_unexpected_suffixes=[".bias"],
+    )
+
+    assert plan.entries[0].checkpoint_name == "linear.bias"
+    assert plan.entries[0].ignore_missing is True
+
+
 def test_qwen3_build_weight_plan_uses_catalog_mapper_and_tie_skip(tmp_path):
     metadata = {
         "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
@@ -770,6 +837,9 @@ def test_qwen3_build_weight_plan_uses_catalog_mapper_and_tie_skip(tmp_path):
         config = FakeConfig()
         hf_to_vllm_mapper = qwen3.Qwen3ForCausalLM.hf_to_vllm_mapper
 
+        def children(self):
+            return []
+
     plan = qwen3.Qwen3ForCausalLM.build_weight_plan(FakeQwen3(), catalog)
     entries = {entry.checkpoint_name: entry for entry in plan.entries}
 
@@ -778,6 +848,53 @@ def test_qwen3_build_weight_plan_uses_catalog_mapper_and_tie_skip(tmp_path):
     assert q_proj.required is True
     assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
     assert q_proj.shard_id == "q"
+
+
+def test_qwen3_build_weight_plan_uses_quant_cache_mapper_and_ignore_suffixes(
+    tmp_path,
+):
+    metadata = {
+        "cache_scale": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "ignored_quant.ignored": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 8)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeQuantConfig:
+        _ignore_unexpected_suffixes = [".ignored"]
+
+        def get_cache_scale_mapper(self):
+            return WeightsMapper(
+                orig_to_new_substr={"cache_scale": "model.layers.0.cache_scale"}
+            )
+
+    class FakeConfig:
+        tie_word_embeddings = False
+
+    class FakeChild:
+        quant_config = FakeQuantConfig()
+
+    class FakeQwen3:
+        config = FakeConfig()
+        hf_to_vllm_mapper = qwen3.Qwen3ForCausalLM.hf_to_vllm_mapper
+
+        def children(self):
+            return [FakeChild()]
+
+    plan = qwen3.Qwen3ForCausalLM.build_weight_plan(FakeQwen3(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["cache_scale"].target_name == "model.layers.0.cache_scale"
+    assert entries["ignored_quant.ignored"].target_name == "ignored_quant.ignored"
+    assert entries["ignored_quant.ignored"].ignore_missing is True
 
 
 def test_qwen3_load_weights_from_source_delegates_to_executor(monkeypatch):

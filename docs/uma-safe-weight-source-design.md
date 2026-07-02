@@ -304,7 +304,12 @@ Implemented so far:
 - `build_auto_weight_plan_from_catalog(...)`
   - performs prefix/substr skips without reading payload bytes
   - applies `WeightsMapper`-style name and shard mapping before payload reads
+  - can mark known ignorable missing suffixes such as `.bias`
   - keeps missing target detection fail-closed in the executor
+- `execute_weight_plan(...)`
+  - resolves target parameters before payload reads
+  - skips `ignore_missing` entries before payload reads
+  - fails closed before payload reads for unexpected missing targets
 - tests for catalog lookup, source construction, full CPU reads, contiguous
   slice reads, source stats, optional model hook dispatch, name-only plan
   building, and basic plan execution
@@ -369,6 +374,8 @@ Target behavior:
 - plan skips rotary/cache tensors: implemented through shared auto-plan helper
 - plan maps q/k/v into qkv placement before read: implemented through
   `hf_to_vllm_mapper` and `shard_id`
+- plan includes AutoWeightsLoader-compatible quant cache-scale mapper and
+  ignored suffix handling for Qwen3
 - plan can read only local TP shard where possible: not implemented yet
 
 Current limitations:
