@@ -77,6 +77,7 @@ from vllm.model_executor.models import (
     llama,
     mamba,
     mamba2,
+    mellum,
     minicpm,
     minicpm_eagle,
     minimax_m2,
@@ -3742,6 +3743,70 @@ def test_eagle_minicpm_build_weight_plan_updates_eagle_flags(tmp_path, monkeypat
     assert entries["lm_head.weight"].required is False
     assert model.has_own_lm_head is True
     assert model.has_own_embed_tokens is True
+
+
+def test_mellum_inherits_qwen_moe_weight_plan(tmp_path):
+    metadata = {
+        "model.layers.0.mlp.experts.0.gate_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [0, 4],
+        },
+        "model.layers.0.input_layernorm.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [8, 12]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 12)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+
+    class FakeExperts:
+        layer_name = "model.layers.0.mlp.experts"
+        w13_weight = nn.Parameter(torch.zeros(1), requires_grad=False)
+
+        def weight_loader(self, **_kwargs):
+            return True
+
+    class FakeLayer:
+        class FakeMlp:
+            class FakeExpertsContainer:
+                routed_experts = FakeExperts()
+
+            experts = FakeExpertsContainer()
+
+        mlp = FakeMlp()
+
+    class FakeModel:
+        layers = [FakeLayer()]
+
+    class FakeMellum(mellum.MellumForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = FakeConfig()
+            self.model = FakeModel()
+            self.hf_to_vllm_mapper = None
+
+    plan = FakeMellum().build_weight_plan(catalog)
+    assert plan.auto_plan.entries[0].checkpoint_name == (
+        "model.layers.0.input_layernorm.weight"
+    )
+    assert plan.auto_plan.entries[1].checkpoint_name == "lm_head.weight"
+    assert plan.auto_plan.entries[1].required is False
+    assert plan.routed_entries[0].checkpoint_name == (
+        "model.layers.0.mlp.experts.0.gate_proj.weight"
+    )
+    assert plan.routed_entries[0].local_required is True
+    assert plan.routed_entries[0].param_name == "w13_weight"
+    assert plan.routed_entries[0].shard_id == "w1"
 
 
 @pytest.mark.parametrize(
