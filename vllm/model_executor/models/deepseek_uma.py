@@ -13,10 +13,12 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 )
 
 from .routed_moe_uma import (
+    RoutedMoeEntry,
     RoutedExpertsResolution,
     RoutedMoeSourcePlan,
     build_routed_moe_weight_plan,
     load_routed_moe_weights_from_source,
+    routed_entry_requires_local_read,
 )
 from .utils import PPMissingLayer
 
@@ -86,6 +88,29 @@ def _parse_deepseek_routed_expert_name(
     return None
 
 
+def _parse_deepseek_shared_expert_name(
+    name: str,
+) -> tuple[int, str, str] | None:
+    parts = name.split(".")
+    for idx in range(len(parts) - 5):
+        if parts[idx] != "layers":
+            continue
+        if (
+            not parts[idx + 1].isdigit()
+            or parts[idx + 2] != "mlp"
+            or parts[idx + 3] != "shared_experts"
+        ):
+            continue
+        proj_name = parts[idx + 4]
+        if proj_name not in ("gate_proj", "down_proj", "up_proj"):
+            continue
+        suffix = ".".join(parts[idx + 5 :])
+        if not suffix:
+            return None
+        return int(parts[idx + 1]), proj_name, suffix
+    return None
+
+
 def _routed_param_for_projection(proj_name: str, suffix: str) -> tuple[str, str]:
     if proj_name == "gate_proj":
         return f"w13_{suffix}", "w1"
@@ -125,6 +150,92 @@ def _get_routed_experts_for_layer(model: Any, layer_id: int) -> Any | None:
     return _resolve_routed_experts_for_layer(model, layer_id).routed_experts
 
 
+def _deepseek_shared_expert_target_exists(
+    mapper: _DeepseekSourceMapper,
+    name: str,
+) -> bool:
+    mapped = mapper._map_name_with_shard(name)
+    return mapped is not None and mapped[0] in mapper._params
+
+
+def _build_deepseek_shared_expert_entries(
+    model: nn.Module,
+    catalog: TensorCatalog,
+    mapper: _DeepseekSourceMapper,
+) -> list[RoutedMoeEntry]:
+    entries: list[RoutedMoeEntry] = []
+    n_routed_experts = getattr(getattr(model, "config", None), "n_routed_experts", None)
+    n_shared_experts = getattr(getattr(model, "config", None), "n_shared_experts", None)
+    for name in catalog.names():
+        parsed = _parse_deepseek_shared_expert_name(name)
+        if parsed is None:
+            continue
+        if _deepseek_shared_expert_target_exists(mapper, name):
+            continue
+        if n_routed_experts is None or n_shared_experts is None:
+            raise RuntimeError(
+                "DeepSeek UMA plan found shared_experts tensors but model config "
+                "does not define n_routed_experts/n_shared_experts"
+            )
+        if n_shared_experts <= 0:
+            raise RuntimeError(
+                "DeepSeek UMA plan found shared_experts tensors but "
+                f"n_shared_experts={n_shared_experts}"
+            )
+        layer_id, proj_name, suffix = parsed
+        resolution = _resolve_routed_experts_for_layer(model, layer_id)
+        routed_experts = resolution.routed_experts
+        if routed_experts is None:
+            entries.append(
+                RoutedMoeEntry(
+                    checkpoint_name=name,
+                    layer_id=layer_id,
+                    expert_id=0,
+                    param_name="",
+                    shard_id="",
+                    local_required=False,
+                    skip_reason=resolution.skip_reason,
+                )
+            )
+            continue
+        record = catalog.get(name)
+        split_dim = 1 if proj_name == "down_proj" and len(record.shape) > 1 else 0
+        total = record.shape[split_dim]
+        if total % n_shared_experts != 0:
+            raise RuntimeError(
+                f"DeepSeek shared expert tensor {name} dimension {total} is not "
+                f"divisible by n_shared_experts={n_shared_experts}"
+            )
+        chunk_size = total // n_shared_experts
+        param_name, shard_id = _routed_param_for_projection(proj_name, suffix)
+        weight_name = f"{routed_experts.layer_name}.{param_name}"
+        for shared_idx in range(n_shared_experts):
+            source_slices: list[slice | int] = [
+                slice(None) for _ in range(len(record.shape))
+            ]
+            source_slices[split_dim] = slice(
+                shared_idx * chunk_size,
+                (shared_idx + 1) * chunk_size,
+            )
+            expert_id = n_routed_experts + shared_idx
+            entries.append(
+                RoutedMoeEntry(
+                    checkpoint_name=name,
+                    layer_id=layer_id,
+                    expert_id=expert_id,
+                    param_name=param_name,
+                    shard_id=shard_id,
+                    local_required=routed_entry_requires_local_read(
+                        routed_experts,
+                        expert_id,
+                        weight_name,
+                    ),
+                    source_slices=tuple(source_slices),
+                )
+            )
+    return entries
+
+
 def build_deepseek_moe_weight_plan(
     model: nn.Module,
     catalog: TensorCatalog,
@@ -132,14 +243,12 @@ def build_deepseek_moe_weight_plan(
     skip_prefixes: list[str] | None = None,
     skip_predicate: Callable[[str], bool] | None = None,
 ) -> RoutedMoeSourcePlan:
-    # The legacy DeepSeek loader has a special split path for fused AITER
-    # shared experts. Keep the first UMA hook conservative until that transform
-    # is represented as a model-side WeightPlan operation.
-    if any("mlp.shared_experts." in name for name in catalog.names()):
-        raise RuntimeError(
-            "DeepSeek UMA WeightSource hook does not yet support "
-            "mlp.shared_experts tensors"
-        )
+    mapper = _DeepseekSourceMapper(model)
+    shared_expert_entries = _build_deepseek_shared_expert_entries(
+        model,
+        catalog,
+        mapper,
+    )
 
     indexer_present_prefixes = {
         name.rsplit(".indexer.", 1)[0]
@@ -167,9 +276,10 @@ def build_deepseek_moe_weight_plan(
         map_projection=_routed_param_for_projection,
         resolve_routed_experts=_resolve_routed_experts_for_layer,
         auto_skip_substr=".mlp.experts.",
-        mapper=_DeepseekSourceMapper(model),
+        mapper=mapper,
         skip_prefixes=skip_prefixes,
         skip_predicate=combined_skip_predicate,
+        extra_routed_entries=shared_expert_entries,
     )
 
 

@@ -78,6 +78,7 @@ def build_routed_moe_weight_plan(
     skip_prefixes: list[str] | None = None,
     skip_substrs: list[str] | None = None,
     skip_predicate: Callable[[str], bool] | None = None,
+    extra_routed_entries: list[RoutedMoeEntry] | None = None,
 ) -> RoutedMoeSourcePlan:
     routed_entries: list[RoutedMoeEntry] = []
     for name in catalog.names():
@@ -114,6 +115,8 @@ def build_routed_moe_weight_plan(
                 ),
             )
         )
+    if extra_routed_entries:
+        routed_entries.extend(extra_routed_entries)
 
     auto_skip_substrs = [*(skip_substrs or []), auto_skip_substr]
     auto_plan = build_auto_weight_plan_for_module(

@@ -2794,25 +2794,92 @@ def test_deepseek_moe_source_plan_skips_nonlocal_experts_before_read():
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
 
-def test_deepseek_moe_source_plan_rejects_shared_expert_fusion():
+def test_deepseek_moe_source_plan_slices_shared_expert_fusion_before_read():
     name = "model.layers.0.mlp.shared_experts.gate_proj.weight"
     catalog = TensorCatalog(
-        [TensorMeta("model.safetensors", name, torch.float32, [1], 0, 4)]
+        [TensorMeta("model.safetensors", name, torch.float32, [4, 1], 0, 16)]
     )
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.mlp.experts"
+        w13_weight = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id in (2, 3) else -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeMLP:
+        def __init__(self, routed_experts):
+            self.experts = routed_experts
+
+    class FakeLayer(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.mlp = FakeMLP(routed_experts)
+
+    class FakeInnerModel(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.layers = nn.ModuleList([FakeLayer(routed_experts)])
 
     class FakeConfig:
         tie_word_embeddings = False
         num_nextn_predict_layers = 0
+        n_routed_experts = 2
+        n_shared_experts = 2
 
     class FakeDeepseek(deepseek_v2.DeepseekV2ForCausalLM):
         use_mha = True
-        config = FakeConfig()
 
         def __init__(self):
             nn.Module.__init__(self)
+            self.config = FakeConfig()
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
 
-    with pytest.raises(RuntimeError, match="shared_experts"):
-        FakeDeepseek().build_weight_plan(catalog)
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.slices = []
+
+        def read_full_cpu(self, name):
+            raise AssertionError(f"unexpected full read for {name}")
+
+        def read_slice_cpu(self, name, source_slices):
+            self.slices.append((name, source_slices))
+            return torch.ones(2, 1)
+
+        def skip(self, name, reason):
+            raise AssertionError(f"unexpected skip for {name}: {reason}")
+
+    model = FakeDeepseek()
+    source = FakeSource(catalog)
+    plan = model.build_weight_plan(catalog)
+
+    assert len(plan.auto_plan.entries) == 0
+    assert [
+        (entry.expert_id, entry.source_slices) for entry in plan.routed_entries
+    ] == [
+        (2, (slice(0, 2), slice(None))),
+        (3, (slice(2, 4), slice(None))),
+    ]
+
+    loaded = model.load_weights_from_source(source, plan)
+
+    assert source.slices == [
+        (name, (slice(0, 2), slice(None))),
+        (name, (slice(2, 4), slice(None))),
+    ]
+    assert [call["expert_id"] for call in model.routed_experts.calls] == [2, 3]
+    assert [call["shard_id"] for call in model.routed_experts.calls] == ["w1", "w1"]
+    assert loaded == {"model.layers.0.mlp.experts.w13_weight"}
 
 
 def test_granite_moe_source_plan_slices_fused_expert_tensors_before_read():
