@@ -30,6 +30,7 @@ from vllm.model_executor.models import (
     cohere2_moe,
     deepseek_v2,
     exaone,
+    falcon,
     gemma,
     gemma2,
     gemma3,
@@ -1035,6 +1036,77 @@ def test_uma_odirect_execute_weight_plan_can_read_into_cpu(tmp_path, monkeypatch
     stats = source.stats_snapshot()
     assert stats["tensors_read_full"] == 1
     assert stats["tensors_read_sliced"] == 1
+
+
+def test_uma_odirect_execute_weight_plan_applies_transform(tmp_path, monkeypatch):
+    metadata = {
+        "weight": {"dtype": "F32", "shape": [2], "data_offsets": [0, 8]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 8)
+
+    class FakeODirectFile:
+        window_size = 64 * 1024 * 1024
+
+        def __init__(self, *_args):
+            self.direct_reads = 0
+            self.window_loads = 0
+            self.window_hits = 0
+            self.bytes_read = 0
+            self.bytes_copied = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback):
+            pass
+
+        def read_record_into_tensor(self, tensor, _offset, size, gate=None):
+            self.direct_reads += 1
+            self.bytes_read += size
+            self.bytes_copied += size
+            tensor.copy_(torch.tensor([1.0, 2.0]))
+            if gate is not None:
+                gate(size)
+
+    class FakeParam:
+        def __init__(self):
+            self.loaded = None
+
+        def weight_loader(self, param, tensor, **kwargs):
+            assert param is self
+            assert kwargs == {}
+            self.loaded = tensor.clone()
+
+    class FakeModel:
+        def __init__(self):
+            self.param = FakeParam()
+
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(load_format="uma_odirect_safetensors")
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.uma_odirect_safetensors_loader."
+        "_ODirectFile",
+        FakeODirectFile,
+    )
+    source = ODirectSafetensorsWeightSource(loader, str(tmp_path))
+    model = FakeModel()
+    plan = WeightPlan(
+        (
+            WeightPlanEntry(
+                "weight",
+                "param",
+                transform=lambda tensor: tensor.flip(0),
+            ),
+        )
+    )
+
+    loaded = execute_weight_plan(model, source, plan)
+
+    assert loaded == {"param"}
+    assert model.param.loaded.tolist() == [2.0, 1.0]
 
 
 def test_uma_odirect_execute_weight_plan_infers_output_tp_slice(
@@ -2214,6 +2286,58 @@ def test_phi_starcoder2_load_weights_from_source_delegates_to_executor(
     plan = WeightPlan(())
 
     loaded = model_cls.load_weights_from_source(model, source, plan)
+
+    assert loaded == {"loaded"}
+    assert calls == [(model, source, plan)]
+
+
+def test_falcon_build_weight_plan_uses_tie_skip(tmp_path):
+    metadata = {
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "transformer.h.0.self_attention.query_key_value.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 8)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+
+    class FakeFalcon:
+        config = FakeConfig()
+
+        def children(self):
+            return []
+
+    plan = falcon.FalconForCausalLM.build_weight_plan(FakeFalcon(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["lm_head.weight"].required is False
+    qkv = entries["transformer.h.0.self_attention.query_key_value.weight"]
+    assert qkv.required is True
+    assert qkv.target_name == "transformer.h.0.self_attention.query_key_value.weight"
+
+
+def test_falcon_load_weights_from_source_delegates_to_executor(monkeypatch):
+    calls = []
+
+    def fake_load(model, source, plan):
+        calls.append((model, source, plan))
+        return {"loaded"}
+
+    monkeypatch.setattr(falcon, "load_auto_uma_weights_from_source", fake_load)
+    model = object()
+    source = object()
+    plan = WeightPlan(())
+
+    loaded = falcon.FalconForCausalLM.load_weights_from_source(model, source, plan)
 
     assert loaded == {"loaded"}
     assert calls == [(model, source, plan)]

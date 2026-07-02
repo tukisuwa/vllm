@@ -187,7 +187,7 @@ class WeightPlanEntry:
     target_slices: tuple[slice | int, ...] | None = None
     shard_id: str | int | None = None
     expert_id: int | None = None
-    transform: str | None = None
+    transform: Callable[[torch.Tensor], torch.Tensor] | None = None
     loader_kind: str = "default"
 ```
 
@@ -336,7 +336,7 @@ Implemented so far:
   - shared model-side helpers for dense AutoWeightsLoader-style source hooks
   - keeps model files from depending directly on generic executor internals
   - is used by Qwen2, Qwen3, Llama, Gemma, Gemma2, Gemma3, InternLM2, Phi,
-    Starcoder2, OLMo, OLMo2, Nemotron, EXAONE, and Cohere
+    Starcoder2, Falcon, OLMo, OLMo2, Nemotron, EXAONE, and Cohere
 - shared routed-MoE model helper
   - keeps per-family parsing and module resolution in model-side files
   - centralizes local-expert skip decisions and existing FusedMoE/RoutedExperts
@@ -348,6 +348,9 @@ Implemented so far:
   - fails closed before payload reads for unexpected missing targets
   - supports opt-in `read_into_cpu` entries for caller-controlled CPU staging;
     parameter/device direct placement is still future work
+  - supports model-provided tensor transforms after source read and before
+    `weight_loader`, keeping special checkpoint transforms out of the storage
+    loader
   - uses `source.empty_cpu(...)` for opt-in CPU staging so allocation gates stay
     under WeightSource control
   - rejects `WeightPlanEntry.target_slices` for now because the generic executor
@@ -404,7 +407,7 @@ Remaining:
 Status: started with `Qwen2ForCausalLM`, `Qwen3ForCausalLM`,
 `LlamaForCausalLM`, `GemmaForCausalLM`, `Gemma2ForCausalLM`,
 `Gemma3ForCausalLM`, `InternLM2ForCausalLM`, `PhiForCausalLM`,
-`Starcoder2ForCausalLM`, `OlmoForCausalLM`, `Olmo2ForCausalLM`,
+`Starcoder2ForCausalLM`, `FalconForCausalLM`, `OlmoForCausalLM`, `Olmo2ForCausalLM`,
 `NemotronForCausalLM`, `ExaoneForCausalLM`, and `CohereForCausalLM`.
 
 Start with Llama/Qwen dense, not MoE.
@@ -423,6 +426,7 @@ Target behavior:
   skips it
 - plan skips tied Starcoder2 `lm_head.weight`: implemented where its existing
   loader skips it
+- plan skips tied Falcon `lm_head`: implemented where its existing loader skips it
 - plan skips static non-payload entries such as Cohere `rotary_emb.inv_freq`
 - plan skips rotary/cache tensors: implemented through shared auto-plan helper
 - dense model hooks use the shared `auto_uma` model-side helper instead of
@@ -533,7 +537,7 @@ Expected current behavior:
 
 | Model type | Base `uma_odirect_safetensors` | Direct plan path |
 | --- | --- | --- |
-| Dense safetensors | Should work if normal vLLM load works | Phase 3 hooks for Qwen2/Qwen3/Llama/Gemma/Gemma2/Gemma3/InternLM2/Phi/Starcoder2/OLMo/OLMo2/Nemotron/EXAONE/Cohere-style AutoWeightsLoader models |
+| Dense safetensors | Should work if normal vLLM load works | Phase 3 hooks for Qwen2/Qwen3/Llama/Gemma/Gemma2/Gemma3/InternLM2/Phi/Starcoder2/Falcon/OLMo/OLMo2/Nemotron/EXAONE/Cohere-style AutoWeightsLoader models |
 | Sharded dense safetensors | Should work if no duplicate names | Phase 3 |
 | Qwen2/Qwen3 / OLMoE / Cohere2 routed MoE | Base path should work if normal vLLM load works | Phase 4/5 model hook for `mlp.experts` gate/up/down tensors; loader-side direct path removed |
 | Mixtral / PhiMoE routed MoE | Base path should work if normal vLLM load works | Phase 5 initial model hook for `block_sparse_moe.experts` w1/w2/w3 tensors |
@@ -609,10 +613,8 @@ Runtime metrics to record:
 
 ## Open questions
 
-- How should transforms be represented?
-  - string enum for common transforms
-  - callable object
-  - delegate entirely to `param.weight_loader`
+- Which model-side transforms should graduate from callables into named,
+  inspectable plan operations?
 - Can we expose destination CPU views for direct `read_into` without violating
   PyTorch storage assumptions?
 - Which tensor slices are contiguous enough to read directly from safetensors

@@ -308,6 +308,7 @@ class WeightPlanEntry:
     required: bool = True
     source_slices: tuple[slice | int, ...] | None = None
     target_slices: tuple[slice | int, ...] | None = None
+    transform: Callable[[torch.Tensor], torch.Tensor] | None = None
     source_is_sharded: bool = False
     read_into_cpu: bool = False
     shard_id: str | int | None = None
@@ -710,6 +711,8 @@ def execute_weight_plan(
             tensor = source.read_full_cpu(entry.checkpoint_name)
         else:
             tensor = source.read_slice_cpu(entry.checkpoint_name, source_slices)
+        if entry.transform is not None:
+            tensor = entry.transform(tensor)
 
         kwargs = {}
         if entry.shard_id is not None:
