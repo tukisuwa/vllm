@@ -137,6 +137,4 @@ def load_minimax_m2_moe_weights_from_source(
         model,
         source,
         plan,
-        family_name="MiniMaxM2 MoE",
-        get_routed_experts=_get_routed_experts_for_layer,
     )

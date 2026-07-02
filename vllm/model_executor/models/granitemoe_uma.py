@@ -247,7 +247,6 @@ def build_granite_moe_weight_plan(
         tuple(routed_entries),
         family_name="Granite MoE",
         get_routed_experts=_get_routed_experts_for_layer,
-        require_registered_params=False,
     )
 
 
@@ -260,6 +259,4 @@ def load_granite_moe_weights_from_source(
         model,
         source,
         plan,
-        family_name="Granite MoE",
-        get_routed_experts=_get_routed_experts_for_layer,
     )

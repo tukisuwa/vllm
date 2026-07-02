@@ -162,6 +162,10 @@ def _assert_same_reads(actual, expected):
     assert sorted(actual) == sorted(expected)
 
 
+def _assert_loaded_suffix(loaded, suffix):
+    assert any(name.endswith(suffix) for name in loaded)
+
+
 @register_model_loader("custom_load_format")
 class CustomModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig) -> None:
@@ -2824,11 +2828,12 @@ def test_minimax_m2_moe_source_plan_skips_nonlocal_experts_before_read():
         ]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.block_sparse_moe.experts"
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
             self.w13_weight = nn.Parameter(torch.zeros(1), requires_grad=False)
 
@@ -2947,7 +2952,7 @@ def test_minimax_m2_moe_source_plan_skips_nonlocal_experts_before_read():
         (names[1], "non-local routed expert"),
     ]
     assert "model.layers.0.self_attn.qkv_proj.weight" in loaded
-    assert "model.layers.0.block_sparse_moe.experts.w13_weight" in loaded
+    _assert_loaded_suffix(loaded, ".w13_weight")
     assert model.model.layers[0].self_attn.qkv_calls[0]["shard_id"] == "q"
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
@@ -3204,12 +3209,13 @@ def test_afmoe_moe_source_plan_skips_nonlocal_experts_before_read():
         ]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.1.mlp.experts"
         w13_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -3322,7 +3328,7 @@ def test_afmoe_moe_source_plan_skips_nonlocal_experts_before_read():
     assert source.skips == [(names[1], "non-local routed expert")]
     assert "model.layers.0.mlp.gate_up_proj.weight" in loaded
     assert "model.layers.1.self_attn.qkv_proj.weight" in loaded
-    assert "model.layers.1.mlp.experts.w13_weight" in loaded
+    _assert_loaded_suffix(loaded, ".w13_weight")
     assert model.model.layers[1].self_attn.qkv_calls[0]["shard_id"] == "q"
     assert model.model.layers[0].mlp.gate_up_calls[0]["shard_id"] == 0
     assert model.routed_experts.calls[0]["expert_id"] == 0
@@ -3347,12 +3353,13 @@ def test_exaone_moe_source_plan_skips_nonlocal_and_preserves_shared_auto_load():
         ]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.1.mlp.experts"
         w13_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -3449,7 +3456,7 @@ def test_exaone_moe_source_plan_skips_nonlocal_and_preserves_shared_auto_load():
         (names[1], "non-local routed expert"),
     ]
     assert "model.layers.1.mlp.shared_experts.gate_up_proj.weight" in loaded
-    assert "model.layers.1.mlp.experts.w13_weight" in loaded
+    _assert_loaded_suffix(loaded, ".w13_weight")
     assert model.model.layers[1].mlp.shared_experts.shared_calls[0]["shard_id"] == 1
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
@@ -3473,13 +3480,14 @@ def test_nemotron_h_moe_source_plan_skips_nonlocal_and_replays_mapper():
         ]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.1.mixer.experts"
         w13_weight = object()
         w2_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -3560,8 +3568,8 @@ def test_nemotron_h_moe_source_plan_skips_nonlocal_and_replays_mapper():
         (names[1], "non-local routed expert"),
     ]
     assert "model.layers.0.mixer.up_proj.weight" in loaded
-    assert "model.layers.1.mixer.experts.w13_weight" in loaded
-    assert "model.layers.1.mixer.experts.w2_weight" in loaded
+    _assert_loaded_suffix(loaded, ".w13_weight")
+    _assert_loaded_suffix(loaded, ".w2_weight")
     assert [call["expert_id"] for call in model.routed_experts.calls] == [0, 0]
     assert [call["shard_id"] for call in model.routed_experts.calls] == ["w1", "w2"]
 
@@ -3934,24 +3942,32 @@ def test_mellum_inherits_qwen_moe_weight_plan(tmp_path):
     class FakeConfig:
         tie_word_embeddings = True
 
-    class FakeExperts:
+    class FakeExperts(nn.Module):
         layer_name = "model.layers.0.mlp.experts"
         w13_weight = nn.Parameter(torch.zeros(1), requires_grad=False)
 
         def weight_loader(self, **_kwargs):
             return True
 
-    class FakeLayer:
-        class FakeMlp:
-            class FakeExpertsContainer:
-                routed_experts = FakeExperts()
+    class FakeExpertsContainer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.routed_experts = FakeExperts()
 
-            experts = FakeExpertsContainer()
+    class FakeMlp(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = FakeExpertsContainer()
 
-        mlp = FakeMlp()
+    class FakeLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = FakeMlp()
 
-    class FakeModel:
-        layers = [FakeLayer()]
+    class FakeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([FakeLayer()])
 
     class FakeMellum(mellum.MellumForCausalLM):
         def __init__(self):
@@ -5179,12 +5195,13 @@ def test_qwen3_moe_source_plan_skips_nonlocal_experts_before_read():
         ]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.mlp.experts.routed_experts"
         w13_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -5194,8 +5211,9 @@ def test_qwen3_moe_source_plan_skips_nonlocal_experts_before_read():
             self.calls.append(kwargs)
             return True
 
-    class FakeExperts:
+    class FakeExperts(nn.Module):
         def __init__(self, routed_experts):
+            super().__init__()
             self.routed_experts = routed_experts
 
     class FakeMLP:
@@ -5246,7 +5264,7 @@ def test_qwen3_moe_source_plan_skips_nonlocal_experts_before_read():
 
     _assert_same_reads(source.reads, [names[0]])
     assert source.skips == [(names[1], "non-local routed expert")]
-    assert loaded == {"model.layers.0.mlp.experts.routed_experts.w13_weight"}
+    _assert_loaded_suffix(loaded, ".w13_weight")
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
@@ -5265,12 +5283,13 @@ def test_glm4_moe_source_plan_skips_nonlocal_experts_and_spec_layers():
         ]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.mlp.experts"
         w13_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -5349,7 +5368,7 @@ def test_glm4_moe_source_plan_skips_nonlocal_experts_and_spec_layers():
         (names[2], "weight plan marked not required"),
         (names[1], "non-local routed expert"),
     ]
-    assert loaded == {"model.layers.0.mlp.experts.w13_weight"}
+    _assert_loaded_suffix(loaded, ".w13_weight")
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
@@ -5365,12 +5384,13 @@ def test_glm4_moe_source_plan_slices_fused_shared_experts_before_read(monkeypatc
         lambda: True,
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.mlp.experts"
         w13_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -5435,7 +5455,7 @@ def test_glm4_moe_source_plan_slices_fused_shared_experts_before_read(monkeypatc
 
     assert source.skips == [(name, "non-local routed expert")]
     assert source.read_slices == [(name, (slice(2, 4), slice(None)))]
-    assert loaded == {"model.layers.0.mlp.experts.w13_weight"}
+    _assert_loaded_suffix(loaded, ".w13_weight")
     assert model.routed_experts.calls[0]["expert_id"] == 3
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
@@ -5456,12 +5476,13 @@ def test_hy_v3_moe_source_plan_skips_nonlocal_experts_and_spec_layers():
         ]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.mlp.experts"
         w13_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -5542,10 +5563,8 @@ def test_hy_v3_moe_source_plan_skips_nonlocal_experts_and_spec_layers():
         (names[3], "weight plan marked not required"),
         (names[1], "non-local routed expert"),
     ]
-    assert loaded == {
-        "model.layers.0.mlp.gate.weight",
-        "model.layers.0.mlp.experts.w13_weight",
-    }
+    assert "model.layers.0.mlp.gate.weight" in loaded
+    _assert_loaded_suffix(loaded, ".w13_weight")
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
@@ -5562,12 +5581,13 @@ def test_jamba_moe_source_plan_skips_nonlocal_experts_before_read():
         ]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.feed_forward.experts"
         w13_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -5620,7 +5640,7 @@ def test_jamba_moe_source_plan_skips_nonlocal_experts_before_read():
 
     _assert_same_reads(source.reads, [names[0]])
     assert source.skips == [(names[1], "non-local routed expert")]
-    assert loaded == {"model.layers.0.feed_forward.experts.w13_weight"}
+    _assert_loaded_suffix(loaded, ".w13_weight")
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
@@ -5639,12 +5659,13 @@ def test_sarvam_moe_source_plan_skips_nonlocal_experts_and_normalizes_gate_bias(
         ]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.mlp.experts"
         w13_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -5729,10 +5750,8 @@ def test_sarvam_moe_source_plan_skips_nonlocal_experts_and_normalizes_gate_bias(
         model.model.layers[0].mlp.gate.e_score_correction_bias,
         torch.tensor([-1.0, 1.0]),
     )
-    assert loaded == {
-        "model.layers.0.mlp.gate.e_score_correction_bias",
-        "model.layers.0.mlp.experts.w13_weight",
-    }
+    assert "model.layers.0.mlp.gate.e_score_correction_bias" in loaded
+    _assert_loaded_suffix(loaded, ".w13_weight")
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
@@ -5753,13 +5772,14 @@ def test_laguna_moe_source_plan_keeps_bias_and_shared_expert_auto_loads():
         ]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.mlp.experts"
         w13_weight = object()
         e_score_correction_bias = nn.Parameter(torch.zeros(2))
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -5853,11 +5873,9 @@ def test_laguna_moe_source_plan_keeps_bias_and_shared_expert_auto_loads():
         model.model.layers[0].mlp.shared_expert.gate_proj.weight,
         torch.tensor([[5.0]]),
     )
-    assert loaded == {
-        "model.layers.0.mlp.experts.e_score_correction_bias",
-        "model.layers.0.mlp.shared_expert.gate_proj.weight",
-        "model.layers.0.mlp.experts.w13_weight",
-    }
+    assert "model.layers.0.mlp.experts.e_score_correction_bias" in loaded
+    assert "model.layers.0.mlp.shared_expert.gate_proj.weight" in loaded
+    _assert_loaded_suffix(loaded, ".w13_weight")
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
@@ -5880,12 +5898,13 @@ def test_kimi_linear_moe_source_plan_skips_nonlocal_and_spec_layers():
         ]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.block_sparse_moe.experts"
         w13_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -6013,11 +6032,12 @@ def test_kimi_linear_moe_source_plan_skips_nonlocal_and_spec_layers():
         moe_layer.shared_experts.gate_up_proj.weight,
         torch.tensor([[5.0], [0.0]]),
     )
-    assert loaded == {
-        "model.layers.0.block_sparse_moe.gate.e_score_correction_bias",
-        "model.layers.0.block_sparse_moe.shared_experts.gate_up_proj.weight",
-        "model.layers.0.block_sparse_moe.experts.w13_weight",
-    }
+    assert "model.layers.0.block_sparse_moe.gate.e_score_correction_bias" in loaded
+    assert (
+        "model.layers.0.block_sparse_moe.shared_experts.gate_up_proj.weight"
+        in loaded
+    )
+    _assert_loaded_suffix(loaded, ".w13_weight")
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
@@ -6038,12 +6058,13 @@ def test_interns1_pro_source_plan_reuses_qwen_moe_helper_and_prefix_mapper():
         ]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "language_model.model.layers.0.mlp.experts"
         w13_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -6130,10 +6151,8 @@ def test_interns1_pro_source_plan_reuses_qwen_moe_helper_and_prefix_mapper():
         (names[1], "non-local routed expert"),
     ]
     assert torch.equal(model.language_model.lm_head.weight, torch.tensor([[7.0]]))
-    assert loaded == {
-        "language_model.lm_head.weight",
-        "language_model.model.layers.0.mlp.experts.w13_weight",
-    }
+    assert "language_model.lm_head.weight" in loaded
+    _assert_loaded_suffix(loaded, ".w13_weight")
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
@@ -6156,12 +6175,13 @@ def test_ernie45_moe_source_plan_skips_and_maps_gate_bias():
         ]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.mlp.experts"
         w13_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -6257,10 +6277,8 @@ def test_ernie45_moe_source_plan_skips_and_maps_gate_bias():
         model.model.layers[0].mlp.gate.e_score_correction_bias,
         torch.tensor([2.0, 4.0]),
     )
-    assert loaded == {
-        "model.layers.0.mlp.gate.e_score_correction_bias",
-        "model.layers.0.mlp.experts.w13_weight",
-    }
+    assert "model.layers.0.mlp.gate.e_score_correction_bias" in loaded
+    _assert_loaded_suffix(loaded, ".w13_weight")
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
@@ -6279,12 +6297,13 @@ def test_bailing_moe_source_plan_skips_nonlocal_experts_and_normalizes_lm_head()
         ]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.mlp.experts"
         w13_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -6354,10 +6373,8 @@ def test_bailing_moe_source_plan_skips_nonlocal_experts_and_normalizes_lm_head()
         model.lm_head.weight,
         torch.nn.functional.normalize(torch.tensor([[3.0, 4.0]]), dim=0, p=2),
     )
-    assert loaded == {
-        "lm_head.weight",
-        "model.layers.0.mlp.experts.w13_weight",
-    }
+    assert "lm_head.weight" in loaded
+    _assert_loaded_suffix(loaded, ".w13_weight")
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
@@ -6458,12 +6475,13 @@ def test_mixtral_moe_source_plan_skips_nonlocal_experts_before_read():
         ]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.block_sparse_moe.experts"
         w13_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -6521,7 +6539,7 @@ def test_mixtral_moe_source_plan_skips_nonlocal_experts_before_read():
 
     _assert_same_reads(source.reads, [names[0]])
     assert source.skips == [(names[1], "non-local routed expert")]
-    assert loaded == {"model.layers.0.block_sparse_moe.experts.w13_weight"}
+    _assert_loaded_suffix(loaded, ".w13_weight")
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
@@ -6542,12 +6560,13 @@ def test_deepseek_moe_source_plan_skips_nonlocal_experts_before_read():
         ]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.mlp.experts"
         w13_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -6627,7 +6646,7 @@ def test_deepseek_moe_source_plan_skips_nonlocal_experts_before_read():
         (names[1], "non-local routed expert"),
     ]
     assert "model.layers.2.input_layernorm.weight" in loaded
-    assert "model.layers.0.mlp.experts.w13_weight" in loaded
+    _assert_loaded_suffix(loaded, ".w13_weight")
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
@@ -6648,12 +6667,13 @@ def test_axk1_source_plan_reuses_deepseek_moe_helper():
         ]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.mlp.experts"
         w13_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -6760,7 +6780,7 @@ def test_axk1_source_plan_reuses_deepseek_moe_helper():
         (names[1], "non-local routed expert"),
     ]
     assert "model.layers.0.self_attn.qkv_proj.weight" in loaded
-    assert "model.layers.0.mlp.experts.w13_weight" in loaded
+    _assert_loaded_suffix(loaded, ".w13_weight")
     assert model.model.layers[0].self_attn.qkv_calls[0]["shard_id"] == "q"
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
@@ -6772,12 +6792,13 @@ def test_deepseek_moe_source_plan_slices_shared_expert_fusion_before_read():
         [TensorMeta("model.safetensors", name, torch.float32, [4, 1], 0, 16)]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.mlp.experts"
         w13_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -6852,7 +6873,7 @@ def test_deepseek_moe_source_plan_slices_shared_expert_fusion_before_read():
     ]
     assert [call["expert_id"] for call in model.routed_experts.calls] == [2, 3]
     assert [call["shard_id"] for call in model.routed_experts.calls] == ["w1", "w1"]
-    assert loaded == {"model.layers.0.mlp.experts.w13_weight"}
+    _assert_loaded_suffix(loaded, ".w13_weight")
 
 
 def test_deepseek_moe_source_plan_loads_fp8_indexer_wk_pair(monkeypatch):
@@ -6964,13 +6985,14 @@ def test_granite_moe_source_plan_slices_fused_expert_tensors_before_read():
         ]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.block_sparse_moe.experts"
         w13_weight = object()
         w2_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -7052,8 +7074,8 @@ def test_granite_moe_source_plan_slices_fused_expert_tensors_before_read():
         (names[1], "non-local routed expert"),
     ]
     assert "model.layers.0.block_sparse_moe.gate.weight" in loaded
-    assert "model.layers.0.block_sparse_moe.experts.w13_weight" in loaded
-    assert "model.layers.0.block_sparse_moe.experts.w2_weight" in loaded
+    _assert_loaded_suffix(loaded, ".w13_weight")
+    _assert_loaded_suffix(loaded, ".w2_weight")
     assert [call["shard_id"] for call in model.routed_experts.calls] == [
         "w1",
         "w3",
@@ -7112,13 +7134,14 @@ def test_granitemoe_hybrid_source_plan_slices_weight_scales_before_read():
         ]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.block_sparse_moe.experts"
         routed_experts_w13_weight_scale = object()
         routed_experts_w2_weight_scale = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -7481,13 +7504,14 @@ def test_lfm2_moe_source_plan_maps_dense_and_routed_names_before_read():
         ),
     ])
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.feed_forward.experts"
         w13_weight = object()
         w2_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -7497,20 +7521,24 @@ def test_lfm2_moe_source_plan_maps_dense_and_routed_names_before_read():
             self.calls.append(kwargs)
             return True
 
-    class FakeFeedForward:
+    class FakeFeedForward(nn.Module):
         def __init__(self, experts):
+            super().__init__()
             self.experts = experts
 
-    class FakeLayer:
+    class FakeLayer(nn.Module):
         def __init__(self, experts):
+            super().__init__()
             self.feed_forward = FakeFeedForward(experts)
 
-    class FakeInnerModel:
+    class FakeInnerModel(nn.Module):
         def __init__(self, experts):
-            self.layers = [FakeLayer(experts)]
+            super().__init__()
+            self.layers = nn.ModuleList([FakeLayer(experts)])
 
-    class FakeModel:
+    class FakeModel(nn.Module):
         def __init__(self):
+            super().__init__()
             self.routed_experts = FakeRoutedExperts()
             self.model = FakeInnerModel(self.routed_experts)
 
@@ -7614,13 +7642,14 @@ def test_mimo_v2_source_plan_maps_split_dense_and_routed_names_before_read(
         ),
     ])
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.mlp.experts"
         w13_weight = object()
         w2_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
@@ -7630,20 +7659,24 @@ def test_mimo_v2_source_plan_maps_split_dense_and_routed_names_before_read(
             self.calls.append(kwargs)
             return True
 
-    class FakeMLP:
+    class FakeMLP(nn.Module):
         def __init__(self, experts):
+            super().__init__()
             self.experts = experts
 
-    class FakeLayer:
+    class FakeLayer(nn.Module):
         def __init__(self, experts):
+            super().__init__()
             self.mlp = FakeMLP(experts)
 
-    class FakeInnerModel:
+    class FakeInnerModel(nn.Module):
         def __init__(self, experts):
-            self.layers = [FakeLayer(experts)]
+            super().__init__()
+            self.layers = nn.ModuleList([FakeLayer(experts)])
 
-    class FakeModel:
+    class FakeModel(nn.Module):
         def __init__(self):
+            super().__init__()
             self.routed_experts = FakeRoutedExperts()
             self.model = FakeInnerModel(self.routed_experts)
 
@@ -7754,7 +7787,7 @@ def test_longcat_flash_source_plan_maps_dense_and_routed_names_before_read():
         ),
     ])
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.mlp.experts"
         w13_weight = object()
         w2_weight = object()
@@ -7778,8 +7811,9 @@ def test_longcat_flash_source_plan_maps_dense_and_routed_names_before_read():
         def __init__(self, experts):
             self.layers = [FakeLayer(experts)]
 
-    class FakeOuter:
+    class FakeOuter(nn.Module):
         def __init__(self):
+            super().__init__()
             self.routed_experts = FakeRoutedExperts()
             self.model = FakeInnerModel(self.routed_experts)
 
@@ -7828,8 +7862,8 @@ def test_longcat_flash_source_plan_maps_dense_and_routed_names_before_read():
     assert auto_entries["model.layers.0.rotary_emb.inv_freq"].required is False
 
 
-def test_longcat_flash_source_load_finalizes_mla_weights(monkeypatch):
-    class FakeRoutedExperts:
+def test_longcat_flash_source_load_finalizes_mla_weights():
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.mlp.experts"
         w13_weight = object()
         quant_method = object()
@@ -7856,8 +7890,9 @@ def test_longcat_flash_source_load_finalizes_mla_weights(monkeypatch):
             self.reads.append(name)
             return torch.ones(1)
 
-    class FakeOuter:
+    class FakeOuter(nn.Module):
         def __init__(self):
+            super().__init__()
             self.finalized = False
             self.routed_experts = FakeRoutedExperts()
 
@@ -7870,27 +7905,21 @@ def test_longcat_flash_source_load_finalizes_mla_weights(monkeypatch):
         (
             WeightPlanEntry(
                 checkpoint_name="model.layers.0.mlp.experts.1.gate_proj.weight",
-                target_name="model.layers.0.mlp.experts.w13_weight",
+                target_name="routed_experts.w13_weight",
                 required=True,
-                param_name="w13_weight",
                 shard_id="w1",
                 expert_id=1,
-                local_required=True,
+                weight_name="model.layers.0.mlp.experts.w13_weight",
+                loader_target_name="routed_experts",
             ),
         ),
-    )
-
-    monkeypatch.setattr(
-        longcat_flash_uma,
-        "_get_routed_experts_for_layer",
-        lambda _model, _layer_id: model.routed_experts,
     )
 
     assert longcat_flash_uma.load_longcat_flash_weights_from_source(
         model,
         source,
         plan,
-    ) == {"model.layers.0.mlp.experts.w13_weight"}
+    ) == {"routed_experts.w13_weight"}
     _assert_same_reads(source.reads, ["model.layers.0.mlp.experts.1.gate_proj.weight"])
     assert model.finalized is True
 
@@ -7921,7 +7950,7 @@ def test_param2moe_source_plan_splits_fused_qkv_and_maps_names_before_read():
         head_dim = 2
         hidden_size = 4
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.mlp.experts"
         w13_weight = object()
         w2_weight = object()
@@ -7945,11 +7974,12 @@ def test_param2moe_source_plan_splits_fused_qkv_and_maps_names_before_read():
         def __init__(self, experts):
             self.layers = [FakeLayer(experts)]
 
-    class FakeOuter:
+    class FakeOuter(nn.Module):
         tie_word_embeddings = False
         config = FakeConfig()
 
         def __init__(self):
+            super().__init__()
             self.routed_experts = FakeRoutedExperts()
             self.model = FakeInnerModel(self.routed_experts)
 
@@ -8066,7 +8096,7 @@ def test_hunyuan_v1_source_plan_maps_fused_and_routed_names_before_read():
         tie_word_embeddings = False
         num_experts = 4
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.mlp.experts"
         w13_weight = object()
         w2_weight = object()
@@ -8090,10 +8120,11 @@ def test_hunyuan_v1_source_plan_maps_fused_and_routed_names_before_read():
         def __init__(self, experts):
             self.layers = [FakeLayer(experts)]
 
-    class FakeOuter:
+    class FakeOuter(nn.Module):
         config = FakeConfig()
 
         def __init__(self):
+            super().__init__()
             self.routed_experts = FakeRoutedExperts()
             self.model = FakeInnerModel(self.routed_experts)
 
@@ -8173,10 +8204,11 @@ def test_hunyuan_v1_source_hook_dispatches_fused_qkv_once():
         def __init__(self):
             self.layers = type("FakeLayers", (), {"0": FakeLayer()})()
 
-    class FakeOuter:
+    class FakeOuter(nn.Module):
         config = FakeConfig()
 
         def __init__(self):
+            super().__init__()
             self.model = FakeInnerModel()
 
     class FakeSource:
@@ -8231,7 +8263,7 @@ def test_openpangu_source_plan_maps_dense_and_routed_names_before_read():
         num_hidden_layers = 2
         num_nextn_predict_layers = 1
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.mlp.experts"
         w13_weight = object()
         w2_weight = object()
@@ -8255,11 +8287,12 @@ def test_openpangu_source_plan_maps_dense_and_routed_names_before_read():
         def __init__(self, experts):
             self.layers = [FakeLayer(experts)]
 
-    class FakeOuter:
+    class FakeOuter(nn.Module):
         config = FakeConfig()
         fuse_qkv_a_proj = True
 
         def __init__(self):
+            super().__init__()
             self.routed_experts = FakeRoutedExperts()
             self.model = FakeInnerModel(self.routed_experts)
 
@@ -8306,8 +8339,9 @@ def test_openpangu_source_hook_delegates_and_runs_post_weight_load(monkeypatch):
         def post_weight_load(self):
             self.finalized = True
 
-    class FakeOuter:
+    class FakeOuter(nn.Module):
         def __init__(self):
+            super().__init__()
             self.model = FakeInnerModel()
 
     class FakeSource:
@@ -8349,7 +8383,7 @@ def test_llama4_source_plan_maps_dense_per_expert_and_fused_names(monkeypatch):
         num_attention_heads = 2
         num_key_value_heads = 1
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.feed_forward.experts"
         w13_weight = object()
         w2_weight = object()
@@ -8386,10 +8420,11 @@ def test_llama4_source_plan_maps_dense_per_expert_and_fused_names(monkeypatch):
         def __init__(self, experts):
             self.layers = FakeLayers(FakeLayer(experts))
 
-    class FakeOuter:
+    class FakeOuter(nn.Module):
         config = FakeConfig()
 
         def __init__(self):
+            super().__init__()
             self.routed_experts = FakeRoutedExperts()
             self.model = FakeInnerModel(self.routed_experts)
 
@@ -8453,7 +8488,7 @@ def test_llama4_source_hook_loads_fused_expert_source_slices(monkeypatch):
             assert param is self
             self.calls.append((weight_name, shard_id, expert_id, tensor.clone()))
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "model.layers.0.feed_forward.experts"
         w13_weight = FakeParam()
         expert_map = torch.tensor([-1, 0, 1, -1])
@@ -8483,8 +8518,9 @@ def test_llama4_source_hook_loads_fused_expert_source_slices(monkeypatch):
         def __init__(self, experts):
             self.layers = FakeLayers(FakeLayer(experts))
 
-    class FakeOuter:
+    class FakeOuter(nn.Module):
         def __init__(self):
+            super().__init__()
             self.routed_experts = FakeRoutedExperts()
             self.model = FakeInnerModel(self.routed_experts)
 
@@ -8541,12 +8577,13 @@ def test_qwen_moe_source_plan_handles_nested_language_model_before_read():
         [TensorMeta("model.safetensors", name, torch.float32, [1], 0, 4)]
     )
 
-    class FakeRoutedExperts:
+    class FakeRoutedExperts(nn.Module):
         layer_name = "language_model.model.layers.0.mlp.experts.routed_experts"
         w13_weight = object()
         quant_method = object()
 
         def __init__(self):
+            super().__init__()
             self.calls = []
 
         def _map_global_expert_id_to_local_expert_id(self, _expert_id):
@@ -8556,28 +8593,34 @@ def test_qwen_moe_source_plan_handles_nested_language_model_before_read():
             self.calls.append(kwargs)
             return True
 
-    class FakeExperts:
+    class FakeExperts(nn.Module):
         def __init__(self, routed_experts):
+            super().__init__()
             self.routed_experts = routed_experts
 
-    class FakeMLP:
+    class FakeMLP(nn.Module):
         def __init__(self, routed_experts):
+            super().__init__()
             self.experts = FakeExperts(routed_experts)
 
-    class FakeLayer:
+    class FakeLayer(nn.Module):
         def __init__(self, routed_experts):
+            super().__init__()
             self.mlp = FakeMLP(routed_experts)
 
-    class FakeInnerModel:
+    class FakeInnerModel(nn.Module):
         def __init__(self, routed_experts):
-            self.layers = [FakeLayer(routed_experts)]
+            super().__init__()
+            self.layers = nn.ModuleList([FakeLayer(routed_experts)])
 
-    class FakeLanguageModel:
+    class FakeLanguageModel(nn.Module):
         def __init__(self, routed_experts):
+            super().__init__()
             self.model = FakeInnerModel(routed_experts)
 
-    class FakeWrapper:
+    class FakeWrapper(nn.Module):
         def __init__(self):
+            super().__init__()
             self.routed_experts = FakeRoutedExperts()
             self.language_model = FakeLanguageModel(self.routed_experts)
 

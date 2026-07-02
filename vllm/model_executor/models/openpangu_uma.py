@@ -185,8 +185,6 @@ def load_openpangu_weights_from_source(
         model,
         source,
         plan,
-        family_name="OpenPangu",
-        get_routed_experts=_get_routed_experts_for_layer,
     )
     post_weight_load = getattr(getattr(model, "model", None), "post_weight_load", None)
     if callable(post_weight_load):

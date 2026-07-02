@@ -315,47 +315,19 @@ def execute_weight_plan(
             )
             continue
 
-        loader_parent = None
         try:
             param = _resolve_attr(model, entry.target_name)
         except RuntimeError:
-            parent_name, _sep, leaf = entry.target_name.rpartition(".")
-            try:
-                parent = _resolve_attr(model, parent_name) if parent_name else None
-            except RuntimeError:
-                parent = None
-            routed_experts = getattr(parent, "routed_experts", None)
-            if (
-                routed_experts is not None
-                and hasattr(routed_experts, leaf)
-                and (
-                    entry.shard_id is not None
-                    or entry.expert_id is not None
-                    or entry.weight_name is not None
-                )
-            ):
-                param = getattr(routed_experts, leaf)
-                loader_parent = routed_experts
-            else:
-                if entry.ignore_missing:
-                    source.skip(entry.checkpoint_name, "weight plan target is ignored")
-                    continue
-                raise
+            if entry.ignore_missing:
+                source.skip(entry.checkpoint_name, "weight plan target is ignored")
+                continue
+            raise
 
         weight_loader = getattr(param, "weight_loader", None)
         if not callable(weight_loader):
-            if (
-                entry.shard_id is not None
-                or entry.expert_id is not None
-                or entry.weight_name is not None
-            ):
-                parent_name, _sep, _leaf = entry.target_name.rpartition(".")
-                parent = (
-                    loader_parent
-                    if loader_parent is not None
-                    else _resolve_attr(model, parent_name) if parent_name else None
-                )
-                parent_loader = getattr(parent, "weight_loader", None)
+            if entry.loader_target_name is not None:
+                loader_target = _resolve_attr(model, entry.loader_target_name)
+                parent_loader = getattr(loader_target, "weight_loader", None)
                 if callable(parent_loader):
                     def _parent_weight_loader(
                         param_arg: object,
@@ -375,9 +347,18 @@ def execute_weight_plan(
                     weight_loader = _parent_weight_loader
                 else:
                     raise RuntimeError(
-                        f"Weight plan target {entry.target_name!r} requires loader "
-                        "metadata but has no custom weight_loader"
+                        f"Weight plan loader target {entry.loader_target_name!r} "
+                        "has no custom weight_loader"
                     )
+            elif (
+                entry.shard_id is not None
+                or entry.expert_id is not None
+                or entry.weight_name is not None
+            ):
+                raise RuntimeError(
+                    f"Weight plan target {entry.target_name!r} requires loader "
+                    "metadata but has no custom weight_loader"
+                )
             else:
                 weight_loader = default_weight_loader
 

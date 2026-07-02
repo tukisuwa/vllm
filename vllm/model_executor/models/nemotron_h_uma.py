@@ -117,6 +117,4 @@ def load_nemotron_h_moe_weights_from_source(
         model,
         source,
         plan,
-        family_name="Nemotron-H MoE",
-        get_routed_experts=_get_routed_experts_for_layer,
     )

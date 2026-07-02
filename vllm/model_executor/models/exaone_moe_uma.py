@@ -121,6 +121,4 @@ def load_exaone_moe_weights_from_source(
         model,
         source,
         plan,
-        family_name="EXAONE MoE",
-        get_routed_experts=_get_routed_experts_for_layer,
     )

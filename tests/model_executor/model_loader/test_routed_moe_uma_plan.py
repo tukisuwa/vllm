@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for folding routed MoE entries into a single executable WeightPlan."""
 
-import types
-
 import pytest
 import torch
 from torch import nn
@@ -18,9 +16,8 @@ from vllm.model_executor.model_loader.weight_plan import (
 )
 from vllm.model_executor.models.routed_moe_uma import (
     RoutedMoeEntry,
-    RoutedMoeSourcePlan,
     build_routed_moe_weight_plan,
-    routed_moe_source_plan_to_weight_plan,
+    routed_moe_entries_to_weight_plan,
     RoutedExpertsResolution,
 )
 
@@ -109,17 +106,17 @@ def _routed_entries():
 
 def test_routed_plan_folds_into_single_weight_plan_and_executes():
     model = _Model()
-    source_plan = RoutedMoeSourcePlan(WeightPlan(()), _routed_entries())
-
-    weight_plan = routed_moe_source_plan_to_weight_plan(
+    weight_plan = routed_moe_entries_to_weight_plan(
         model,
-        source_plan,
+        WeightPlan(()),
+        _routed_entries(),
         family_name="Test",
         get_routed_experts=lambda m, layer_id: m.experts,
     )
 
     assert [entry.required for entry in weight_plan.entries] == [True, False]
     assert weight_plan.entries[0].target_name == "experts.w13_weight"
+    assert weight_plan.entries[0].loader_target_name == "experts"
     assert weight_plan.entries[0].weight_name == "experts.w13_weight"
     assert weight_plan.entries[1].skip_reason == "non-local expert 1"
 
@@ -160,14 +157,15 @@ def test_build_routed_moe_weight_plan_returns_weight_plan():
     assert [entry.required for entry in plan.entries] == [True, True]
     assert [entry.expert_id for entry in plan.entries] == [0, 1]
     assert plan.entries[0].target_name == "experts.w13_weight"
+    assert plan.entries[0].loader_target_name == "experts"
 
 
 def test_refused_local_expert_fails_closed():
     model = _Model(accept=False)
-    source_plan = RoutedMoeSourcePlan(WeightPlan(()), _routed_entries())
-    weight_plan = routed_moe_source_plan_to_weight_plan(
+    weight_plan = routed_moe_entries_to_weight_plan(
         model,
-        source_plan,
+        WeightPlan(()),
+        _routed_entries(),
         family_name="Test",
         get_routed_experts=lambda m, layer_id: m.experts,
     )
@@ -178,18 +176,15 @@ def test_refused_local_expert_fails_closed():
         execute_weight_plan(model, source, weight_plan)
 
 
-def test_unregistered_routed_parameter_fails_closed():
+def test_unregistered_routed_expert_module_fails_closed():
     model = _Model()
-    rogue = types.SimpleNamespace(
-        layer_name="experts",
-        w13_weight=nn.Parameter(torch.zeros(2, 4), requires_grad=False),
-    )
+    rogue = _Experts()
 
-    source_plan = RoutedMoeSourcePlan(WeightPlan(()), _routed_entries()[:1])
-    with pytest.raises(RuntimeError, match="not a registered model parameter"):
-        routed_moe_source_plan_to_weight_plan(
+    with pytest.raises(RuntimeError, match="not a registered model module"):
+        routed_moe_entries_to_weight_plan(
             model,
-            source_plan,
+            WeightPlan(()),
+            _routed_entries()[:1],
             family_name="Test",
             get_routed_experts=lambda m, layer_id: rogue,
         )

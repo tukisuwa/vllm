@@ -476,13 +476,15 @@ The shared MoE hook helper returns a composite plan (`auto_plan` plus
 Phase 1 folds routed entries into first-class `WeightPlanEntry` records; the
 fields needed for it (`expert_id`, `shard_id`, `weight_name`) already exist.
 
-Status: mostly closed 2026-07-03.
-`routed_moe_source_plan_to_weight_plan()` converts the composite plan into a
-single `WeightPlan` right before execution, so routed expert bytes appear in
-the summary and the side executor loop is gone.  Model hooks still *build*
-`RoutedMoeSourcePlan` (several families post-process `auto_plan` /
-`routed_entries` between build and load), so build-side unification — hooks
-returning a plain `WeightPlan` — remains Phase 1 work.
+Status: closed 2026-07-03.
+Routed entries are folded into a single `WeightPlan` during plan construction.
+The temporary `RoutedMoeSourcePlan` compatibility class and conversion helper
+were removed after all current family hooks were audited.  Routed expert target
+paths are now derived from `model.named_modules(remove_duplicate=False)` at
+build time, and each routed entry carries an explicit `loader_target_name` when
+the custom loader lives on the expert module rather than the parameter object.
+The executor no longer guesses `routed_experts` children or parent loaders at
+execution time.
 
 ### No load completeness check
 
@@ -748,19 +750,18 @@ Working stance until an upstream RFC exists:
 ## Practical Next Steps
 
 For this branch, the next useful work is, in priority order (items completed
-on 2026-07-03: the loaded-set completeness check, the load-side routed-plan
-fold, moving TP slice inference into plan resolution, Phase 2.5 read-window
-reuse and read scheduling, and build-side routed-plan unification — see
+on 2026-07-03: the loaded-set completeness check, the routed-plan fold, moving
+TP slice inference into plan resolution, Phase 2.5 read-window reuse and read
+scheduling, build-side routed-plan unification, compatibility layer removal,
+and build-time routed target path derivation — see
 Implementation Notes):
 
-1. remove the temporary `RoutedMoeSourcePlan` compatibility class and helper
-   once downstream call sites have been audited;
-2. replace `transform` callables with named registry ops that declare their
+1. replace `transform` callables with named registry ops that declare their
    staging factor;
-3. move symlink/path validation into `TensorCatalog` construction;
-4. begin `parse_name` spec-ification to stop further `*_uma.py` growth
+2. move symlink/path validation into `TensorCatalog` construction;
+3. begin `parse_name` spec-ification to stop further `*_uma.py` growth
    (Phase 3);
-5. keep adding a short design note in each future model hook explaining which
+4. keep adding a short design note in each future model hook explaining which
    generic spec pattern it should eventually become.
 
 This lets the branch keep solving the immediate UMA safety problem while moving
@@ -856,16 +857,15 @@ The three highest-priority gaps from the review were closed in code:
   the compatibility iterator path.  The plan path fails closed if a model hook
   returns no loaded set; the compat path logs a warning for legacy models
   that return `None`.
-- **Routed MoE entries folded into the plan IR (Phase 1, load side).**
-  `routed_moe_source_plan_to_weight_plan()` in `routed_moe_uma.py` converts
-  `RoutedMoeSourcePlan` into a single `WeightPlan` — local routed entries
-  become required `WeightPlanEntry` records (target names resolved through
-  `model.named_parameters()`, loader metadata carried in `shard_id` /
-  `expert_id` / `weight_name`), non-local entries become skips with a
-  `skip_reason`.  `load_routed_moe_weights_from_source` is now a thin wrapper
-  over `execute_weight_plan`, so routed expert bytes are included in
-  `summarize_weight_plan` accounting and the side executor loop is gone.
-  Family hooks are unchanged; build-side unification remains open.
+- **Routed MoE entries folded into the plan IR (Phase 1).**
+  `routed_moe_uma.py` now folds routed entries into a single `WeightPlan` at
+  build time.  Local routed entries become required `WeightPlanEntry` records
+  with target paths derived from registered model modules; loader metadata is
+  carried in `shard_id`, `expert_id`, `weight_name`, and `loader_target_name`.
+  Non-local entries become skips with a `skip_reason`.  Routed expert bytes are
+  included in `summarize_weight_plan` accounting, the side executor loop is
+  gone, and the temporary `RoutedMoeSourcePlan` compatibility layer has been
+  removed.
 - **Executor-side TP slice inference moved to plan resolution (Phase 2).**
   `_infer_output_dim_source_slice` and helpers moved to `weight_plan.py`, and
   a new `resolve_weight_plan(model, catalog, plan)` fills TP source slices
@@ -1063,8 +1063,10 @@ accepts routed expert wrappers where the custom loader lives on the parent
 expert module rather than the parameter object, preserving the routed loader
 call convention after unification.
 
-The old `RoutedMoeSourcePlan` class and
-`routed_moe_source_plan_to_weight_plan()` helper remain as a short-lived
-compatibility layer for audited downstream callers and focused unit tests.  They
-are no longer returned by current build hooks; deleting that compatibility layer
-is now a small follow-up rather than a blocker for Phase 3.
+Follow-up on 2026-07-03 removed the old `RoutedMoeSourcePlan` class and
+`routed_moe_source_plan_to_weight_plan()` helper entirely.  The build helper now
+requires routed experts to be registered model modules and derives their target
+path with `named_modules(remove_duplicate=False)`, preferring paths that match
+the expert module's `layer_name`.  Routed entries that need a module-level
+custom loader carry `loader_target_name`, so `execute_weight_plan()` no longer
+has a hard-coded `routed_experts` fallback or parent-loader guessing logic.

@@ -366,8 +366,6 @@ def load_deepseek_moe_weights_from_source(
         model,
         source,
         plan.routed_plan,
-        family_name="DeepSeek MoE",
-        get_routed_experts=_get_routed_experts_for_layer,
     )
     params = dict(model.named_parameters())
     for entry in plan.fp8_indexer_wk_entries:

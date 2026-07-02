@@ -154,8 +154,6 @@ def load_longcat_flash_weights_from_source(
         model,
         source,
         plan,
-        family_name="Longcat Flash",
-        get_routed_experts=_get_routed_experts_for_layer,
     )
     finalize = getattr(model, "_finalize_mla_weights", None)
     if not callable(finalize):

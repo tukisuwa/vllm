@@ -224,6 +224,7 @@ class WeightPlanEntry:
     shard_id: str | int | None = None
     expert_id: int | None = None
     weight_name: str | None = None
+    loader_target_name: str | None = None
     ignore_missing: bool = False
     skip_reason: str | None = None
 
