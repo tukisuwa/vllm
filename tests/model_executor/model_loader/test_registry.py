@@ -38,6 +38,7 @@ from vllm.model_executor.models import (
     exaone,
     exaone4,
     falcon,
+    falcon_h1,
     gemma,
     gemma2,
     gemma3,
@@ -63,6 +64,7 @@ from vllm.model_executor.models import (
     orion,
     opt,
     olmoe,
+    ouro,
     persimmon,
     phimoe,
     phi,
@@ -79,6 +81,7 @@ from vllm.model_executor.models import (
     step1,
     starcoder2,
     telechat2,
+    zamba2,
 )
 from vllm.model_executor.models.utils import PPMissingLayer, WeightsMapper
 
@@ -2385,12 +2388,143 @@ def test_olmo_exaone_dense_hooks_use_mapper_and_tie_skip(
     assert gate_proj.shard_id == shard_id
 
 
+def test_falcon_h1_build_weight_plan_uses_mapper_and_tie_skip(tmp_path):
+    metadata = {
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "model.layers.0.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "model.layers.0.mlp.gate_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [8, 12],
+        },
+        "model.layers.0.mamba.A_log.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [12, 16],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 16)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeFalconH1:
+        tie_word_embeddings = True
+        hf_to_vllm_mapper = falcon_h1.FalconH1ForCausalLM.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = falcon_h1.FalconH1ForCausalLM.build_weight_plan(FakeFalconH1(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["lm_head.weight"].required is False
+    q_proj = entries["model.layers.0.self_attn.q_proj.weight"]
+    assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
+    assert q_proj.shard_id == "q"
+    gate_proj = entries["model.layers.0.mlp.gate_proj.weight"]
+    assert gate_proj.target_name == "model.layers.0.mlp.gate_up_proj.weight"
+    assert gate_proj.shard_id == 0
+    a_log = entries["model.layers.0.mamba.A_log.weight"]
+    assert a_log.target_name == "model.layers.0.mamba.mamba.A.weight"
+
+
+def test_zamba2_build_weight_plan_uses_mapper_and_tied_lm_head_skip(tmp_path):
+    metadata = {
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "model.layers.0.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "model.layers.0.mamba.A_log.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [8, 12],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 12)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeZamba2:
+        hf_to_vllm_mapper = zamba2.Zamba2ForCausalLM.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = zamba2.Zamba2ForCausalLM.build_weight_plan(FakeZamba2(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["lm_head.weight"].required is False
+    q_proj = entries["model.layers.0.self_attn.q_proj.weight"]
+    assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
+    assert q_proj.shard_id == "q"
+    a_log = entries["model.layers.0.mamba.A_log.weight"]
+    assert a_log.target_name == "model.layers.0.mamba.A.weight"
+
+
+def test_ouro_build_weight_plan_uses_mapper_and_tie_skip(tmp_path):
+    metadata = {
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "model.layers.0.self_attn.v_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "model.layers.0.mlp.up_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [8, 12],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 12)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+
+    class FakeOuro:
+        config = FakeConfig()
+        hf_to_vllm_mapper = ouro.OuroForCausalLM.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = ouro.OuroForCausalLM.build_weight_plan(FakeOuro(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["lm_head.weight"].required is False
+    v_proj = entries["model.layers.0.self_attn.v_proj.weight"]
+    assert v_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
+    assert v_proj.shard_id == "v"
+    up_proj = entries["model.layers.0.mlp.up_proj.weight"]
+    assert up_proj.target_name == "model.layers.0.mlp.gate_up_proj.weight"
+    assert up_proj.shard_id == 1
+
+
 @pytest.mark.parametrize(
     "model_cls, module",
     [
         (olmo.OlmoForCausalLM, olmo),
         (exaone.ExaoneForCausalLM, exaone),
         (nemotron.NemotronForCausalLM, nemotron),
+        (falcon_h1.FalconH1ForCausalLM, falcon_h1),
+        (zamba2.Zamba2ForCausalLM, zamba2),
+        (ouro.OuroForCausalLM, ouro),
     ],
 )
 def test_more_dense_load_weights_from_source_delegates_to_executor(
