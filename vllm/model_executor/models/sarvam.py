@@ -63,6 +63,11 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
 from .bailing_moe import BailingMoeForCausalLM
+from .bailing_moe_uma import (
+    BailingMoeSourcePlan,
+    build_bailing_moe_weight_plan,
+    load_bailing_moe_weights_from_source,
+)
 from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
 from .sarvam_uma import (
     SarvamMoeSourcePlan,
@@ -796,3 +801,23 @@ class SarvamMoEForCausalLM(BailingMoeForCausalLM):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return super().load_weights(_normalized_weights(weights))
+
+    @staticmethod
+    def _uma_name_transform(name: str):
+        if _is_gate_expert_bias_name(name):
+            return name, _zero_mean_tensor
+        return name, None
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> BailingMoeSourcePlan:
+        return build_bailing_moe_weight_plan(
+            self,
+            catalog,
+            extra_name_transform=self._uma_name_transform,
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: BailingMoeSourcePlan,
+    ) -> set[str]:
+        return load_bailing_moe_weights_from_source(self, source, plan)

@@ -58,9 +58,18 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
+from .bailing_moe_uma import (
+    BailingMoeSourcePlan,
+    build_bailing_moe_weight_plan,
+    load_bailing_moe_weights_from_source,
+)
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
@@ -631,6 +640,16 @@ class BailingMoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> BailingMoeSourcePlan:
+        return build_bailing_moe_weight_plan(self, catalog)
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: BailingMoeSourcePlan,
+    ) -> set[str]:
+        return load_bailing_moe_weights_from_source(self, source, plan)
 
 
 class BailingMoeV2ForCausalLM(BailingMoeForCausalLM):

@@ -32,6 +32,8 @@ from vllm.model_executor.models import (
     apertus,
     arctic,
     arcee,
+    bailing_moe,
+    bailing_moe_uma,
     chatglm,
     commandr,
     cohere2_moe,
@@ -4644,6 +4646,187 @@ def test_ernie45_moe_source_plan_skips_and_maps_gate_bias():
     }
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
+
+
+def test_bailing_moe_source_plan_skips_nonlocal_experts_and_normalizes_lm_head():
+    names = [
+        "model.layers.0.mlp.experts.0.gate_proj.weight",
+        "model.layers.0.mlp.experts.1.gate_proj.weight",
+        "lm_head.weight",
+    ]
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", names[0], torch.float32, [1], 0, 4),
+            TensorMeta("model.safetensors", names[1], torch.float32, [1], 4, 4),
+            TensorMeta("model.safetensors", names[2], torch.float32, [2], 8, 8),
+        ]
+    )
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.mlp.experts"
+        w13_weight = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 0 else -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeMLP(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.experts = routed_experts
+
+    class FakeLayer(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.mlp = FakeMLP(routed_experts)
+
+    class FakeInnerModel(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.layers = [FakeLayer(routed_experts)]
+
+    class FakeConfig:
+        tie_word_embeddings = False
+        norm_head = True
+
+    class FakeBailing(bailing_moe.BailingMoeForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = FakeConfig()
+            self.tie_word_embeddings = False
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+            self.lm_head = nn.Linear(2, 1, bias=False)
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            if name == names[2]:
+                return torch.tensor([[3.0, 4.0]])
+            return torch.ones(1)
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    model = FakeBailing()
+    source = FakeSource(catalog)
+
+    plan = model.build_weight_plan(catalog)
+    assert len(plan.auto_plan.entries) == 1
+    assert plan.auto_plan.entries[0].checkpoint_name == names[2]
+    assert [entry.checkpoint_name for entry in plan.routed_entries] == names[:2]
+    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+
+    loaded = model.load_weights_from_source(source, plan)
+
+    assert source.reads == [names[2], names[0]]
+    assert source.skips == [(names[1], "non-local routed expert")]
+    assert torch.allclose(
+        model.lm_head.weight,
+        torch.nn.functional.normalize(torch.tensor([[3.0, 4.0]]), dim=0, p=2),
+    )
+    assert loaded == {
+        "lm_head.weight",
+        "model.layers.0.mlp.experts.w13_weight",
+    }
+    assert model.routed_experts.calls[0]["expert_id"] == 0
+    assert model.routed_experts.calls[0]["shard_id"] == "w1"
+
+
+def test_sarvam_bailing_moe_source_plan_preserves_gate_bias_transform():
+    names = [
+        "model.layers.0.mlp.gate.e_score_correction_bias",
+    ]
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", names[0], torch.float32, [2], 0, 8),
+        ]
+    )
+
+    class FakeGate(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.e_score_correction_bias = nn.Parameter(torch.zeros(2))
+
+    class FakeMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate = FakeGate()
+
+    class FakeLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = FakeMLP()
+
+    class FakeLayers:
+        def __init__(self):
+            self._layers = [FakeLayer()]
+
+        def __len__(self):
+            return len(self._layers)
+
+        def __getitem__(self, idx):
+            return self._layers[idx]
+
+        def __getattr__(self, name):
+            if name.isdigit():
+                return self._layers[int(name)]
+            raise AttributeError(name)
+
+    class FakeInnerModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = FakeLayers()
+
+    class FakeConfig:
+        tie_word_embeddings = False
+        norm_head = False
+
+    class FakeSarvamBailing(sarvam.SarvamMoEForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = FakeConfig()
+            self.tie_word_embeddings = False
+            self.model = FakeInnerModel()
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            return torch.tensor([1.0, 3.0])
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    model = FakeSarvamBailing()
+    source = FakeSource(catalog)
+
+    plan = model.build_weight_plan(catalog)
+    loaded = model.load_weights_from_source(source, plan)
+
+    assert source.reads == names
+    assert source.skips == []
+    assert torch.equal(
+        model.model.layers[0].mlp.gate.e_score_correction_bias,
+        torch.tensor([-1.0, 1.0]),
+    )
+    assert loaded == {"model.layers.0.mlp.gate.e_score_correction_bias"}
 
 
 def test_mixtral_moe_source_plan_skips_nonlocal_experts_before_read():
