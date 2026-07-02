@@ -698,6 +698,13 @@ Add model-side plans only where needed:
   - maps `up_proj` into the FusedMoE `w1` slot and `down_proj` into `w2`
   - skips non-local routed experts before payload read
   - preserves `backbone` to `model` prefix mapping and MTP skip
+- MiniCPM MoE
+  - initial hook implemented for `mlp.experts.<expert>.w{1,2,3}.weight`
+    tensors
+  - reads only the TP-local expert source slices before placing them into
+    MiniCPM's `ws` / `w2s` fused expert parameters
+  - preserves qkv/gate-up packed dense mappings, rotary-cache skips, and tied
+    `lm_head` skip in the model-side plan
 
 Each model family should implement its own plan builder instead of adding
 loader-side conditionals.
@@ -731,6 +738,7 @@ Expected current behavior:
 | AFMoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts while preserving qkv, shared-expert, and router mappings |
 | EXAONE MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts, shared-expert mapper replay, and lm_head/MTP skips |
 | Nemotron-H MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for non-gated `mixer.experts` up/down tensors and MTP skip |
+| MiniCPM MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for TP-local `mlp.experts` w1/w2/w3 source slices into `ws` / `w2s` |
 | Other routed MoE | Base path should work if normal vLLM load works | Not yet implemented |
 | Non-safetensors | Not supported | Not supported |
 | Remote HF path | Not supported by UMA-safe loader | Not supported |

@@ -59,6 +59,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+    WeightPlan,
+    WeightPlanEntry,
+    execute_weight_plan,
+)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -77,6 +84,173 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+
+def _minicpm_resolve_attr(root: object, path: str) -> object:
+    current = root
+    for part in path.split("."):
+        if not hasattr(current, part):
+            raise RuntimeError(f"Cannot resolve MiniCPM UMA target {path!r}")
+        current = getattr(current, part)
+    return current
+
+
+def _minicpm_model_weight_plan(
+    model: nn.Module,
+    catalog: TensorCatalog,
+    *,
+    checkpoint_prefix: str = "model.",
+    target_prefix: str = "model.",
+) -> WeightPlan:
+    config = model.config
+    num_experts = getattr(config, "num_experts", 0)
+    tp_rank = get_tensor_model_parallel_rank()
+    tp_size = get_tensor_model_parallel_world_size()
+    expert_shard_size = config.intermediate_size // tp_size
+
+    entries: list[WeightPlanEntry] = []
+    for checkpoint_name in catalog.names():
+        if not checkpoint_name.startswith(checkpoint_prefix):
+            continue
+        name = checkpoint_name[len(checkpoint_prefix) :]
+
+        if "rotary_emb.inv_freq" in name or (
+            "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name
+        ):
+            entries.append(
+                WeightPlanEntry(
+                    checkpoint_name=checkpoint_name,
+                    target_name=target_prefix + name,
+                    required=False,
+                )
+            )
+            continue
+
+        entry: WeightPlanEntry | None = None
+        for param_name, weight_name, shard_id in (
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ):
+            if weight_name not in name:
+                continue
+            mapped_name = name.replace(weight_name, param_name)
+            entry = WeightPlanEntry(
+                checkpoint_name=checkpoint_name,
+                target_name=target_prefix + mapped_name,
+                shard_id=shard_id,
+                ignore_missing=mapped_name.endswith(".bias"),
+            )
+            break
+        if entry is not None:
+            entries.append(entry)
+            continue
+
+        if num_experts:
+            for expert_id in range(num_experts):
+                for param_name, weight_name, source_slices in (
+                    (
+                        "ws",
+                        f"experts.{expert_id}.w1.weight",
+                        (
+                            slice(
+                                tp_rank * expert_shard_size,
+                                (tp_rank + 1) * expert_shard_size,
+                            ),
+                            slice(None),
+                        ),
+                    ),
+                    (
+                        "w2s",
+                        f"experts.{expert_id}.w2.weight",
+                        (
+                            slice(None),
+                            slice(
+                                tp_rank * expert_shard_size,
+                                (tp_rank + 1) * expert_shard_size,
+                            ),
+                        ),
+                    ),
+                    (
+                        "ws",
+                        f"experts.{expert_id}.w3.weight",
+                        (
+                            slice(
+                                tp_rank * expert_shard_size,
+                                (tp_rank + 1) * expert_shard_size,
+                            ),
+                            slice(None),
+                        ),
+                    ),
+                ):
+                    if weight_name not in name:
+                        continue
+                    entry = WeightPlanEntry(
+                        checkpoint_name=checkpoint_name,
+                        target_name=target_prefix
+                        + name.replace(weight_name, param_name),
+                        source_slices=source_slices,
+                        source_is_sharded=True,
+                        expert_id=expert_id,
+                        weight_name=weight_name,
+                    )
+                    break
+                if entry is not None:
+                    break
+        if entry is not None:
+            entries.append(entry)
+            continue
+
+        entries.append(
+            WeightPlanEntry(
+                checkpoint_name=checkpoint_name,
+                target_name=target_prefix + name,
+                ignore_missing=name.endswith(".bias"),
+            )
+        )
+    return WeightPlan(tuple(entries))
+
+
+def _minicpm_load_weights_from_source(
+    model: nn.Module,
+    source: ODirectSafetensorsWeightSource,
+    plan: WeightPlan,
+) -> set[str]:
+    generic_entries: list[WeightPlanEntry] = []
+    loaded: set[str] = set()
+    for entry in plan:
+        if entry.expert_id is None or entry.source_slices is None:
+            generic_entries.append(entry)
+            continue
+        param = _minicpm_resolve_attr(model, entry.target_name)
+        tensor = source.read_slice_cpu(entry.checkpoint_name, entry.source_slices)
+        if entry.weight_name is None:
+            raise RuntimeError(
+                "MiniCPM UMA expert entry requires weight_name: "
+                f"{entry.checkpoint_name}"
+            )
+        if entry.weight_name.endswith("w1.weight"):
+            param.data[entry.expert_id, 0 : tensor.shape[0], :] = tensor
+        elif entry.weight_name.endswith("w3.weight"):
+            param.data[entry.expert_id, tensor.shape[0] : 2 * tensor.shape[0], :] = (
+                tensor
+            )
+        elif entry.weight_name.endswith("w2.weight"):
+            param.data[entry.expert_id, :, :] = tensor
+        else:
+            raise RuntimeError(
+                "MiniCPM UMA expert entry has unknown weight name: "
+                f"{entry.weight_name}"
+            )
+        loaded.add(entry.target_name)
+
+    if generic_entries:
+        loaded.update(
+            execute_weight_plan(model, source, WeightPlan(tuple(generic_entries)))
+        )
+    return loaded
 
 
 class MiniCPMMoE(nn.Module):
@@ -653,3 +827,31 @@ class MiniCPMForCausalLM(
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
         return loader.load_weights(weights)
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
+        plan = _minicpm_model_weight_plan(self.model, catalog)
+        lm_head_entries: list[WeightPlanEntry] = []
+        if catalog.has("lm_head.weight"):
+            lm_head_entries.append(
+                WeightPlanEntry(
+                    "lm_head.weight",
+                    "lm_head.weight",
+                    required=not self.config.tie_word_embeddings,
+                )
+            )
+        existing = {entry.checkpoint_name for entry in plan}
+        return WeightPlan(
+            tuple(plan.entries)
+            + tuple(
+                entry
+                for entry in lm_head_entries
+                if entry.checkpoint_name not in existing
+            )
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: WeightPlan,
+    ) -> set[str]:
+        return _minicpm_load_weights_from_source(self, source, plan)
