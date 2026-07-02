@@ -38,10 +38,19 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.llama import LlamaMLP as JambaMLP
 from vllm.sequence import IntermediateTensors
 
+from .jamba_uma import (
+    JambaMoeSourcePlan,
+    build_jamba_moe_weight_plan,
+    load_jamba_moe_weights_from_source,
+)
 from .interfaces import (
     HasInnerState,
     IsHybrid,
@@ -579,6 +588,20 @@ class JambaForCausalLM(
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> JambaMoeSourcePlan:
+        return build_jamba_moe_weight_plan(
+            self,
+            catalog,
+            mapper=self.hf_to_vllm_mapper,
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: JambaMoeSourcePlan,
+    ) -> set[str]:
+        return load_jamba_moe_weights_from_source(self, source, plan)
 
 
 class JambaForSequenceClassification(JambaForCausalLM):

@@ -61,6 +61,8 @@ from vllm.model_executor.models import (
     hrm_text,
     internlm2,
     jais2,
+    jamba,
+    jamba_uma,
     lfm2,
     llama,
     mamba,
@@ -4322,6 +4324,81 @@ def test_hy_v3_moe_source_plan_skips_nonlocal_experts_and_spec_layers():
         "model.layers.0.mlp.gate.weight",
         "model.layers.0.mlp.experts.w13_weight",
     }
+    assert model.routed_experts.calls[0]["expert_id"] == 0
+    assert model.routed_experts.calls[0]["shard_id"] == "w1"
+
+
+def test_jamba_moe_source_plan_skips_nonlocal_experts_before_read():
+    names = [
+        "model.layers.0.feed_forward.experts.0.gate_proj.weight",
+        "model.layers.0.feed_forward.experts.1.gate_proj.weight",
+    ]
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", names[0], torch.float32, [1], 0, 4),
+            TensorMeta("model.safetensors", names[1], torch.float32, [1], 4, 4),
+        ]
+    )
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.feed_forward.experts"
+        w13_weight = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 0 else -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeFeedForward:
+        def __init__(self, routed_experts):
+            self.experts = routed_experts
+
+    class FakeLayer:
+        def __init__(self, routed_experts):
+            self.feed_forward = FakeFeedForward(routed_experts)
+
+    class FakeInnerModel:
+        def __init__(self, routed_experts):
+            self.layers = [FakeLayer(routed_experts)]
+
+    class FakeJamba(jamba.JambaForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            return torch.ones(1)
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    model = FakeJamba()
+    source = FakeSource(catalog)
+
+    plan = model.build_weight_plan(catalog)
+    assert len(plan.auto_plan.entries) == 0
+    assert [entry.checkpoint_name for entry in plan.routed_entries] == names
+    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+
+    loaded = model.load_weights_from_source(source, plan)
+
+    assert source.reads == [names[0]]
+    assert source.skips == [(names[1], "non-local routed expert")]
+    assert loaded == {"model.layers.0.feed_forward.experts.w13_weight"}
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
