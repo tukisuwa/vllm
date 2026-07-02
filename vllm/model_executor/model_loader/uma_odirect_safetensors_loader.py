@@ -9,7 +9,7 @@ import sys
 import time
 from collections import defaultdict
 from collections.abc import Callable, Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from torch import nn
@@ -495,6 +495,45 @@ class ODirectSafetensorsWeightSource:
         self.catalog = loader._build_catalog(self.files)
         self._stats = _SourceReadStats()
         self._bytes_since_gate = 0
+        self._open_file_handle: "_ODirectFile | None" = None
+        self._open_file_path: str | None = None
+
+    def _open_file(self, path: str) -> "_ODirectFile":
+        """Return an open O_DIRECT handle, keeping the most recent file open.
+
+        The read window lives on the handle, so keeping one handle open across
+        plan entries lets adjacent small tensors share window loads instead of
+        paying one window-sized read per tensor.  Only the most recent file
+        stays open, so fd count and window-buffer residency stay bounded at one.
+        """
+
+        handle = self._open_file_handle
+        if handle is not None and self._open_file_path == path:
+            return handle
+        self.close_files()
+        handle = _ODirectFile(
+            path,
+            self._loader._chunk_size,
+            self._loader._alignment,
+            self._loader._window_size,
+        )
+        self._open_file_handle = handle
+        self._open_file_path = path
+        self._stats.files_opened += 1
+        return handle
+
+    def close_files(self) -> None:
+        """Close the cached O_DIRECT handle and fold its counters into stats."""
+
+        handle = self._open_file_handle
+        if handle is None:
+            return
+        self._open_file_handle = None
+        self._open_file_path = None
+        self._stats.collect_file(handle)
+        close = getattr(handle, "close", None)
+        if close is not None:
+            close()
 
     def iter_full_tensors(
         self,
@@ -517,24 +556,9 @@ class ODirectSafetensorsWeightSource:
             else None
         )
 
-        current_path: str | None = None
-        odirect_file: _ODirectFile | None = None
         try:
             for record in records:
-                if record.file_path != current_path:
-                    if odirect_file is not None:
-                        self._stats.collect_file(odirect_file)
-                        odirect_file.close()
-                    current_path = record.file_path
-                    odirect_file = _ODirectFile(
-                        current_path,
-                        self._loader._chunk_size,
-                        self._loader._alignment,
-                        self._loader._window_size,
-                    )
-                    self._stats.files_opened += 1
-
-                assert odirect_file is not None
+                odirect_file = self._open_file(record.file_path)
                 tensor, time_alloc, time_read = self._read_record_tensor(
                     record,
                     odirect_file,
@@ -564,9 +588,7 @@ class ODirectSafetensorsWeightSource:
                         "another load error was already being raised",
                         exc_info=True,
                     )
-            if odirect_file is not None:
-                self._stats.collect_file(odirect_file)
-                odirect_file.close()
+            self.close_files()
             if consumer_profile is not None:
                 consumer_profile.log()
 
@@ -736,26 +758,19 @@ class ODirectSafetensorsWeightSource:
 
         flat = tensor.reshape(-1)
         t1 = time.perf_counter()
-        with _ODirectFile(
-            record.file_path,
-            self._loader._chunk_size,
-            self._loader._alignment,
-            self._loader._window_size,
-        ) as odirect_file:
-            self._stats.files_opened += 1
-            for outer_idx in range(outer_count):
-                source_element_offset = (
-                    outer_idx * source_dim * inner_count + start * inner_count
-                )
-                target_element_offset = outer_idx * segment_elements
-                target_view = flat.narrow(0, target_element_offset, segment_elements)
-                odirect_file.read_record_into_tensor(
-                    target_view,
-                    record.offset + source_element_offset * element_size,
-                    segment_bytes,
-                    gate=self._note_loaded_bytes,
-                )
-            self._stats.collect_file(odirect_file)
+        odirect_file = self._open_file(record.file_path)
+        for outer_idx in range(outer_count):
+            source_element_offset = (
+                outer_idx * source_dim * inner_count + start * inner_count
+            )
+            target_element_offset = outer_idx * segment_elements
+            target_view = flat.narrow(0, target_element_offset, segment_elements)
+            odirect_file.read_record_into_tensor(
+                target_view,
+                record.offset + source_element_offset * element_size,
+                segment_bytes,
+                gate=self._note_loaded_bytes,
+            )
         time_read = time.perf_counter() - t1
 
         selected_bytes = total_elements * element_size
@@ -798,26 +813,19 @@ class ODirectSafetensorsWeightSource:
         self._maybe_gate(f"before reading {record.name}[strided-slice]", force=True)
         flat = dst.reshape(-1)
         t0 = time.perf_counter()
-        with _ODirectFile(
-            record.file_path,
-            self._loader._chunk_size,
-            self._loader._alignment,
-            self._loader._window_size,
-        ) as odirect_file:
-            self._stats.files_opened += 1
-            for outer_idx in range(outer_count):
-                source_element_offset = (
-                    outer_idx * source_dim * inner_count + start * inner_count
-                )
-                target_element_offset = outer_idx * segment_elements
-                target_view = flat.narrow(0, target_element_offset, segment_elements)
-                odirect_file.read_record_into_tensor(
-                    target_view,
-                    record.offset + source_element_offset * element_size,
-                    segment_bytes,
-                    gate=self._note_loaded_bytes,
-                )
-            self._stats.collect_file(odirect_file)
+        odirect_file = self._open_file(record.file_path)
+        for outer_idx in range(outer_count):
+            source_element_offset = (
+                outer_idx * source_dim * inner_count + start * inner_count
+            )
+            target_element_offset = outer_idx * segment_elements
+            target_view = flat.narrow(0, target_element_offset, segment_elements)
+            odirect_file.read_record_into_tensor(
+                target_view,
+                record.offset + source_element_offset * element_size,
+                segment_bytes,
+                gate=self._note_loaded_bytes,
+            )
         time_read = time.perf_counter() - t0
 
         selected_bytes = total_elements * element_size
@@ -830,18 +838,11 @@ class ODirectSafetensorsWeightSource:
 
     def _read_record_cpu(self, record: TensorMeta, *, sliced: bool) -> torch.Tensor:
         self._maybe_gate(f"before reading {record.name}", force=True)
-        with _ODirectFile(
-            record.file_path,
-            self._loader._chunk_size,
-            self._loader._alignment,
-            self._loader._window_size,
-        ) as odirect_file:
-            self._stats.files_opened += 1
-            tensor, time_alloc, time_read = self._read_record_tensor(
-                record,
-                odirect_file,
-            )
-            self._stats.collect_file(odirect_file)
+        odirect_file = self._open_file(record.file_path)
+        tensor, time_alloc, time_read = self._read_record_tensor(
+            record,
+            odirect_file,
+        )
         self._stats.tensors_read += 1
         self._stats.bytes_tensor_payload += record.size
         if sliced:
@@ -898,22 +899,15 @@ class ODirectSafetensorsWeightSource:
                 f"Destination shape mismatch for {record.name}: "
                 f"dst={list(dst.shape)}, source={record.shape}"
             )
-        with _ODirectFile(
-            record.file_path,
-            self._loader._chunk_size,
-            self._loader._alignment,
-            self._loader._window_size,
-        ) as odirect_file:
-            self._stats.files_opened += 1
-            t0 = time.perf_counter()
-            odirect_file.read_record_into_tensor(
-                dst,
-                record.offset,
-                record.size,
-                gate=self._note_loaded_bytes,
-            )
-            time_read = time.perf_counter() - t0
-            self._stats.collect_file(odirect_file)
+        odirect_file = self._open_file(record.file_path)
+        t0 = time.perf_counter()
+        odirect_file.read_record_into_tensor(
+            dst,
+            record.offset,
+            record.size,
+            gate=self._note_loaded_bytes,
+        )
+        time_read = time.perf_counter() - t0
         self._stats.tensors_read += 1
         self._stats.bytes_tensor_payload += record.size
         if sliced:
@@ -947,7 +941,10 @@ class ODirectSafetensorsWeightSource:
         self._stats.log(label)
 
     def stats_snapshot(self) -> dict[str, int | float]:
-        return self._stats.snapshot()
+        stats = replace(self._stats)
+        if self._open_file_handle is not None:
+            stats.collect_file(self._open_file_handle)
+        return stats.snapshot()
 
     def _maybe_gate(self, reason: str, force: bool = False) -> None:
         if (
@@ -1442,6 +1439,7 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
             try:
                 loaded_weights = load_weights_from_source(source, plan)
             finally:
+                source.close_files()
                 source.log_stats("model-source")
             if loaded_weights is None:
                 raise RuntimeError(
@@ -1459,6 +1457,7 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
         try:
             loaded_weights = model.load_weights(source.iter_full_tensors())
         finally:
+            source.close_files()
             source.log_stats("compat-iterator")
         if loaded_weights is None:
             logger.warning(

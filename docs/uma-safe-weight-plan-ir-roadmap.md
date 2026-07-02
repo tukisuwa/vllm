@@ -748,14 +748,18 @@ Working stance until an upstream RFC exists:
 
 For this branch, the next useful work is, in priority order (items completed
 on 2026-07-03: the loaded-set completeness check, the load-side routed-plan
-fold, and moving TP slice inference into plan resolution — see Implementation
-Notes):
+fold, moving TP slice inference into plan resolution, and Phase 2.5 stage 1
+read-window reuse — see Implementation Notes):
 
-1. finish routed-plan unification on the build side so model hooks return a
+1. Phase 2.5 stage 2: `ReadSchedulePlan` — order plan entries by
+   (file, offset) where semantics allow, coalesce nearby ranges, and report
+   expected read amplification in the plan summary before execution (this
+   also removes the residual second pass over expert regions from routed
+   entries being appended after the auto plan);
+2. finish routed-plan unification on the build side so model hooks return a
    plain `WeightPlan` instead of `RoutedMoeSourcePlan`;
-2. replace `transform` callables with named registry ops that declare their
+3. replace `transform` callables with named registry ops that declare their
    staging factor;
-3. start the Phase 2.5 read scheduler and report read amplification;
 4. move symlink/path validation into `TensorCatalog` construction;
 5. begin `parse_name` spec-ification to stop further `*_uma.py` growth
    (Phase 3);
@@ -950,3 +954,48 @@ PrimeIntellect tiny MoE run read 150.39 GiB for 1.25 GiB of payload with the
 21.73 GiB of payload after reducing the O_DIRECT window to 1 MiB.  This
 validates the Phase 2.5 priority: read scheduling and coalescing should become
 a first-class regression metric rather than relying on window-size tuning.
+
+### 2026-07-03 Phase 2.5 stage 1: read-window reuse across plan entries
+
+The runtime numbers above identified the amplification mechanism exactly:
+every plan-path read (`_read_record_cpu`, `_read_record_into_cpu`, and both
+strided readers) opened its own `_ODirectFile` per call, and the read window
+lives on that handle, so each entry paid at least one window-sized pread.
+The measurements match "one window load per entry" almost perfectly:
+
+```text
+35B NVFP4: 124,306 entries x 1 MiB window   ~ 121 GiB  vs 125.91 GiB read
+tiny MoE:    1,325 entries x 128 MiB window ~ 166 GiB  vs 150.39 GiB read
+qwen3.5:     2,017 entries x ~1.1 MiB file  ~ 2.2 GiB  vs   2.24 GiB read
+```
+
+(The compat iterator path already kept one handle open per file, which is why
+this never showed up before the plan path became the default.)
+
+Fix: `ODirectSafetensorsWeightSource` now caches the most recently used
+`_ODirectFile` (`_open_file` / `close_files`), and all plan-path readers plus
+`iter_full_tensors` share it.  Only one file stays open, so fd count and
+window-buffer residency remain bounded at one — peak memory behavior is
+unchanged.  Because auto plans iterate the catalog in (file, offset) order,
+adjacent small tensors now hit the same window instead of each paying a full
+window read.  Expected result: amplification drops to roughly
+`bytes_read ~ file bytes touched` for offset-ordered plan segments; routed
+entries appended after the auto plan can still cause a second pass over
+expert regions (bounded ~2x), which is what the stage 2 `ReadSchedulePlan`
+(entry ordering and range coalescing) will remove.
+
+DGX Spark re-measurement after the fix:
+
+```text
+Model                         Payload   bytes_read  Window loads  Load time
+PrimeIntellect tiny MoE       1.25 GiB    1.85 GiB            11     0.90 s
+tiny-random-qwen3.5 MoE       0.01 GiB    0.01 GiB             1     0.43 s
+Qwen3.6 35B NVFP4            21.73 GiB   28.90 GiB           218    23.93 s
+```
+
+Safety counters stayed clean: swap remained 0 and memory PSI stayed 0 for all
+three runs.  The 35B run was measured with the normal 128 MiB window again;
+the previous 1 MiB workaround is no longer required for amplification control.
+Per-file counters are now folded into source stats when the handle is closed or
+switched, and `stats_snapshot()` includes the currently open handle so registry
+tests and mid-load snapshots see live counters.
