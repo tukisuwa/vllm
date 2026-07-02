@@ -52,6 +52,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+    WeightPlan,
+    build_auto_weight_plan_for_module,
+    execute_weight_plan,
+)
 from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -418,3 +425,20 @@ class Olmo2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
             ),
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
+        return build_auto_weight_plan_for_module(
+            self,
+            catalog,
+            mapper=self.hf_to_vllm_mapper,
+            skip_prefixes=(
+                ["lm_head.weight"] if self.config.tie_word_embeddings else None
+            ),
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: WeightPlan,
+    ) -> set[str]:
+        return execute_weight_plan(self, source, plan)

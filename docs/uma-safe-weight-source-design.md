@@ -392,7 +392,8 @@ Remaining:
 
 ### Phase 3: Dense model prototype
 
-Status: started with `Qwen3ForCausalLM` and `LlamaForCausalLM`.
+Status: started with `Qwen2ForCausalLM`, `Qwen3ForCausalLM`,
+`LlamaForCausalLM`, `Olmo2ForCausalLM`, and `CohereForCausalLM`.
 
 Start with Llama/Qwen dense, not MoE.
 
@@ -404,7 +405,8 @@ Why:
 
 Target behavior:
 
-- plan skips tied `lm_head`: implemented for Qwen3 and Llama
+- plan skips tied `lm_head`: implemented for Qwen2, Qwen3, Llama, and OLMo2
+- plan skips static non-payload entries such as Cohere `rotary_emb.inv_freq`
 - plan skips rotary/cache tensors: implemented through shared auto-plan helper
 - plan maps q/k/v into qkv placement before read: implemented through
   `hf_to_vllm_mapper` and `shard_id`
@@ -512,7 +514,7 @@ Expected current behavior:
 
 | Model type | Base `uma_odirect_safetensors` | Direct plan path |
 | --- | --- | --- |
-| Dense safetensors | Should work if normal vLLM load works | Phase 3 |
+| Dense safetensors | Should work if normal vLLM load works | Phase 3 hooks for Qwen2/Qwen3/Llama/OLMo2/Cohere-style AutoWeightsLoader models |
 | Sharded dense safetensors | Should work if no duplicate names | Phase 3 |
 | Qwen2/Qwen3 / OLMoE / Cohere2 routed MoE | Base path should work if normal vLLM load works | Phase 4/5 model hook for `mlp.experts` gate/up/down tensors; loader-side direct path removed |
 | Mixtral / PhiMoE routed MoE | Base path should work if normal vLLM load works | Phase 5 initial model hook for `block_sparse_moe.experts` w1/w2/w3 tensors |

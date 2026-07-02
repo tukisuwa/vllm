@@ -26,6 +26,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     execute_weight_plan,
 )
 from vllm.model_executor.models import (
+    commandr,
     cohere2_moe,
     deepseek_v2,
     granitemoe,
@@ -33,8 +34,10 @@ from vllm.model_executor.models import (
     granitemoeshared,
     llama,
     mixtral,
+    olmo2,
     olmoe,
     phimoe,
+    qwen2,
     qwen2_moe,
     qwen3,
     qwen3_5,
@@ -1481,6 +1484,67 @@ def test_qwen3_load_weights_from_source_delegates_to_executor(monkeypatch):
     assert calls == [(model, source, plan)]
 
 
+def test_qwen2_build_weight_plan_uses_catalog_mapper_and_tie_skip(tmp_path):
+    metadata = {
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "model.layers.0.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "model.layers.0.mlp.gate_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [8, 12],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 12)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+
+    class FakeQwen2:
+        config = FakeConfig()
+        hf_to_vllm_mapper = qwen2.Qwen2ForCausalLM.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = qwen2.Qwen2ForCausalLM.build_weight_plan(FakeQwen2(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["lm_head.weight"].required is False
+    q_proj = entries["model.layers.0.self_attn.q_proj.weight"]
+    assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
+    assert q_proj.shard_id == "q"
+    gate_proj = entries["model.layers.0.mlp.gate_proj.weight"]
+    assert gate_proj.target_name == "model.layers.0.mlp.gate_up_proj.weight"
+    assert gate_proj.shard_id == 0
+
+
+def test_qwen2_load_weights_from_source_delegates_to_executor(monkeypatch):
+    calls = []
+
+    def fake_execute(model, source, plan):
+        calls.append((model, source, plan))
+        return {"loaded"}
+
+    monkeypatch.setattr(qwen2, "execute_weight_plan", fake_execute)
+    model = object()
+    source = object()
+    plan = WeightPlan(())
+
+    loaded = qwen2.Qwen2ForCausalLM.load_weights_from_source(model, source, plan)
+
+    assert loaded == {"loaded"}
+    assert calls == [(model, source, plan)]
+
+
 def test_llama_build_weight_plan_uses_catalog_mapper_and_tie_skip(tmp_path):
     metadata = {
         "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
@@ -1583,6 +1647,130 @@ def test_llama_load_weights_from_source_delegates_to_executor(monkeypatch):
     plan = WeightPlan(())
 
     loaded = llama.LlamaForCausalLM.load_weights_from_source(model, source, plan)
+
+    assert loaded == {"loaded"}
+    assert calls == [(model, source, plan)]
+
+
+def test_olmo2_build_weight_plan_uses_catalog_mapper_and_tie_skip(tmp_path):
+    metadata = {
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "model.layers.0.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "model.layers.0.mlp.up_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [8, 12],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 12)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+
+    class FakeOlmo2:
+        config = FakeConfig()
+        hf_to_vllm_mapper = olmo2.Olmo2ForCausalLM.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = olmo2.Olmo2ForCausalLM.build_weight_plan(FakeOlmo2(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["lm_head.weight"].required is False
+    q_proj = entries["model.layers.0.self_attn.q_proj.weight"]
+    assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
+    assert q_proj.shard_id == "q"
+    up_proj = entries["model.layers.0.mlp.up_proj.weight"]
+    assert up_proj.target_name == "model.layers.0.mlp.gate_up_proj.weight"
+    assert up_proj.shard_id == 1
+
+
+def test_olmo2_load_weights_from_source_delegates_to_executor(monkeypatch):
+    calls = []
+
+    def fake_execute(model, source, plan):
+        calls.append((model, source, plan))
+        return {"loaded"}
+
+    monkeypatch.setattr(olmo2, "execute_weight_plan", fake_execute)
+    model = object()
+    source = object()
+    plan = WeightPlan(())
+
+    loaded = olmo2.Olmo2ForCausalLM.load_weights_from_source(model, source, plan)
+
+    assert loaded == {"loaded"}
+    assert calls == [(model, source, plan)]
+
+
+def test_commandr_build_weight_plan_uses_catalog_mapper_and_static_skips(tmp_path):
+    metadata = {
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "model.rotary_emb.inv_freq": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "model.layers.0.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [8, 12],
+        },
+        "model.layers.0.mlp.up_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [12, 16],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 16)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeCommandR:
+        hf_to_vllm_mapper = commandr.CohereForCausalLM.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = commandr.CohereForCausalLM.build_weight_plan(FakeCommandR(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["lm_head.weight"].required is False
+    assert entries["model.rotary_emb.inv_freq"].required is False
+    q_proj = entries["model.layers.0.self_attn.q_proj.weight"]
+    assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
+    assert q_proj.shard_id == "q"
+    up_proj = entries["model.layers.0.mlp.up_proj.weight"]
+    assert up_proj.target_name == "model.layers.0.mlp.gate_up_proj.weight"
+    assert up_proj.shard_id == 1
+
+
+def test_commandr_load_weights_from_source_delegates_to_executor(monkeypatch):
+    calls = []
+
+    def fake_execute(model, source, plan):
+        calls.append((model, source, plan))
+        return {"loaded"}
+
+    monkeypatch.setattr(commandr, "execute_weight_plan", fake_execute)
+    model = object()
+    source = object()
+    plan = WeightPlan(())
+
+    loaded = commandr.CohereForCausalLM.load_weights_from_source(model, source, plan)
 
     assert loaded == {"loaded"}
     assert calls == [(model, source, plan)]

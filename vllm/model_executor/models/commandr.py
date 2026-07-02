@@ -44,6 +44,13 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+    WeightPlan,
+    build_auto_weight_plan_for_module,
+    execute_weight_plan,
+)
 from vllm.model_executor.model_loader.weight_utils import (
     row_parallel_weight_loader,
 )
@@ -417,3 +424,18 @@ class CohereForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsQuant):
             self, skip_prefixes=["lm_head", "rotary_emb.inv_freq"]
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
+        return build_auto_weight_plan_for_module(
+            self,
+            catalog,
+            mapper=self.hf_to_vllm_mapper,
+            skip_prefixes=["lm_head", "rotary_emb.inv_freq"],
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: WeightPlan,
+    ) -> set[str]:
+        return execute_weight_plan(self, source, plan)
