@@ -34,6 +34,8 @@ def _make_source(monkeypatch):
     source._stats = L._SourceReadStats()
     source._bytes_since_gate = 0
     source._open_file_handle = None
+    source._open_file_path = None
+    source._expected_read_summary = None
     return source
 
 
@@ -94,3 +96,26 @@ def test_open_file_reopens_after_close(monkeypatch):
     assert first is not second
     assert second.closed is False
     assert source._stats.files_opened == 2
+
+
+def test_log_stats_warns_when_actual_reads_exceed_expected(caplog, monkeypatch):
+    source = _make_source(monkeypatch)
+    source._stats.bytes_read = 121
+    source.set_expected_read_summary(
+        L.ReadScheduleSummary(
+            entries=1,
+            required_entries=1,
+            read_ranges=1,
+            expected_direct_reads=1,
+            expected_window_loads=1,
+            expected_window_hits=1,
+            expected_bytes_read=100,
+            payload_bytes=100,
+        )
+    )
+
+    caplog.set_level("WARNING")
+    source.log_stats("test")
+
+    assert "actual read amplification exceeded" in caplog.text
+    assert "threshold=1.10x" in caplog.text

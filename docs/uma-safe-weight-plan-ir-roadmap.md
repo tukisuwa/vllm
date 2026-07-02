@@ -1015,3 +1015,12 @@ new bulk group-read API; the actual read path still uses the Stage 1 handle
 cache, while the schedule gives logs and CI a stable expected-amplification
 metric and prepares the IR for later range-group execution if it becomes worth
 the extra staging complexity.
+
+Stage 2 follow-up: schedule construction now computes read ranges once and
+shares them across ordering, payload accounting, and simulation.  Strided reads
+are represented as `(offset, size, repeat, stride)` instead of enumerating every
+row/column segment, which keeps tensor-parallel slice planning bounded by
+entries rather than rows.  Source stats also compare actual `bytes_read` to the
+scheduled expectation after execution and warn when actual exceeds expected by
+more than 10%, making read-amplification regression detection permanent in the
+load logs.

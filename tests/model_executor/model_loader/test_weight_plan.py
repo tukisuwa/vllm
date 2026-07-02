@@ -238,3 +238,34 @@ def test_schedule_weight_plan_reads_estimates_large_direct_reads():
     assert schedule.summary.expected_window_loads == 0
     assert schedule.summary.expected_bytes_read == 12288
     assert schedule.summary.read_amplification == 1.0
+
+
+def test_schedule_weight_plan_reads_estimates_strided_ranges_without_expansion():
+    catalog = TensorCatalog(
+        [
+            TensorMeta("f", "cols", torch.uint8, [4, 4], 0, 16),
+        ]
+    )
+    plan = WeightPlan(
+        (
+            WeightPlanEntry(
+                "cols",
+                "cols",
+                source_slices=(slice(None), slice(0, 1)),
+            ),
+        )
+    )
+
+    schedule = schedule_weight_plan_reads(
+        catalog,
+        plan,
+        chunk_size=4,
+        window_size=8,
+        alignment=1,
+    )
+
+    assert schedule.summary.read_ranges == 4
+    assert schedule.summary.payload_bytes == 4
+    assert schedule.summary.expected_window_loads == 2
+    assert schedule.summary.expected_window_hits == 4
+    assert schedule.summary.expected_bytes_read == 16

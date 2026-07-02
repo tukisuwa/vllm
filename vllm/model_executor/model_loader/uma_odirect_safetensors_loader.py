@@ -23,6 +23,7 @@ from vllm.model_executor.model_loader.weight_plan import (
     ExecutorCapability,
     TensorCatalog,
     TensorMeta,
+    ReadScheduleSummary,
     WeightPlan,
     WeightPlanBuilder,
     WeightPlanEntry,
@@ -268,6 +269,9 @@ def execute_weight_plan(
         ),
     )
     schedule_summary = schedule.summary
+    set_expected_read_summary = getattr(source, "set_expected_read_summary", None)
+    if callable(set_expected_read_summary):
+        set_expected_read_summary(schedule_summary)
     logger.info(
         "uma_odirect_safetensors weight plan: entries=%d required=%d skipped=%d "
         "missing_skipped=%d full_reads=%d sliced_reads=%d read_into=%d "
@@ -535,6 +539,7 @@ class ODirectSafetensorsWeightSource:
         self._bytes_since_gate = 0
         self._open_file_handle: "_ODirectFile | None" = None
         self._open_file_path: str | None = None
+        self._expected_read_summary: ReadScheduleSummary | None = None
 
     def _open_file(self, path: str) -> "_ODirectFile":
         """Return an open O_DIRECT handle, keeping the most recent file open.
@@ -977,6 +982,24 @@ class ODirectSafetensorsWeightSource:
 
     def log_stats(self, label: str) -> None:
         self._stats.log(label)
+        expected = self._expected_read_summary
+        if expected is None or expected.expected_bytes_read <= 0:
+            return
+        threshold = expected.expected_bytes_read * 1.10
+        if self._stats.bytes_read <= threshold:
+            return
+        logger.warning(
+            "uma_odirect_safetensors actual read amplification exceeded "
+            "schedule expectation (%s): actual_bytes_read=%s "
+            "expected_bytes_read=%s ratio=%.2fx threshold=1.10x",
+            label,
+            _format_gib(self._stats.bytes_read),
+            _format_gib(expected.expected_bytes_read),
+            self._stats.bytes_read / expected.expected_bytes_read,
+        )
+
+    def set_expected_read_summary(self, summary: ReadScheduleSummary) -> None:
+        self._expected_read_summary = summary
 
     def stats_snapshot(self) -> dict[str, int | float]:
         stats = replace(self._stats)

@@ -284,6 +284,41 @@ class ReadSchedulePlan:
     summary: ReadScheduleSummary
 
 
+@dataclass(frozen=True)
+class _PlanReadRange:
+    file_path: str
+    offset: int
+    size: int
+    repeat: int = 1
+    stride: int = 0
+
+    @property
+    def first_offset(self) -> int:
+        return self.offset
+
+    @property
+    def range_count(self) -> int:
+        return self.repeat if self.size > 0 else 0
+
+    @property
+    def payload_bytes(self) -> int:
+        return self.size * self.range_count
+
+
+@dataclass(frozen=True)
+class _ScheduledEntry:
+    original_index: int
+    entry: WeightPlanEntry
+    ranges: tuple[_PlanReadRange, ...]
+
+    @property
+    def first_read_key(self) -> tuple[str, int, int]:
+        if not self.ranges:
+            return ("", 0, self.original_index)
+        first = min(self.ranges, key=lambda item: (item.file_path, item.first_offset))
+        return (first.file_path, first.first_offset, self.original_index)
+
+
 class TensorCatalog:
     """Validated, metadata-only catalog of safetensors records."""
 
@@ -774,9 +809,9 @@ def _weight_plan_entry_payload_size(
 def _weight_plan_entry_read_ranges(
     record: TensorMeta,
     source_slices: tuple[slice | int, ...] | None,
-) -> tuple[tuple[int, int], ...]:
+) -> tuple[_PlanReadRange, ...]:
     if source_slices is None:
-        return ((record.offset, record.size),)
+        return (_PlanReadRange(record.file_path, record.offset, record.size),)
     try:
         element_offset, element_count, _output_shape = _normalize_slice_selection(
             record.shape,
@@ -796,17 +831,25 @@ def _weight_plan_entry_read_ranges(
         segment_elements = length * inner_count
         element_size = _DTYPE_NBYTES[record.dtype]
         segment_bytes = segment_elements * element_size
-        return tuple(
-            (
-                record.offset
-                + (outer_idx * source_dim * inner_count + start * inner_count)
-                * element_size,
+        stride = source_dim * inner_count * element_size
+        offset = record.offset + start * inner_count * element_size
+        return (
+            _PlanReadRange(
+                record.file_path,
+                offset,
                 segment_bytes,
-            )
-            for outer_idx in range(outer_count)
+                repeat=outer_count,
+                stride=stride,
+            ),
         )
     element_size = _DTYPE_NBYTES[record.dtype]
-    return ((record.offset + element_offset * element_size, element_count * element_size),)
+    return (
+        _PlanReadRange(
+            record.file_path,
+            record.offset + element_offset * element_size,
+            element_count * element_size,
+        ),
+    )
 
 
 def _weight_plan_entry_target_shape(
@@ -911,40 +954,21 @@ def summarize_weight_plan(
 def _weight_plan_read_ranges(
     catalog: TensorCatalog,
     entry: WeightPlanEntry,
-) -> tuple[tuple[str, int, int], ...]:
+) -> tuple[_PlanReadRange, ...]:
     if not entry.required or not catalog.has(entry.checkpoint_name):
         return ()
     record = catalog.get(entry.checkpoint_name)
     if entry.read_segments is not None:
-        ranges: list[tuple[str, int, int]] = []
+        ranges: list[_PlanReadRange] = []
         for segment in entry.read_segments:
             ranges.extend(
-                (record.file_path, offset, size)
-                for offset, size in _weight_plan_entry_read_ranges(
+                _weight_plan_entry_read_ranges(
                     record,
                     segment.source_slices,
                 )
             )
         return tuple(ranges)
-    return tuple(
-        (record.file_path, offset, size)
-        for offset, size in _weight_plan_entry_read_ranges(
-            record,
-            entry.source_slices,
-        )
-    )
-
-
-def _first_read_key(
-    catalog: TensorCatalog,
-    indexed_entry: tuple[int, WeightPlanEntry],
-) -> tuple[str, int, int]:
-    index, entry = indexed_entry
-    ranges = _weight_plan_read_ranges(catalog, entry)
-    if not ranges:
-        return ("", 0, index)
-    path, offset, _size = min(ranges, key=lambda item: (item[0], item[1]))
-    return (path, offset, index)
+    return _weight_plan_entry_read_ranges(record, entry.source_slices)
 
 
 def _file_sizes_from_catalog(catalog: TensorCatalog) -> dict[str, int]:
@@ -958,7 +982,7 @@ def _file_sizes_from_catalog(catalog: TensorCatalog) -> dict[str, int]:
 
 
 def _simulate_odirect_reads(
-    ranges: tuple[tuple[str, int, int], ...],
+    ranges: tuple[_PlanReadRange, ...],
     *,
     file_sizes: dict[str, int],
     chunk_size: int,
@@ -975,19 +999,40 @@ def _simulate_odirect_reads(
     window_hits = 0
     bytes_read = 0
 
-    for path, offset, size in ranges:
-        if size == 0:
-            continue
+    def simulate_windowed_range(
+        path: str,
+        offset: int,
+        size: int,
+        repeat: int,
+        stride: int,
+    ) -> None:
+        nonlocal current_path
+        nonlocal window_start
+        nonlocal window_valid
+        nonlocal direct_reads
+        nonlocal window_loads
+        nonlocal window_hits
+        nonlocal bytes_read
+
+        if repeat <= 0 or size == 0:
+            return
+        if stride == 0:
+            stride = size
         if path != current_path:
             current_path = path
             window_start = 0
             window_valid = 0
         file_size = file_sizes[path]
-        if size <= window_size:
+        index = 0
+        while index < repeat:
+            range_offset = offset + index * stride
             window_end = window_start + window_valid
-            if offset < window_start or offset + size > window_end:
-                read_start = _round_down(offset, alignment)
-                required_size = _round_up((offset - read_start) + size, alignment)
+            if range_offset < window_start or range_offset + size > window_end:
+                read_start = _round_down(range_offset, alignment)
+                required_size = _round_up(
+                    (range_offset - read_start) + size,
+                    alignment,
+                )
                 read_size = max(window_size, required_size)
                 got = min(read_size, max(file_size - read_start, 0))
                 direct_reads += 1
@@ -995,26 +1040,79 @@ def _simulate_odirect_reads(
                 bytes_read += got
                 window_start = read_start
                 window_valid = got
-            window_hits += 1
-            continue
+                window_end = window_start + window_valid
 
-        copied = 0
-        while copied < size:
-            wanted_offset = offset + copied
-            wanted_size = min(size - copied, chunk_size)
-            read_start = _round_down(wanted_offset, alignment)
-            read_end = _round_up(wanted_offset + wanted_size, alignment)
-            read_size = read_end - read_start
-            got = min(read_size, max(file_size - read_start, 0))
-            direct_reads += 1
-            bytes_read += got
-            available_start = read_start
-            available_end = read_start + got
-            copy_start = max(wanted_offset, available_start)
-            copy_end = min(wanted_offset + wanted_size, available_end)
-            if copy_end <= copy_start:
-                break
-            copied = (copy_start - offset) + (copy_end - copy_start)
+            max_covered_index = (window_end - size - offset) // stride
+            covered = max(1, min(repeat, max_covered_index + 1) - index)
+            window_hits += covered
+            index += covered
+
+    def simulate_direct_range(
+        path: str,
+        offset: int,
+        size: int,
+        repeat: int,
+        stride: int,
+    ) -> None:
+        nonlocal current_path
+        nonlocal window_start
+        nonlocal window_valid
+        nonlocal direct_reads
+        nonlocal bytes_read
+
+        if repeat <= 0 or size == 0:
+            return
+        if stride == 0:
+            stride = size
+        if path != current_path:
+            current_path = path
+            window_start = 0
+            window_valid = 0
+        file_size = file_sizes[path]
+        for index in range(repeat):
+            offset_i = offset + index * stride
+            chunks = _round_up(size, chunk_size) // chunk_size
+            if offset_i % alignment == 0 and size % alignment == 0:
+                direct_reads += chunks
+                bytes_read += size
+                continue
+            copied = 0
+            while copied < size:
+                wanted_offset = offset_i + copied
+                wanted_size = min(size - copied, chunk_size)
+                read_start = _round_down(wanted_offset, alignment)
+                read_end = _round_up(wanted_offset + wanted_size, alignment)
+                read_size = read_end - read_start
+                got = min(read_size, max(file_size - read_start, 0))
+                direct_reads += 1
+                bytes_read += got
+                available_start = read_start
+                available_end = read_start + got
+                copy_start = max(wanted_offset, available_start)
+                copy_end = min(wanted_offset + wanted_size, available_end)
+                if copy_end <= copy_start:
+                    break
+                copied = (copy_start - offset_i) + (copy_end - copy_start)
+
+    for read_range in ranges:
+        if read_range.size == 0:
+            continue
+        if read_range.size <= window_size:
+            simulate_windowed_range(
+                read_range.file_path,
+                read_range.offset,
+                read_range.size,
+                read_range.repeat,
+                read_range.stride,
+            )
+        else:
+            simulate_direct_range(
+                read_range.file_path,
+                read_range.offset,
+                read_range.size,
+                read_range.repeat,
+                read_range.stride,
+            )
 
     return direct_reads, window_loads, window_hits, bytes_read
 
@@ -1029,24 +1127,30 @@ def schedule_weight_plan_reads(
 ) -> ReadSchedulePlan:
     """Order required plan entries by file offset and estimate O_DIRECT reads."""
 
-    required: list[tuple[int, WeightPlanEntry]] = []
+    required: list[_ScheduledEntry] = []
     skipped: list[WeightPlanEntry] = []
     for index, entry in enumerate(plan.entries):
         if entry.required:
-            required.append((index, entry))
+            required.append(
+                _ScheduledEntry(
+                    original_index=index,
+                    entry=entry,
+                    ranges=_weight_plan_read_ranges(catalog, entry),
+                )
+            )
         else:
             skipped.append(entry)
 
-    scheduled_required = [
-        entry for _index, entry in sorted(required, key=lambda item: _first_read_key(catalog, item))
-    ]
+    scheduled_entries = sorted(required, key=lambda item: item.first_read_key)
+    scheduled_required = [item.entry for item in scheduled_entries]
     scheduled_plan = WeightPlan(tuple([*scheduled_required, *skipped]))
-    ranges: list[tuple[str, int, int]] = []
+    ranges: list[_PlanReadRange] = []
     payload_bytes = 0
-    for entry in scheduled_required:
-        entry_ranges = _weight_plan_read_ranges(catalog, entry)
-        ranges.extend(entry_ranges)
-        payload_bytes += sum(size for _path, _offset, size in entry_ranges)
+    read_ranges = 0
+    for scheduled_entry in scheduled_entries:
+        ranges.extend(scheduled_entry.ranges)
+        read_ranges += sum(item.range_count for item in scheduled_entry.ranges)
+        payload_bytes += sum(item.payload_bytes for item in scheduled_entry.ranges)
     direct_reads, window_loads, window_hits, bytes_read = _simulate_odirect_reads(
         tuple(ranges),
         file_sizes=_file_sizes_from_catalog(catalog),
@@ -1059,7 +1163,7 @@ def schedule_weight_plan_reads(
         summary=ReadScheduleSummary(
             entries=len(scheduled_plan.entries),
             required_entries=len(scheduled_required),
-            read_ranges=len(ranges),
+            read_ranges=read_ranges,
             expected_direct_reads=direct_reads,
             expected_window_loads=window_loads,
             expected_window_hits=window_hits,
