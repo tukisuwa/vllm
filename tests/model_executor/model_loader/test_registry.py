@@ -37,6 +37,7 @@ from vllm.model_executor.models import (
     gemma2,
     gemma3,
     gpt_bigcode,
+    gpt_j,
     granitemoe,
     granitemoehybrid,
     granitemoeshared,
@@ -44,9 +45,11 @@ from vllm.model_executor.models import (
     llama,
     mixtral,
     mistral,
+    mpt,
     nemotron,
     olmo,
     olmo2,
+    orion,
     opt,
     olmoe,
     phimoe,
@@ -2613,11 +2616,81 @@ def test_bloom_build_weight_plan_adds_transformer_prefix_and_tie_skip(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "model_cls, source_name, expected_target, expected_shard",
+    [
+        (
+            gpt_j.GPTJForCausalLM,
+            "transformer.h.0.attn.q_proj.weight",
+            "transformer.h.0.attn.qkv_proj.weight",
+            "q",
+        ),
+        (
+            orion.OrionForCausalLM,
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.0.mlp.gate_up_proj.weight",
+            0,
+        ),
+    ],
+)
+def test_more_dense_compat_hooks_apply_mapper(
+    tmp_path, model_cls, source_name, expected_target, expected_shard
+):
+    metadata = {
+        source_name: {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 4)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeModel:
+        hf_to_vllm_mapper = model_cls.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = model_cls.build_weight_plan(FakeModel(), catalog)
+    entry = plan.entries[0]
+
+    assert entry.checkpoint_name == source_name
+    assert entry.target_name == expected_target
+    assert entry.shard_id == expected_shard
+
+
+def test_mpt_build_weight_plan_uses_plain_auto_mapping(tmp_path):
+    name = "transformer.blocks.0.ffn.up_proj.weight"
+    metadata = {
+        name: {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 4)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeMPT:
+        def children(self):
+            return []
+
+    plan = mpt.MPTForCausalLM.build_weight_plan(FakeMPT(), catalog)
+
+    assert plan.entries[0].checkpoint_name == name
+    assert plan.entries[0].target_name == name
+    assert plan.entries[0].required is True
+
+
+@pytest.mark.parametrize(
     "model_cls, module",
     [
         (gpt_bigcode.GPTBigCodeForCausalLM, gpt_bigcode),
         (opt.OPTForCausalLM, opt),
         (bloom.BloomForCausalLM, bloom),
+        (gpt_j.GPTJForCausalLM, gpt_j),
+        (mpt.MPTForCausalLM, mpt),
+        (orion.OrionForCausalLM, orion),
     ],
 )
 def test_more_dense_compat_load_weights_from_source_delegates_to_executor(

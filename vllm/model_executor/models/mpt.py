@@ -27,8 +27,14 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+    WeightPlan,
+)
 from vllm.sequence import IntermediateTensors
 
+from .auto_uma import build_auto_uma_weight_plan, load_auto_uma_weights_from_source
 from .interfaces import SupportsPP
 from .utils import (
     AutoWeightsLoader,
@@ -316,3 +322,13 @@ class MPTForCausalLM(nn.Module, SupportsPP):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
+        return build_auto_uma_weight_plan(self, catalog)
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: WeightPlan,
+    ) -> set[str]:
+        return load_auto_uma_weights_from_source(self, source, plan)
