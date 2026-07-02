@@ -53,6 +53,7 @@ from vllm.model_executor.models import (
     gemma4,
     glm4,
     glm4_moe,
+    glm4_moe_uma,
     gpt_bigcode,
     gpt_j,
     gpt_neox,
@@ -4514,6 +4515,92 @@ def test_glm4_moe_source_plan_skips_nonlocal_experts_and_spec_layers():
     ]
     assert loaded == {"model.layers.0.mlp.experts.w13_weight"}
     assert model.routed_experts.calls[0]["expert_id"] == 0
+    assert model.routed_experts.calls[0]["shard_id"] == "w1"
+
+
+def test_glm4_moe_source_plan_slices_fused_shared_experts_before_read(monkeypatch):
+    name = "model.layers.0.mlp.shared_experts.gate_proj.weight"
+    catalog = TensorCatalog(
+        [TensorMeta("model.safetensors", name, torch.float32, [4, 1], 0, 16)]
+    )
+    monkeypatch.setattr(
+        glm4_moe_uma.rocm_aiter_ops,
+        "is_fusion_moe_shared_experts_enabled",
+        lambda: True,
+    )
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.mlp.experts"
+        w13_weight = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 3 else -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeMLP:
+        def __init__(self, routed_experts):
+            self.experts = routed_experts
+
+    class FakeLayer:
+        def __init__(self, routed_experts):
+            self.mlp = FakeMLP(routed_experts)
+
+    class FakeInnerModel:
+        def __init__(self, routed_experts):
+            self.layers = [FakeLayer(routed_experts)]
+
+    class FakeConfig:
+        num_hidden_layers = 1
+        num_nextn_predict_layers = 0
+        n_routed_experts = 2
+        n_shared_experts = 2
+
+    class FakeGlm4Moe(glm4_moe.Glm4MoeForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = FakeConfig()
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.read_slices = []
+            self.skips = []
+
+        def read_slice_cpu(self, name, slices):
+            self.read_slices.append((name, slices))
+            return torch.ones(2, 1)
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    model = FakeGlm4Moe()
+    source = FakeSource(catalog)
+
+    plan = model.build_weight_plan(catalog)
+
+    assert len(plan.auto_plan.entries) == 0
+    assert [entry.expert_id for entry in plan.routed_entries] == [2, 3]
+    assert [entry.local_required for entry in plan.routed_entries] == [False, True]
+    assert [entry.source_slices for entry in plan.routed_entries] == [
+        (slice(0, 2), slice(None)),
+        (slice(2, 4), slice(None)),
+    ]
+
+    loaded = model.load_weights_from_source(source, plan)
+
+    assert source.skips == [(name, "non-local routed expert")]
+    assert source.read_slices == [(name, (slice(2, 4), slice(None)))]
+    assert loaded == {"model.layers.0.mlp.experts.w13_weight"}
+    assert model.routed_experts.calls[0]["expert_id"] == 3
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
 

@@ -7,6 +7,7 @@ from typing import Any
 
 from torch import nn
 
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
     TensorCatalog,
@@ -18,6 +19,7 @@ from .routed_moe_uma import (
     RoutedMoeSourcePlan,
     build_routed_moe_weight_plan,
     load_routed_moe_weights_from_source,
+    routed_entry_requires_local_read,
 )
 from .utils import PPMissingLayer, WeightsMapper
 
@@ -74,6 +76,29 @@ def _parse_glm4_moe_routed_expert_name(
     return None
 
 
+def _parse_glm4_moe_shared_expert_name(
+    name: str,
+) -> tuple[int, str, str] | None:
+    parts = name.split(".")
+    for idx in range(len(parts) - 5):
+        if parts[idx] != "layers":
+            continue
+        if (
+            not parts[idx + 1].isdigit()
+            or parts[idx + 2] != "mlp"
+            or parts[idx + 3] != "shared_experts"
+        ):
+            continue
+        proj_name = parts[idx + 4]
+        if proj_name not in ("gate_proj", "down_proj", "up_proj"):
+            continue
+        suffix = ".".join(parts[idx + 5 :])
+        if not suffix:
+            return None
+        return int(parts[idx + 1]), proj_name, suffix
+    return None
+
+
 def _routed_param_for_projection(
     proj_name: str,
     suffix: str,
@@ -116,6 +141,85 @@ def _get_routed_experts_for_layer(model: Any, layer_id: int) -> Any | None:
     return _resolve_routed_experts_for_layer(model, layer_id).routed_experts
 
 
+def _build_fused_shared_expert_entries(
+    model: nn.Module,
+    catalog: TensorCatalog,
+    skip_predicate: Callable[[str], bool] | None,
+) -> list[RoutedMoeEntry]:
+    if not rocm_aiter_ops.is_fusion_moe_shared_experts_enabled():
+        return []
+    n_routed_experts = getattr(getattr(model, "config", None), "n_routed_experts", None)
+    n_shared_experts = getattr(getattr(model, "config", None), "n_shared_experts", None)
+    if n_routed_experts is None or n_shared_experts is None:
+        raise RuntimeError(
+            "GLM4 MoE UMA FSE plan requires config.n_routed_experts and "
+            "config.n_shared_experts"
+        )
+    if n_shared_experts <= 0:
+        return []
+
+    entries: list[RoutedMoeEntry] = []
+    for name in catalog.names():
+        if skip_predicate is not None and skip_predicate(name):
+            continue
+        parsed = _parse_glm4_moe_shared_expert_name(name)
+        if parsed is None:
+            continue
+        layer_id, proj_name, suffix = parsed
+        resolution = _resolve_routed_experts_for_layer(model, layer_id)
+        routed_experts = resolution.routed_experts
+        if routed_experts is None:
+            entries.append(
+                RoutedMoeEntry(
+                    checkpoint_name=name,
+                    layer_id=layer_id,
+                    expert_id=0,
+                    param_name="",
+                    shard_id="",
+                    local_required=False,
+                    skip_reason=resolution.skip_reason,
+                )
+            )
+            continue
+
+        record = catalog.get(name)
+        split_dim = 1 if proj_name == "down_proj" and len(record.shape) > 1 else 0
+        total = record.shape[split_dim]
+        if total % n_shared_experts != 0:
+            raise RuntimeError(
+                f"GLM4 MoE FSE shared expert tensor {name} dimension {total} is "
+                f"not divisible by n_shared_experts={n_shared_experts}"
+            )
+        chunk_size = total // n_shared_experts
+        param_name, shard_id = _routed_param_for_projection(proj_name, suffix)
+        weight_name = f"{routed_experts.layer_name}.{param_name}"
+        for shared_idx in range(n_shared_experts):
+            source_slices: list[slice | int] = [
+                slice(None) for _ in range(len(record.shape))
+            ]
+            source_slices[split_dim] = slice(
+                shared_idx * chunk_size,
+                (shared_idx + 1) * chunk_size,
+            )
+            expert_id = n_routed_experts + shared_idx
+            entries.append(
+                RoutedMoeEntry(
+                    checkpoint_name=name,
+                    layer_id=layer_id,
+                    expert_id=expert_id,
+                    param_name=param_name,
+                    shard_id=shard_id,
+                    local_required=routed_entry_requires_local_read(
+                        routed_experts,
+                        expert_id,
+                        weight_name,
+                    ),
+                    source_slices=tuple(source_slices),
+                )
+            )
+    return entries
+
+
 def build_glm4_moe_weight_plan(
     model: nn.Module,
     catalog: TensorCatalog,
@@ -129,6 +233,12 @@ def build_glm4_moe_weight_plan(
             return None
         return _parse_glm4_moe_routed_expert_name(name)
 
+    shared_expert_entries = _build_fused_shared_expert_entries(
+        model,
+        catalog,
+        skip_predicate,
+    )
+
     return build_routed_moe_weight_plan(
         model,
         catalog,
@@ -139,6 +249,7 @@ def build_glm4_moe_weight_plan(
         auto_skip_substr=".mlp.experts.",
         mapper=_Glm4MoeSourceMapper(include_mla=include_mla),
         skip_predicate=skip_predicate,
+        extra_routed_entries=shared_expert_entries,
     )
 
 

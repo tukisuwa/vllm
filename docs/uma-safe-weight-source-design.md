@@ -608,8 +608,10 @@ Add model-side plans only where needed:
     `mlp.experts.<expert>.{gate,up,down}_proj.*` tensors
   - skips non-local routed experts and speculative next-token layers before
     payload read
-  - keeps standard qkv/gate-up packed dense mapping model-side; ROCm fused
-    shared-expert special handling remains future work
+  - keeps standard qkv/gate-up packed dense mapping model-side
+  - ROCm AITER fused shared-expert tensors are represented as source slices
+    into appended FusedMoE expert slots, avoiding a full shared-expert tensor
+    read before chunking
 - Gemma4 MoE
   - initial hook implemented for packed 3D
     `moe.gate_up_proj` / `moe.down_proj` tensors
@@ -702,7 +704,7 @@ Expected current behavior:
 | AXK1 MoE | Base path should work if normal vLLM load works | Phase 5 hook via DeepSeek-style helper |
 | Granite MoE / Granite MoE Shared | Base path should work if normal vLLM load works | Phase 5 initial model hook |
 | Granite MoE Hybrid | Base path should work if normal vLLM load works | Phase 5 initial hook, including fused expert `weight_scale` and `A_log` mapping |
-| GLM4 MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts; fused shared-expert special path not yet implemented |
+| GLM4 MoE | Base path should work if normal vLLM load works | Phase 5 hook for standard routed experts and ROCm AITER fused shared-expert source slices |
 | Gemma4 MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for packed 3D expert tensors and k_eq_v duplication |
 | Arctic MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for local expert slices into `ws` / `w2s` |
 | HYV3 MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts and speculative-layer skip |
