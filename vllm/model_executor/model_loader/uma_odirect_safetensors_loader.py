@@ -228,6 +228,71 @@ class WeightPlan:
         return iter(self.entries)
 
 
+_ROTARY_EMBEDS_UNUSED_WEIGHTS = (
+    "rotary_pos_emb.inv_freq",
+    "rotary_emb.inv_freq",
+    "rotary_emb.cos_cached",
+    "rotary_emb.sin_cached",
+)
+
+
+def build_auto_weight_plan_from_catalog(
+    catalog: "TensorCatalog",
+    *,
+    mapper: object | None = None,
+    skip_prefixes: list[str] | None = None,
+    skip_substrs: list[str] | None = None,
+) -> WeightPlan:
+    """Build a name-mapped plan without reading tensor payloads.
+
+    This mirrors the safe subset of AutoWeightsLoader's pre-read decisions:
+    prefix/substr skips and optional WeightsMapper name/shard mapping.
+    Resolution against actual module parameters is intentionally deferred to
+    execute_weight_plan(), where missing targets fail closed.
+    """
+
+    prefixes = skip_prefixes or []
+    substrs = [*(skip_substrs or []), *_ROTARY_EMBEDS_UNUSED_WEIGHTS]
+    map_name_with_shard = getattr(mapper, "_map_name_with_shard", None)
+    entries: list[WeightPlanEntry] = []
+    for name in catalog.names():
+        if any(name.startswith(prefix) for prefix in prefixes) or any(
+            substr in name for substr in substrs
+        ):
+            entries.append(
+                WeightPlanEntry(
+                    checkpoint_name=name,
+                    target_name=name,
+                    required=False,
+                )
+            )
+            continue
+
+        target_name = name
+        shard_id = None
+        if callable(map_name_with_shard):
+            mapped = map_name_with_shard(name)
+            if mapped is None:
+                entries.append(
+                    WeightPlanEntry(
+                        checkpoint_name=name,
+                        target_name=name,
+                        required=False,
+                    )
+                )
+                continue
+            target_name, shard_id = mapped
+
+        entries.append(
+            WeightPlanEntry(
+                checkpoint_name=name,
+                target_name=target_name,
+                shard_id=shard_id,
+            )
+        )
+    return WeightPlan(tuple(entries))
+
+
 def _resolve_attr(root: object, path: str) -> object:
     current = root
     for part in path.split("."):

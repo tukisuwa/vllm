@@ -23,6 +23,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     WeightPlanEntry,
     _Qwen35MoeDirectLoader,
     _TensorRecord,
+    build_auto_weight_plan_from_catalog,
     execute_weight_plan,
 )
 
@@ -676,6 +677,52 @@ def test_uma_odirect_execute_weight_plan_skips_not_required(tmp_path, monkeypatc
 
     assert execute_weight_plan(FakeModel(), source, plan) == set()
     assert source.stats_snapshot()["tensors_skipped"] == 1
+
+
+def test_uma_odirect_build_auto_weight_plan_from_catalog(tmp_path):
+    metadata = {
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "model.layers.0.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "model.layers.0.rotary_emb.inv_freq": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [8, 12],
+        },
+        "drop_me.weight": {"dtype": "F32", "shape": [1], "data_offsets": [12, 16]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 16)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeMapper:
+        def _map_name_with_shard(self, name):
+            if name == "drop_me.weight":
+                return None
+            if name.endswith("q_proj.weight"):
+                return name.replace("q_proj", "qkv_proj"), "q"
+            return name, None
+
+    plan = build_auto_weight_plan_from_catalog(
+        catalog,
+        mapper=FakeMapper(),
+        skip_prefixes=["lm_head."],
+    )
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["lm_head.weight"].required is False
+    assert entries["model.layers.0.rotary_emb.inv_freq"].required is False
+    assert entries["drop_me.weight"].required is False
+    q_proj = entries["model.layers.0.self_attn.q_proj.weight"]
+    assert q_proj.required is True
+    assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
+    assert q_proj.shard_id == "q"
 
 
 def test_uma_odirect_model_source_hook_requires_both_methods(tmp_path, monkeypatch):

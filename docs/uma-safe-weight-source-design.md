@@ -301,9 +301,13 @@ Implemented so far:
   - supports required/skipped entries
   - supports full CPU reads and contiguous source slices
   - routes tensors to a target parameter's `weight_loader`
+- `build_auto_weight_plan_from_catalog(...)`
+  - performs prefix/substr skips without reading payload bytes
+  - applies `WeightsMapper`-style name and shard mapping before payload reads
+  - keeps missing target detection fail-closed in the executor
 - tests for catalog lookup, source construction, full CPU reads, contiguous
-  slice reads, source stats, optional model hook dispatch, and basic plan
-  execution
+  slice reads, source stats, optional model hook dispatch, name-only plan
+  building, and basic plan execution
 
 Remaining refactor without behavioral change:
 
