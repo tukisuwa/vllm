@@ -1150,3 +1150,22 @@ Stage 4 removed the legacy `WeightPlanEntry.transform` field and the callable
 `name_transform` compatibility path.  `WeightPlanEntry` is now data-only for
 transforms, with all transform behavior represented by serializable
 `TransformOp` tuples.  This unblocks golden-plan serialization tests.
+
+### 2026-07-03 golden plan test seed
+
+`tests/model_executor/model_loader/test_weight_plan_golden.py` adds the first
+inline golden snapshots for representative plan builders:
+
+- Qwen3 MoE routed local/non-local expert entries, including
+  `loader_target_name` and skip metadata;
+- Mistral Q projection remap with shared `qk_rope_permute`;
+- Bagel patch embedding with `patch_embedding_reshape`;
+- Llama4 dense Q transform, routed local/non-local experts, and fused expert
+  source slices.
+
+The snapshot serializer intentionally records stable plan semantics rather
+than environment-specific file paths or runtime tensors: checkpoint name,
+target name, required/skipped state, slices, read segments, transform ops,
+routed metadata, loader target, and skip reason.  This is the safety net for
+Phase 3 parse-name spec migration: a declarative rewrite should either keep
+these snapshots byte-for-byte equivalent or produce a small, reviewable diff.
