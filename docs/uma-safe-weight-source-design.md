@@ -458,7 +458,8 @@ Status: started with `Qwen2ForCausalLM`, `Qwen3ForCausalLM`,
 `OlmoForCausalLM`, `Olmo2ForCausalLM`, `NemotronForCausalLM`,
 `ExaoneForCausalLM`, `CohereForCausalLM`, `TeleChat2ForCausalLM`,
 `FalconH1ForCausalLM`, `Zamba2ForCausalLM`, `OuroForCausalLM`,
-`MambaForCausalLM`, `Mamba2ForCausalLM`, and `HrmTextForCausalLM`.
+`MambaForCausalLM`, `Mamba2ForCausalLM`, `HrmTextForCausalLM`, and
+`MiniMaxM2ForCausalLM`.
 
 Start with Llama/Qwen dense, not MoE.
 
@@ -485,6 +486,9 @@ Target behavior:
 - plan uses segmented CPU staging reads for TeleChat2 `key_value` tensors,
   assembling K and V staging tensors from alternating source head blocks before
   delegating to the existing qkv parameter loader
+- plan can replay nested AutoWeightsLoader behavior where it is explicit and
+  bounded; MiniMaxM2 maps `model.*` checkpoint names through its inner model
+  mapper and skips appended MTP layers before payload read
 - plan skips rotary/cache tensors: implemented through shared auto-plan helper
 - dense model hooks use the shared `auto_uma` model-side helper instead of
   calling generic executor internals directly
@@ -597,7 +601,7 @@ Expected current behavior:
 
 | Model type | Base `uma_odirect_safetensors` | Direct plan path |
 | --- | --- | --- |
-| Dense safetensors | Should work if normal vLLM load works | Phase 3 hooks for Qwen2/Qwen3/Llama/Gemma/Gemma2/Gemma3/InternLM2/Phi/Starcoder2/Falcon/FalconH1/Mistral/GPTBigCode/OPT/BLOOM/GPT-J/MPT/Orion/Step1/Apertus/StableLM/Solar/GPT-NeoX/Persimmon/Granite/Jais2/EXAONE4/Plamo3/Arcee/SeedOss/HyperCLOVAX/LFM2/MiMo/OLMo/OLMo2/Nemotron/EXAONE/Cohere/TeleChat2/Zamba2/Ouro/Mamba/Mamba2/HrmText-style AutoWeightsLoader models |
+| Dense safetensors | Should work if normal vLLM load works | Phase 3 hooks for Qwen2/Qwen3/Llama/Gemma/Gemma2/Gemma3/InternLM2/Phi/Starcoder2/Falcon/FalconH1/Mistral/GPTBigCode/OPT/BLOOM/GPT-J/MPT/Orion/Step1/Apertus/StableLM/Solar/GPT-NeoX/Persimmon/Granite/Jais2/EXAONE4/Plamo3/Arcee/SeedOss/HyperCLOVAX/LFM2/MiMo/OLMo/OLMo2/Nemotron/EXAONE/Cohere/TeleChat2/Zamba2/Ouro/Mamba/Mamba2/HrmText/MiniMaxM2-style AutoWeightsLoader models |
 | Sharded dense safetensors | Should work if no duplicate names | Phase 3 |
 | Qwen2/Qwen3 / OLMoE / Cohere2 routed MoE | Base path should work if normal vLLM load works | Phase 4/5 model hook for `mlp.experts` gate/up/down tensors; loader-side direct path removed |
 | Mixtral / PhiMoE routed MoE | Base path should work if normal vLLM load works | Phase 5 initial model hook for `block_sparse_moe.experts` w1/w2/w3 tensors |

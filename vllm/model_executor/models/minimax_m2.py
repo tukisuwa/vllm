@@ -24,6 +24,7 @@
 """Inference-only MiniMaxM2 model."""
 
 from collections.abc import Iterable
+from dataclasses import replace
 from itertools import islice
 from typing import Any
 
@@ -56,8 +57,14 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+    WeightPlan,
+)
 from vllm.sequence import IntermediateTensors
 
+from .auto_uma import build_auto_uma_weight_plan, load_auto_uma_weights_from_source
 from .interfaces import EagleModelMixin, SupportsEagle3, SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
@@ -490,3 +497,39 @@ class MiniMaxM2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
+        skip_prefixes = None
+        num_mtp = getattr(self.config, "num_mtp_modules", 0)
+        if num_mtp:
+            base = self.config.num_hidden_layers
+            skip_prefixes = [f"layers.{base + i}." for i in range(num_mtp)]
+
+        def name_transform(name: str):
+            if name.startswith("model."):
+                return name[len("model.") :], None
+            return name, None
+
+        plan = build_auto_uma_weight_plan(
+            self,
+            catalog,
+            mapper=MiniMaxM2Model.hf_to_vllm_mapper,
+            name_transform=name_transform,
+            skip_prefixes=skip_prefixes,
+        )
+        entries = []
+        for entry in plan:
+            if entry.checkpoint_name.startswith("model."):
+                entries.append(
+                    replace(entry, target_name=f"model.{entry.target_name}")
+                )
+            else:
+                entries.append(entry)
+        return WeightPlan(tuple(entries))
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: WeightPlan,
+    ) -> set[str]:
+        return load_auto_uma_weights_from_source(self, source, plan)

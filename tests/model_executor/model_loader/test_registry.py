@@ -57,6 +57,7 @@ from vllm.model_executor.models import (
     llama,
     mamba,
     mamba2,
+    minimax_m2,
     mixtral,
     mistral,
     mpt,
@@ -2590,6 +2591,51 @@ def test_hrm_text_build_weight_plan_uses_mapper_and_tie_skip(tmp_path):
     assert attn.target_name == "model.layers.0.self_attn.gqkv_proj.weight"
 
 
+def test_minimax_m2_build_weight_plan_replays_inner_mapper_and_mtp_skip(tmp_path):
+    metadata = {
+        "model.layers.0.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [0, 4],
+        },
+        "model.layers.2.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [8, 12]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 12)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        num_hidden_layers = 2
+        num_mtp_modules = 1
+
+    class FakeMiniMaxM2:
+        config = FakeConfig()
+
+        def children(self):
+            return []
+
+    plan = minimax_m2.MiniMaxM2ForCausalLM.build_weight_plan(
+        FakeMiniMaxM2(),
+        catalog,
+    )
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    q_proj = entries["model.layers.0.self_attn.q_proj.weight"]
+    assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
+    assert q_proj.shard_id == "q"
+    assert entries["model.layers.2.self_attn.q_proj.weight"].required is False
+    assert entries["lm_head.weight"].target_name == "lm_head.weight"
+    assert entries["lm_head.weight"].required is True
+
+
 @pytest.mark.parametrize(
     "model_cls, module",
     [
@@ -2602,6 +2648,7 @@ def test_hrm_text_build_weight_plan_uses_mapper_and_tie_skip(tmp_path):
         (mamba.MambaForCausalLM, mamba),
         (mamba2.Mamba2ForCausalLM, mamba2),
         (hrm_text.HrmTextForCausalLM, hrm_text),
+        (minimax_m2.MiniMaxM2ForCausalLM, minimax_m2),
     ],
 )
 def test_more_dense_load_weights_from_source_delegates_to_executor(
