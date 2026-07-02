@@ -922,6 +922,72 @@ class ODirectSafetensorsWeightSource:
         )
         return self._read_record_cpu(slice_record, sliced=True)
 
+    def read_into_cpu(
+        self,
+        name: str,
+        dst: torch.Tensor,
+        *,
+        source_slices: tuple[slice | int, ...] | None = None,
+    ) -> None:
+        record = self.catalog.get(name)
+        if dst.device.type != "cpu":
+            raise RuntimeError(
+                f"read_into_cpu requires a CPU destination for {name}, "
+                f"got {dst.device}"
+            )
+        if dst.dtype != record.dtype:
+            raise RuntimeError(
+                f"read_into_cpu dtype mismatch for {name}: "
+                f"dst={dst.dtype}, source={record.dtype}"
+            )
+        if not dst.is_contiguous():
+            raise RuntimeError(f"read_into_cpu requires a contiguous dst for {name}")
+
+        if source_slices is None:
+            if list(dst.shape) != record.shape:
+                raise RuntimeError(
+                    f"read_into_cpu shape mismatch for {name}: "
+                    f"dst={list(dst.shape)}, source={record.shape}"
+                )
+            self._read_record_into_cpu(record, dst, sliced=False)
+            return
+
+        try:
+            element_offset, element_count, output_shape = _normalize_slice_selection(
+                record.shape,
+                source_slices,
+            )
+        except ValueError as exc:
+            strided = _normalize_single_dim_slice_selection(
+                record.shape,
+                source_slices,
+            )
+            if strided is None:
+                raise exc
+            if list(dst.shape) != strided[4]:
+                raise RuntimeError(
+                    f"read_into_cpu shape mismatch for {name}: "
+                    f"dst={list(dst.shape)}, source_slice={strided[4]}"
+                )
+            self._read_strided_slice_into_cpu(record, strided, dst)
+            return
+
+        if list(dst.shape) != output_shape:
+            raise RuntimeError(
+                f"read_into_cpu shape mismatch for {name}: "
+                f"dst={list(dst.shape)}, source_slice={output_shape}"
+            )
+        element_size = _DTYPE_NBYTES[record.dtype]
+        slice_record = TensorMeta(
+            file_path=record.file_path,
+            name=f"{record.name}[slice]",
+            dtype=record.dtype,
+            shape=output_shape,
+            offset=record.offset + element_offset * element_size,
+            size=element_count * element_size,
+        )
+        self._read_record_into_cpu(slice_record, dst, sliced=True)
+
     def _read_strided_slice_cpu(
         self,
         record: TensorMeta,
@@ -991,6 +1057,66 @@ class ODirectSafetensorsWeightSource:
         self._maybe_gate(f"after reading {record.name}[strided-slice]", force=True)
         return tensor
 
+    def _read_strided_slice_into_cpu(
+        self,
+        record: TensorMeta,
+        strided: tuple[int, int, int, int, list[int]],
+        dst: torch.Tensor,
+    ) -> None:
+        outer_count, source_dim, start, length, output_shape = strided
+        element_size = _DTYPE_NBYTES[record.dtype]
+        partial_dim = next(
+            idx
+            for idx, (src, out) in enumerate(zip(record.shape, output_shape))
+            if src != out
+        )
+        inner_count = math.prod(record.shape[partial_dim + 1 :])
+        segment_elements = length * inner_count
+        segment_bytes = segment_elements * element_size
+        if segment_bytes <= 0:
+            raise RuntimeError(f"Invalid empty strided slice for {record.name}")
+
+        total_elements = math.prod(output_shape)
+        expected_elements = outer_count * segment_elements
+        if total_elements != expected_elements:
+            raise RuntimeError(
+                f"Internal strided slice shape mismatch for {record.name}: "
+                f"output={output_shape}, expected_elements={expected_elements}"
+            )
+
+        self._maybe_gate(f"before reading {record.name}[strided-slice]", force=True)
+        flat = dst.reshape(-1)
+        t0 = time.perf_counter()
+        with _ODirectFile(
+            record.file_path,
+            self._loader._chunk_size,
+            self._loader._alignment,
+            self._loader._window_size,
+        ) as odirect_file:
+            self._stats.files_opened += 1
+            for outer_idx in range(outer_count):
+                source_element_offset = (
+                    outer_idx * source_dim * inner_count + start * inner_count
+                )
+                target_element_offset = outer_idx * segment_elements
+                target_view = flat.narrow(0, target_element_offset, segment_elements)
+                odirect_file.read_record_into_tensor(
+                    target_view,
+                    record.offset + source_element_offset * element_size,
+                    segment_bytes,
+                    gate=self._note_loaded_bytes,
+                )
+            self._stats.collect_file(odirect_file)
+        time_read = time.perf_counter() - t0
+
+        selected_bytes = total_elements * element_size
+        self._stats.tensors_read += 1
+        self._stats.tensors_read_sliced += 1
+        self._stats.bytes_tensor_payload += selected_bytes
+        self._stats.bytes_sliced_tensor_payload += selected_bytes
+        self._stats.time_read += time_read
+        self._maybe_gate(f"after reading {record.name}[strided-slice]", force=True)
+
     def _read_record_cpu(self, record: TensorMeta, *, sliced: bool) -> torch.Tensor:
         self._maybe_gate(f"before reading {record.name}", force=True)
         with _ODirectFile(
@@ -1019,6 +1145,46 @@ class ODirectSafetensorsWeightSource:
         self._stats.time_read += time_read
         self._maybe_gate(f"after reading {record.name}", force=True)
         return tensor
+
+    def _read_record_into_cpu(
+        self,
+        record: TensorMeta,
+        dst: torch.Tensor,
+        *,
+        sliced: bool,
+    ) -> None:
+        self._maybe_gate(f"before reading {record.name}", force=True)
+        if list(dst.shape) != record.shape:
+            raise RuntimeError(
+                f"Destination shape mismatch for {record.name}: "
+                f"dst={list(dst.shape)}, source={record.shape}"
+            )
+        with _ODirectFile(
+            record.file_path,
+            self._loader._chunk_size,
+            self._loader._alignment,
+            self._loader._window_size,
+        ) as odirect_file:
+            self._stats.files_opened += 1
+            t0 = time.perf_counter()
+            odirect_file.read_record_into_tensor(
+                dst,
+                record.offset,
+                record.size,
+                gate=self._note_loaded_bytes,
+            )
+            time_read = time.perf_counter() - t0
+            self._stats.collect_file(odirect_file)
+        self._stats.tensors_read += 1
+        self._stats.bytes_tensor_payload += record.size
+        if sliced:
+            self._stats.tensors_read_sliced += 1
+            self._stats.bytes_sliced_tensor_payload += record.size
+        else:
+            self._stats.tensors_read_full += 1
+            self._stats.bytes_full_tensor_payload += record.size
+        self._stats.time_read += time_read
+        self._maybe_gate(f"after reading {record.name}", force=True)
 
     def skip(self, name: str, reason: str) -> None:
         self._stats.tensors_skipped += 1

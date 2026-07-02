@@ -290,6 +290,12 @@ Implemented so far:
   - supports only row-major contiguous slices
   - rejects stepped or non-contiguous slices instead of full-tensor fallback
   - records only the requested payload bytes in source stats
+- `source.read_into_cpu(name, dst, source_slices=None)`
+  - reads full, contiguous slice, or supported single-dimension strided slice
+    directly into a caller-provided contiguous CPU tensor
+  - validates destination dtype, shape, device, and contiguity fail-closed
+  - is implemented as a WeightSource primitive; model executors do not yet use
+    it for parameter placement by default
 - source-level stats for model hook reads
   - files opened
   - tensors read/skipped
@@ -321,7 +327,6 @@ Implemented so far:
 Remaining refactor without behavioral change:
 
 - move more `_ODirectFile` orchestration into `ODirectSafetensorsWeightSource`
-- add `source.read_into_cpu(...)` for destination-buffer reads
 - expand plan execution only where generic semantics are clear; model-specific
   transforms should stay in model-side plan code
 
