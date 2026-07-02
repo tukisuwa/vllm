@@ -46,6 +46,8 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
+)
+from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
     WeightPlan,
 )

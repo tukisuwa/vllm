@@ -13,11 +13,13 @@ from vllm.distributed import (
 )
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
+    execute_weight_plan,
+)
+from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
     WeightPlan,
     WeightPlanEntry,
     build_auto_weight_plan_for_module,
-    execute_weight_plan,
 )
 from vllm.model_executor.models.utils import WeightsMapper
 
@@ -143,7 +145,10 @@ def _reject_unsupported_fp8_qkv(catalog: TensorCatalog) -> None:
         )
 
 
-def _apply_attention_sink_slices(catalog: TensorCatalog, plan: WeightPlan) -> WeightPlan:
+def _apply_attention_sink_slices(
+    catalog: TensorCatalog,
+    plan: WeightPlan,
+) -> WeightPlan:
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
     if tp_size <= 1:

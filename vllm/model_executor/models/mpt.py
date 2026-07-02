@@ -29,6 +29,8 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
+)
+from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
     WeightPlan,
 )

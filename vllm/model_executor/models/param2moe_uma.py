@@ -9,6 +9,8 @@ from torch import nn
 
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
+)
+from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
     WeightPlan,
     WeightPlanEntry,
@@ -173,7 +175,10 @@ def _qkv_split_entries(model: nn.Module, catalog: TensorCatalog) -> tuple[
                 WeightPlanEntry(
                     checkpoint_name=checkpoint_name,
                     target_name=target_name,
-                    source_slices=(slice(q_split + kv_split, q_split + 2 * kv_split), *rest),
+                    source_slices=(
+                        slice(q_split + kv_split, q_split + 2 * kv_split),
+                        *rest,
+                    ),
                     shard_id="v",
                 ),
             ]

@@ -10,10 +10,12 @@ from torch import nn
 
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
-    TensorCatalog,
-    WeightPlan,
     _call_weight_loader,
     _resolve_attr,
+)
+from vllm.model_executor.model_loader.weight_plan import (
+    TensorCatalog,
+    WeightPlan,
 )
 from vllm.model_executor.models.utils import WeightsMapper
 

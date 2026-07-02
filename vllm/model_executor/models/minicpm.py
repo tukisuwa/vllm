@@ -61,10 +61,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
+    execute_weight_plan,
+)
+from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
     WeightPlan,
     WeightPlanEntry,
-    execute_weight_plan,
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform

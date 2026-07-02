@@ -28,6 +28,8 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
+)
+from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
     WeightPlan,
     WeightPlanEntry,

@@ -10,6 +10,8 @@ from torch import nn
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
+)
+from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
 )
 
