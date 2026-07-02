@@ -742,6 +742,7 @@ Expected current behavior:
 | MiniCPM / EagleMiniCPM MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for TP-local `mlp.experts` w1/w2/w3 source slices into `ws` / `w2s` |
 | LFM2 MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for `feed_forward.experts` w1/w2/w3 tensors, dense qkv/w13 stacking, conv remap, and non-local expert skip |
 | MiMoV2 MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for split q/k/v and routed experts; Pro-format fused FP8 `qkv_proj` currently fails closed |
+| Longcat Flash MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for routed experts, dual dense MLP stacking, fused MLA q/kv-a stacking, and MLA post-load cache/scaling finalization |
 | Other routed MoE | Base path should work if normal vLLM load works | Not yet implemented |
 | Non-safetensors | Not supported | Not supported |
 | Remote HF path | Not supported by UMA-safe loader | Not supported |

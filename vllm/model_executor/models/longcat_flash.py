@@ -63,11 +63,20 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MLAAttention
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsLoRA, SupportsPP
+from .longcat_flash_uma import (
+    LongcatFlashSourcePlan,
+    build_longcat_flash_weight_plan,
+    load_longcat_flash_weights_from_source,
+)
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -659,6 +668,10 @@ class FlashModel(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        self._finalize_mla_weights()
+        return loaded_params
+
+    def _finalize_mla_weights(self) -> None:
         for layer_id in range(self.config.num_hidden_layers):
             for i in range(2):
                 if isinstance(self.layers[layer_id], PPMissingLayer):
@@ -695,7 +708,6 @@ class FlashModel(nn.Module):
                     self_attn.kv_a_layernorm.weight.data *= (
                         self.config.hidden_size / self.config.kv_lora_rank
                     ) ** 0.5
-        return loaded_params
 
 
 class LongcatFlashForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
@@ -774,3 +786,13 @@ class LongcatFlashForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> LongcatFlashSourcePlan:
+        return build_longcat_flash_weight_plan(self, catalog)
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: LongcatFlashSourcePlan,
+    ) -> set[str]:
+        return load_longcat_flash_weights_from_source(self, source, plan)

@@ -76,6 +76,8 @@ from vllm.model_executor.models import (
     laguna,
     lfm2,
     lfm2_moe,
+    longcat_flash,
+    longcat_flash_uma,
     kimi_linear,
     llama,
     mamba,
@@ -7539,6 +7541,195 @@ def test_mimo_v2_source_plan_rejects_fp8_fused_qkv():
 
     with pytest.raises(RuntimeError, match="fused FP8 qkv_proj"):
         mimo_v2_uma.build_mimo_v2_weight_plan(FakeModel(), catalog)
+
+
+def test_longcat_flash_source_plan_maps_dense_and_routed_names_before_read():
+    local_name = "model.layers.0.mlp.experts.1.gate_proj.weight"
+    remote_name = "model.layers.0.mlp.experts.2.down_proj.weight"
+    catalog = TensorCatalog([
+        TensorMeta("model.safetensors", local_name, torch.float32, [1], 0, 4),
+        TensorMeta("model.safetensors", remote_name, torch.float32, [1], 4, 4),
+        TensorMeta(
+            "model.safetensors",
+            "model.layers.0.self_attn.0.q_a_proj.weight",
+            torch.float32,
+            [1],
+            8,
+            4,
+        ),
+        TensorMeta(
+            "model.safetensors",
+            "model.layers.0.self_attn.0.kv_a_proj_with_mqa.weight",
+            torch.float32,
+            [1],
+            12,
+            4,
+        ),
+        TensorMeta(
+            "model.safetensors",
+            "model.layers.0.mlps.0.gate_proj.weight",
+            torch.float32,
+            [1],
+            16,
+            4,
+        ),
+        TensorMeta(
+            "model.safetensors",
+            "model.layers.0.mlp.gate.classifier.weight",
+            torch.float32,
+            [1],
+            20,
+            4,
+        ),
+        TensorMeta(
+            "model.safetensors",
+            "model.layers.0.rotary_emb.inv_freq",
+            torch.float32,
+            [1],
+            24,
+            4,
+        ),
+    ])
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.mlp.experts"
+        w13_weight = object()
+        w2_weight = object()
+        quant_method = object()
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 1 else -1
+
+        def weight_loader(self, **_kwargs):
+            return True
+
+    class FakeMLP:
+        def __init__(self, experts):
+            self.experts = experts
+
+    class FakeLayer:
+        def __init__(self, experts):
+            self.mlp = FakeMLP(experts)
+
+    class FakeInnerModel:
+        def __init__(self, experts):
+            self.layers = [FakeLayer(experts)]
+
+    class FakeOuter:
+        def __init__(self):
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+        def children(self):
+            return []
+
+        def named_parameters(self, *args, **kwargs):
+            return iter(())
+
+    plan = longcat_flash_uma.build_longcat_flash_weight_plan(FakeOuter(), catalog)
+    routed = {entry.checkpoint_name: entry for entry in plan.routed_entries}
+    assert routed[local_name].param_name == "w13_weight"
+    assert routed[local_name].shard_id == "w1"
+    assert routed[local_name].local_required is True
+    assert routed[remote_name].param_name == "w2_weight"
+    assert routed[remote_name].shard_id == "w2"
+    assert routed[remote_name].local_required is False
+
+    auto_entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    assert local_name not in auto_entries
+    assert remote_name not in auto_entries
+    assert (
+        auto_entries["model.layers.0.self_attn.0.q_a_proj.weight"].target_name
+        == "model.layers.0.self_attn.0.fused_qkv_a_proj.weight"
+    )
+    assert auto_entries["model.layers.0.self_attn.0.q_a_proj.weight"].shard_id == 0
+    assert (
+        auto_entries[
+            "model.layers.0.self_attn.0.kv_a_proj_with_mqa.weight"
+        ].target_name
+        == "model.layers.0.self_attn.0.fused_qkv_a_proj.weight"
+    )
+    assert (
+        auto_entries["model.layers.0.self_attn.0.kv_a_proj_with_mqa.weight"].shard_id
+        == 1
+    )
+    assert (
+        auto_entries["model.layers.0.mlps.0.gate_proj.weight"].target_name
+        == "model.layers.0.mlps.0.gate_up_proj.weight"
+    )
+    assert auto_entries["model.layers.0.mlps.0.gate_proj.weight"].shard_id == 0
+    assert (
+        auto_entries["model.layers.0.mlp.gate.classifier.weight"].target_name
+        == "model.layers.0.mlp.gate.classifier.weight"
+    )
+    assert auto_entries["model.layers.0.rotary_emb.inv_freq"].required is False
+
+
+def test_longcat_flash_source_load_finalizes_mla_weights(monkeypatch):
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.mlp.experts"
+        w13_weight = object()
+        quant_method = object()
+
+        def weight_loader(self, **_kwargs):
+            return True
+
+    class FakeSource:
+        catalog = TensorCatalog([
+            TensorMeta(
+                "model.safetensors",
+                "model.layers.0.mlp.experts.1.gate_proj.weight",
+                torch.float32,
+                [1],
+                0,
+                4,
+            )
+        ])
+
+        def __init__(self):
+            self.reads = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            return torch.ones(1)
+
+    class FakeOuter:
+        def __init__(self):
+            self.finalized = False
+            self.routed_experts = FakeRoutedExperts()
+
+        def _finalize_mla_weights(self):
+            self.finalized = True
+
+    model = FakeOuter()
+    source = FakeSource()
+    plan = longcat_flash_uma.LongcatFlashSourcePlan(
+        auto_plan=WeightPlan(()),
+        routed_entries=(
+            longcat_flash_uma.LongcatFlashMoeRoutedEntry(
+                checkpoint_name="model.layers.0.mlp.experts.1.gate_proj.weight",
+                layer_id=0,
+                expert_id=1,
+                param_name="w13_weight",
+                shard_id="w1",
+                local_required=True,
+            ),
+        ),
+    )
+
+    monkeypatch.setattr(
+        longcat_flash_uma,
+        "_get_routed_experts_for_layer",
+        lambda _model, _layer_id: model.routed_experts,
+    )
+
+    assert longcat_flash_uma.load_longcat_flash_weights_from_source(
+        model,
+        source,
+        plan,
+    ) == {"model.layers.0.mlp.experts.w13_weight"}
+    assert source.reads == ["model.layers.0.mlp.experts.1.gate_proj.weight"]
+    assert model.finalized is True
 
 
 def test_qwen_moe_source_plan_handles_nested_language_model_before_read():
