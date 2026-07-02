@@ -1282,6 +1282,16 @@ class OpenPanguModelBase(nn.Module, SupportsPP, SupportsLoRA):
         )
         return loader.load_weights(weights)
 
+    def build_weight_plan(self, catalog):
+        from .openpangu_uma import build_openpangu_weight_plan
+
+        return build_openpangu_weight_plan(self, catalog)
+
+    def load_weights_from_source(self, source, plan) -> set[str]:
+        from .openpangu_uma import load_openpangu_weights_from_source
+
+        return load_openpangu_weights_from_source(self, source, plan)
+
 
 class OpenPanguMoEModel(OpenPanguModelBase, MixtureOfExperts):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):

@@ -101,6 +101,7 @@ from vllm.model_executor.models import (
     orion,
     opt,
     olmoe,
+    openpangu_uma,
     ouro,
     param2moe,
     param2moe_uma,
@@ -8048,6 +8049,125 @@ def test_hunyuan_v1_source_hook_dispatches_fused_qkv_once():
     calls = getattr(model.model.layers, "0").self_attn.qkv_proj.weight.calls
     assert [call[0] for call in calls] == ["q", "k", "v"]
     assert [tuple(call[1].shape) for call in calls] == [(4, 4), (2, 4), (2, 4)]
+
+
+def test_openpangu_source_plan_maps_dense_and_routed_names_before_read():
+    local_name = "model.layers.0.mlp.experts.1.gate_proj.weight"
+    remote_name = "model.layers.0.mlp.experts.2.down_proj.weight"
+    q_a_name = "model.layers.0.self_attn.q_a_proj.weight"
+    kv_a_name = "model.layers.0.self_attn.kv_a_proj_with_mqa.weight"
+    bias_name = "model.layers.0.mlp.e_score_correction_bias"
+    mtp_name = "model.layers.2.self_attn.q_proj.weight"
+    catalog = TensorCatalog([
+        TensorMeta("model.safetensors", local_name, torch.float32, [1], 0, 4),
+        TensorMeta("model.safetensors", remote_name, torch.float32, [1], 4, 4),
+        TensorMeta("model.safetensors", q_a_name, torch.float32, [1], 8, 4),
+        TensorMeta("model.safetensors", kv_a_name, torch.float32, [1], 12, 4),
+        TensorMeta("model.safetensors", bias_name, torch.float32, [1], 16, 4),
+        TensorMeta("model.safetensors", mtp_name, torch.float32, [1], 20, 4),
+    ])
+
+    class FakeConfig:
+        tie_word_embeddings = False
+        n_routed_experts = 4
+        num_hidden_layers = 2
+        num_nextn_predict_layers = 1
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.mlp.experts"
+        w13_weight = object()
+        w2_weight = object()
+        quant_method = object()
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 1 else -1
+
+        def weight_loader(self, **_kwargs):
+            return True
+
+    class FakeMLP:
+        def __init__(self, experts):
+            self.experts = experts
+
+    class FakeLayer:
+        def __init__(self, experts):
+            self.mlp = FakeMLP(experts)
+
+    class FakeInnerModel:
+        def __init__(self, experts):
+            self.layers = [FakeLayer(experts)]
+
+    class FakeOuter:
+        config = FakeConfig()
+        fuse_qkv_a_proj = True
+
+        def __init__(self):
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+        def named_parameters(self):
+            return iter(())
+
+        def children(self):
+            return []
+
+    plan = openpangu_uma.build_openpangu_weight_plan(FakeOuter(), catalog)
+    routed = {entry.checkpoint_name: entry for entry in plan.routed_entries}
+    assert routed[local_name].param_name == "w13_weight"
+    assert routed[local_name].shard_id == "w1"
+    assert routed[local_name].local_required is True
+    assert routed[remote_name].param_name == "w2_weight"
+    assert routed[remote_name].shard_id == "w2"
+    assert routed[remote_name].local_required is False
+
+    auto_entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    assert local_name not in auto_entries
+    assert remote_name not in auto_entries
+    assert auto_entries[q_a_name].target_name == (
+        "model.layers.0.self_attn.fused_qkv_a_proj.weight"
+    )
+    assert auto_entries[q_a_name].shard_id == 0
+    assert auto_entries[kv_a_name].target_name == (
+        "model.layers.0.self_attn.fused_qkv_a_proj.weight"
+    )
+    assert auto_entries[kv_a_name].shard_id == 1
+    assert (
+        auto_entries[bias_name].target_name
+        == "model.layers.0.mlp.gate.e_score_correction_bias"
+    )
+    assert auto_entries[mtp_name].required is False
+
+
+def test_openpangu_source_hook_delegates_and_runs_post_weight_load(monkeypatch):
+    catalog = TensorCatalog([])
+
+    class FakeInnerModel:
+        def __init__(self):
+            self.finalized = False
+
+        def post_weight_load(self):
+            self.finalized = True
+
+    class FakeOuter:
+        def __init__(self):
+            self.model = FakeInnerModel()
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+
+    model = FakeOuter()
+    source = FakeSource(catalog)
+    plan = openpangu_uma.OpenPanguSourcePlan(
+        auto_plan=WeightPlan(()),
+        routed_entries=(),
+    )
+    assert openpangu_uma.load_openpangu_weights_from_source(
+        model,
+        source,
+        plan,
+    ) == set()
+    assert model.model.finalized is True
 
 
 def test_qwen_moe_source_plan_handles_nested_language_model_before_read():
