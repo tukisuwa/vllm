@@ -44,12 +44,14 @@ from vllm.model_executor.models import (
     olmo2,
     olmoe,
     phimoe,
+    phi,
     qwen2,
     qwen2_moe,
     qwen3,
     qwen3_5,
     qwen3_moe,
     qwen3_next,
+    starcoder2,
 )
 from vllm.model_executor.models.utils import PPMissingLayer, WeightsMapper
 
@@ -2101,6 +2103,117 @@ def test_internlm2_load_weights_from_source_delegates_to_executor(monkeypatch):
     loaded = internlm2.InternLM2ForCausalLM.load_weights_from_source(
         model, source, plan
     )
+
+    assert loaded == {"loaded"}
+    assert calls == [(model, source, plan)]
+
+
+@pytest.mark.parametrize(
+    "model_cls",
+    [
+        phi.PhiForCausalLM,
+        starcoder2.Starcoder2ForCausalLM,
+    ],
+)
+def test_phi_starcoder2_dense_hooks_use_qkv_mapper(tmp_path, model_cls):
+    metadata = {
+        "model.layers.0.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [0, 4],
+        },
+        "model.layers.0.self_attn.k_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "model.layers.0.self_attn.v_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [8, 12],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 12)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = False
+
+    class FakeModel:
+        config = FakeConfig()
+        hf_to_vllm_mapper = model_cls.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = model_cls.build_weight_plan(FakeModel(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    for source_name, shard_id in [
+        ("model.layers.0.self_attn.q_proj.weight", "q"),
+        ("model.layers.0.self_attn.k_proj.weight", "k"),
+        ("model.layers.0.self_attn.v_proj.weight", "v"),
+    ]:
+        entry = entries[source_name]
+        assert entry.target_name == "model.layers.0.self_attn.qkv_proj.weight"
+        assert entry.shard_id == shard_id
+
+
+def test_starcoder2_build_weight_plan_skips_tied_lm_head(tmp_path):
+    metadata = {
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 4)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+
+    class FakeStarcoder2:
+        config = FakeConfig()
+        hf_to_vllm_mapper = starcoder2.Starcoder2ForCausalLM.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = starcoder2.Starcoder2ForCausalLM.build_weight_plan(
+        FakeStarcoder2(), catalog
+    )
+
+    assert plan.entries[0].checkpoint_name == "lm_head.weight"
+    assert plan.entries[0].required is False
+
+
+@pytest.mark.parametrize(
+    "model_cls, module",
+    [
+        (phi.PhiForCausalLM, phi),
+        (starcoder2.Starcoder2ForCausalLM, starcoder2),
+    ],
+)
+def test_phi_starcoder2_load_weights_from_source_delegates_to_executor(
+    monkeypatch, model_cls, module
+):
+    calls = []
+
+    def fake_load(model, source, plan):
+        calls.append((model, source, plan))
+        return {"loaded"}
+
+    monkeypatch.setattr(module, "load_auto_uma_weights_from_source", fake_load)
+    model = object()
+    source = object()
+    plan = WeightPlan(())
+
+    loaded = model_cls.load_weights_from_source(model, source, plan)
 
     assert loaded == {"loaded"}
     assert calls == [(model, source, plan)]
