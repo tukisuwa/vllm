@@ -55,9 +55,18 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
+from .mixtral_uma import (
+    MixtralMoeSourcePlan,
+    build_mixtral_moe_weight_plan,
+    load_mixtral_moe_weights_from_source,
+)
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -483,6 +492,22 @@ class MixtralForCausalLM(nn.Module, SupportsLoRA, SupportsPP, MixtureOfExperts):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> MixtralMoeSourcePlan:
+        skip_prefixes = ["lm_head."] if self.config.tie_word_embeddings else None
+        return build_mixtral_moe_weight_plan(
+            self,
+            catalog,
+            mapper=self.hf_to_vllm_mapper,
+            skip_prefixes=skip_prefixes,
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: MixtralMoeSourcePlan,
+    ) -> set[str]:
+        return load_mixtral_moe_weights_from_source(self, source, plan)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

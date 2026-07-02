@@ -439,7 +439,10 @@ Remaining work:
 
 Add model-side plans only where needed:
 
-- Mixtral
+- Mixtral: initial model-side source hook implemented for per-expert
+  `block_sparse_moe.experts.<expert>.w{1,2,3}.*` tensors; it skips non-local
+  experts before payload read and delegates placement to existing FusedMoE
+  `weight_loader`
 - DeepSeek V2/V3 style MoE
 - Granite MoE variants
 
@@ -455,7 +458,8 @@ Expected current behavior:
 | Dense safetensors | Should work if normal vLLM load works | Phase 3 |
 | Sharded dense safetensors | Should work if no duplicate names | Phase 3 |
 | Qwen routed MoE | Works; current direct optimization exists | Phase 4 |
-| Non-Qwen routed MoE | Base path should work if normal vLLM load works | Phase 5 |
+| Mixtral routed MoE | Base path should work if normal vLLM load works | Phase 5 initial hook |
+| Other non-Qwen routed MoE | Base path should work if normal vLLM load works | Phase 5 |
 | Non-safetensors | Not supported | Not supported |
 | Remote HF path | Not supported by UMA-safe loader | Not supported |
 | mmap/eager/prefetch | Rejected | Rejected |
