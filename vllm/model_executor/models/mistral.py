@@ -28,6 +28,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 )
 from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
+    TransformOp,
     WeightPlan,
 )
 from vllm.sequence import IntermediateTensors
@@ -35,6 +36,13 @@ from vllm.v1.attention.backend import AttentionType
 
 from .auto_uma import build_auto_uma_weight_plan, load_auto_uma_weights_from_source
 from .utils import AutoWeightsLoader
+
+
+def _tensor_numel(shape: list[int]) -> int:
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    return numel
 
 
 class MistralMLP(nn.Module):
@@ -365,45 +373,53 @@ class MistralForCausalLM(LlamaForCausalLM):
     def _mistral_source_name_transform(
         self,
         name: str,
-    ):
+        catalog: TensorCatalog | None = None,
+    ) -> tuple[str, tuple[TransformOp, ...] | None]:
         modules = name.split(".")
-        transform = None
+        transform_ops: tuple[TransformOp, ...] | None = None
         if "wk" in modules and modules[-1] == "weight":
-            transform = lambda tensor: self._permute_mistral_weight(
-                tensor, self.config.num_key_value_heads, self.config.hidden_size
+            transform_ops = (
+                TransformOp("qk_rope_permute", (self.config.num_key_value_heads,)),
             )
         elif (
             "wk" in modules
             and modules[-1] == "qscale_weight"
             and self.config.num_key_value_heads > 0
+            and (
+                catalog is None
+                or _tensor_numel(catalog.get(name).shape) > 1
+            )
         ):
-            transform = lambda tensor: (
-                self._permute_mistral_weight(tensor, self.config.num_key_value_heads, 1)
-                if tensor.numel() > 1
-                else tensor
+            transform_ops = (
+                TransformOp("qk_rope_permute", (self.config.num_key_value_heads,)),
             )
         elif "wq" in modules and modules[-1] == "weight":
-            transform = lambda tensor: self._permute_mistral_weight(
-                tensor, self.config.num_attention_heads, self.config.hidden_size
+            transform_ops = (
+                TransformOp("qk_rope_permute", (self.config.num_attention_heads,)),
             )
         elif (
             "wq" in modules
             and modules[-1] == "qscale_weight"
             and self.config.num_attention_heads > 0
-        ):
-            transform = lambda tensor: (
-                self._permute_mistral_weight(tensor, self.config.num_attention_heads, 1)
-                if tensor.numel() > 1
-                else tensor
+            and (
+                catalog is None
+                or _tensor_numel(catalog.get(name).shape) > 1
             )
-        return self._remap_mistral_name(name), transform
+        ):
+            transform_ops = (
+                TransformOp("qk_rope_permute", (self.config.num_attention_heads,)),
+            )
+        return self._remap_mistral_name(name), transform_ops
 
     def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
         return build_auto_uma_weight_plan(
             self,
             catalog,
             mapper=self.hf_to_vllm_mapper,
-            name_transform=self._mistral_source_name_transform,
+            name_transform=lambda name: self._mistral_source_name_transform(
+                name,
+                catalog,
+            ),
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
 

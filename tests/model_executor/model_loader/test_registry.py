@@ -4049,9 +4049,10 @@ def test_bagel_build_weight_plan_skips_generation_and_transforms_patch(tmp_path)
 
     patch = entries["vit_model.patch_embedding.weight"]
     assert patch.target_name == "vit_model.patch_embedding.weight"
-    assert patch.transform is not None
+    assert patch.transform is None
+    assert patch.transform_ops == (TransformOp("patch_embedding_reshape", (2, 3)),)
     tensor = torch.arange(24, dtype=torch.float32).reshape(2, 12)
-    transformed = patch.transform(tensor)
+    transformed = apply_transform_ops(patch.transform_ops, tensor)
     assert transformed.shape == (2, 3, 2, 2)
     assert transformed[0, :, 0, 0].tolist() == [0.0, 1.0, 2.0]
     assert entries["moe_gen.experts.0.w1.weight"].required is False
@@ -4775,10 +4776,11 @@ def test_mistral_build_weight_plan_remaps_names_and_permute_transform(tmp_path):
     wq = entries["layers.0.attention.wq.weight"]
     assert wq.target_name == "model.layers.0.self_attn.qkv_proj.weight"
     assert wq.shard_id == "q"
-    assert wq.transform is not None
+    assert wq.transform is None
+    assert wq.transform_ops == (TransformOp("qk_rope_permute", (2,)),)
     tensor = torch.arange(16, dtype=torch.float32).reshape(4, 4)
     assert torch.equal(
-        wq.transform(tensor),
+        apply_transform_ops(wq.transform_ops, tensor),
         fake._permute_mistral_weight(tensor, 2, 4),
     )
     output = entries["output.weight"]
@@ -8440,9 +8442,6 @@ def test_llama4_source_plan_maps_dense_per_expert_and_fused_names(monkeypatch):
         def children(self):
             return []
 
-        def permute_qk_weight_for_rotary(self, _name, tensor):
-            return _name, tensor + 1
-
     plan = llama4_uma.build_llama4_weight_plan(FakeOuter(), catalog)
     routed = {entry.checkpoint_name: entry for entry in _routed_plan_entries(plan)}
     assert _entry_param_name(routed[local_name]) == "w13_weight"
@@ -8460,7 +8459,15 @@ def test_llama4_source_plan_maps_dense_per_expert_and_fused_names(monkeypatch):
         "model.layers.0.self_attn.qkv_proj.weight"
     )
     assert auto_entries[q_name].shard_id == "q"
-    assert auto_entries[q_name].transform(torch.zeros(1)).tolist() == [1.0]
+    assert auto_entries[q_name].transform is None
+    assert auto_entries[q_name].transform_ops == (
+        TransformOp("qk_rope_permute", (2,)),
+    )
+    tensor = torch.arange(4, dtype=torch.float32).reshape(4, 1)
+    assert torch.equal(
+        apply_transform_ops(auto_entries[q_name].transform_ops, tensor),
+        tensor.view(2, 1, 2, 1).transpose(1, 2).reshape(4, 1),
+    )
 
     fused = plan.fused_expert_entries
     assert [(entry.target_name, entry.shard_id, entry.source_slices,

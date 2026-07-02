@@ -304,7 +304,7 @@ transform work):
 zero_mean       sarvam, param2moe   x - x.mean()            allocates ~2x
 squeeze(dim=0)  ernie45_moe         view                    ~1x
 l2_normalize    bailing_moe         F.normalize(dim=0)      allocates ~2x
-qk_rope_permute llama4, mistral     model-bound closures    allocates ~2x
+qk_rope_permute llama4, mistral     pure n_heads arg        allocates ~2x
 patch_reshape   bagel               vit patch embedding     ~1x (view/reshape)
 (composition)   bailing_moe         chained callables       product
 ```
@@ -321,10 +321,10 @@ question about the minimal op set.  Design:
   (`WeightPlanEntry.transform_ops`), replacing callable chaining;
 - a module-level registry in `weight_plan.py`:
   `register_weight_transform(name, fn, *, extra_staging_factor)`; duplicate
-  names fail; generic ops (`zero_mean`, `squeeze`, `l2_normalize`) register
-  at import, model-specific ops (`llama4_qk_rope_permute`) register from the
-  model hook module with **pure arguments computed at build time** (head
-  counts, dims from config) — implementations must not capture the model;
+  names fail; generic ops (`zero_mean`, `squeeze`, `l2_normalize`,
+  `qk_rope_permute`, `patch_embedding_reshape`) register at import with
+  **pure arguments computed at build time** (head counts, patch size, channel
+  counts) — implementations must not capture the model;
 - unknown op names fail during plan validation (before payload reads), not
   at execution;
 - `WeightPlanSummary` gains transform staging accounting
@@ -336,9 +336,10 @@ question about the minimal op set.  Design:
 
 Migration order: (1) registry + entry field + executor application +
 validation, legacy field kept temporarily; (2) migrate the three generic-op
-families; (3) extract llama4's rope permute into a pure-args op — the only
-nontrivial case because today's closure captures the model, and it needs a
-llama4-family real-load check; (4) delete the legacy `transform` field.
+families; (3) extract model-bound transform closures into pure-args ops:
+llama4 and mistral use shared `qk_rope_permute(n_heads)`, and bagel uses
+`patch_embedding_reshape(patch_size, in_channels)`; (4) delete the legacy
+`transform` field.
 
 At this layer, the declaration is still abstract.  It should not decide which
 checkpoint tensor actually exists, which file offset will be read, or which
@@ -1117,7 +1118,7 @@ the expert module's `layer_name`.  Routed entries that need a module-level
 custom loader carry `loader_target_name`, so `execute_weight_plan()` no longer
 has a hard-coded `routed_experts` fallback or parent-loader guessing logic.
 
-### 2026-07-03 transform op registry, stages 1-2
+### 2026-07-03 transform op registry, stages 1-3
 
 `weight_plan.py` now owns the named transform registry:
 
@@ -1126,7 +1127,8 @@ has a hard-coded `routed_experts` fallback or parent-loader guessing logic.
 - `register_weight_transform(name, fn, *, extra_staging_factor)` — idempotent
   for identical re-registration, fails closed on conflicting names;
 - generic ops registered at import: `zero_mean`, `squeeze(dim)`,
-  `l2_normalize(dim, eps)`;
+  `l2_normalize(dim, eps)`, `qk_rope_permute(n_heads)`, and
+  `patch_embedding_reshape(patch_size, in_channels)`;
 - `summarize_weight_plan` resolves each required entry's ops (unknown op
   names fail before any payload read) and reports
   `peak_transform_staging_bytes` from declared staging factors;
@@ -1137,10 +1139,12 @@ has a hard-coded `routed_experts` fallback or parent-loader guessing logic.
 Migrated to named ops: sarvam (`zero_mean`, including the model-file copy in
 `sarvam.py`), param2moe (`zero_mean`), ernie45_moe (`squeeze`), bailing_moe
 (`l2_normalize`, with `_compose_name_transform` now concatenating op tuples
-instead of chaining callables).  mimo_v2's attention-sink rewrite passes
+instead of chaining callables), llama4 and mistral (`qk_rope_permute`), and
+bagel (`patch_embedding_reshape`).  mimo_v2's attention-sink rewrite passes
 `transform_ops` through.
 
-Still on the legacy callable (stage 3, model-bound closures that need
-pure-args extraction): llama4 `permute_qk_weight_for_rotary`, mistral's
-QK permute, and bagel's patch-embedding reshape.  The legacy `transform`
-field is removed after those migrate (stage 4).
+Stage 3 removed the remaining model-bound transform closures: llama4 no
+longer captures `model.permute_qk_weight_for_rotary`, mistral shares the same
+rope permute op with pure `n_heads`, and bagel's patch reshape uses static
+patch/channel arguments.  The legacy `transform` field is now removable in
+stage 4.

@@ -7,7 +7,7 @@ BAGEL is a unified multimodal model for image understanding and generation.
 For vLLM, we focus on the image understanding (vision-to-text) capabilities.
 """
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Literal, TypeAlias
 
 import torch
@@ -28,6 +28,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 )
 from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
+    TransformOp,
     WeightPlan,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -85,24 +86,6 @@ def _bagel_should_skip_weight(name: str) -> bool:
     if any(name.startswith(prefix) for prefix in _BAGEL_VAE_PREFIXES):
         return True
     return name.startswith("vit_pos_embed.pos_embed")
-
-
-def _bagel_patch_embedding_transform(
-    config: Any,
-) -> Callable[[torch.Tensor], torch.Tensor]:
-    def transform(tensor: torch.Tensor) -> torch.Tensor:
-        if tensor.ndim != 2:
-            return tensor
-        out_channels = tensor.shape[0]
-        in_features = tensor.shape[1]
-        patch_size = config.vit_config.patch_size
-        in_channels = config.vit_config.num_channels
-        if in_features != in_channels * patch_size * patch_size:
-            return tensor
-        tensor = tensor.reshape(out_channels, patch_size, patch_size, in_channels)
-        return tensor.permute(0, 3, 1, 2).contiguous()
-
-    return transform
 
 
 class BagelImagePixelInputs(TensorSchema):
@@ -634,11 +617,19 @@ class BagelForConditionalGeneration(
     def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
         def name_transform(
             name: str,
-        ) -> tuple[str, Callable[[torch.Tensor], torch.Tensor] | None] | None:
+        ) -> tuple[str, tuple[TransformOp, ...] | None] | None:
             if _bagel_should_skip_weight(name):
                 return name, None
             if "patch_embedding.weight" in name:
-                return name, _bagel_patch_embedding_transform(self.config)
+                return name, (
+                    TransformOp(
+                        "patch_embedding_reshape",
+                        (
+                            self.config.vit_config.patch_size,
+                            self.config.vit_config.num_channels,
+                        ),
+                    ),
+                )
             return name, None
 
         return build_auto_uma_weight_plan(

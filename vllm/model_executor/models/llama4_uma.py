@@ -16,6 +16,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 )
 from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
+    TransformOp,
     WeightPlan,
 )
 from vllm.model_executor.models.utils import WeightsMapper
@@ -61,11 +62,34 @@ def _llama4_weight_mapper() -> WeightsMapper:
     )
 
 
-def _llama4_name_transform(model: Any, checkpoint_name: str):
-    def transform(tensor: torch.Tensor) -> torch.Tensor:
-        return model.permute_qk_weight_for_rotary(checkpoint_name, tensor)[1]
+def _tensor_numel(shape: list[int]) -> int:
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    return numel
 
-    return checkpoint_name, transform
+
+def _llama4_name_transform(
+    model: Any,
+    catalog: TensorCatalog,
+    checkpoint_name: str,
+) -> tuple[str, tuple[TransformOp, ...] | None]:
+    modules = checkpoint_name.split(".")
+    leaf = modules[-1]
+    is_weight = leaf in ("weight", "weight_packed")
+    is_weight_scale = leaf == "weight_scale" and _tensor_numel(
+        catalog.get(checkpoint_name).shape
+    ) > 1
+    is_k_proj = "wk" in modules or "k_proj" in modules
+    is_q_proj = "wq" in modules or "q_proj" in modules
+    if not ((is_weight or is_weight_scale) and (is_k_proj or is_q_proj)):
+        return checkpoint_name, None
+    n_heads = (
+        model.config.num_key_value_heads
+        if is_k_proj
+        else model.config.num_attention_heads
+    )
+    return checkpoint_name, (TransformOp("qk_rope_permute", (n_heads,)),)
 
 
 def _parse_llama4_routed_expert_name(
@@ -259,7 +283,7 @@ def build_llama4_weight_plan(
         resolve_routed_experts=_resolve_routed_experts_for_layer,
         auto_skip_substr=".feed_forward.experts.",
         mapper=_llama4_weight_mapper(),
-        name_transform=lambda name: _llama4_name_transform(model, name),
+        name_transform=lambda name: _llama4_name_transform(model, catalog, name),
         skip_prefixes=(["lm_head."] if model.config.tie_word_embeddings else None),
         skip_predicate=lambda name: name in fused_names,
     )

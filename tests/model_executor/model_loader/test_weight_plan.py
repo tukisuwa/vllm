@@ -313,6 +313,30 @@ def test_builtin_transform_ops_match_family_semantics():
     empty = apply_transform_ops((TransformOp("zero_mean"),), torch.empty(0))
     assert empty.numel() == 0
 
+    qk = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    assert torch.equal(
+        apply_transform_ops((TransformOp("qk_rope_permute", (2,)),), qk),
+        qk.view(2, 1, 2, 4).transpose(1, 2).reshape(4, 4),
+    )
+
+    qk_scale = torch.arange(4, dtype=torch.float32)
+    assert torch.equal(
+        apply_transform_ops((TransformOp("qk_rope_permute", (2,)),), qk_scale),
+        qk_scale.unsqueeze(-1)
+        .view(2, 1, 2, 1)
+        .transpose(1, 2)
+        .reshape(4, 1)
+        .squeeze(-1),
+    )
+
+    patch = torch.arange(24, dtype=torch.float32).reshape(2, 12)
+    patch_reshaped = apply_transform_ops(
+        (TransformOp("patch_embedding_reshape", (2, 3)),),
+        patch,
+    )
+    assert patch_reshaped.shape == (2, 3, 2, 2)
+    assert patch_reshaped[0, :, 0, 0].tolist() == [0.0, 1.0, 2.0]
+
 
 def test_summarize_weight_plan_fails_closed_on_unknown_transform_op():
     catalog = TensorCatalog(

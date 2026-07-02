@@ -315,10 +315,53 @@ def _transform_l2_normalize(
     return torch.nn.functional.normalize(tensor, dim=dim, p=2, eps=eps)
 
 
+def _transform_qk_rope_permute(
+    tensor: torch.Tensor,
+    n_heads: int,
+) -> torch.Tensor:
+    if n_heads <= 0:
+        raise ValueError(f"qk_rope_permute requires n_heads > 0, got {n_heads}")
+    original_ndim = tensor.ndim
+    if original_ndim == 1:
+        tensor = tensor.unsqueeze(-1)
+    f_out, f_in = tensor.shape
+    tensor = (
+        tensor.view(n_heads, f_out // n_heads // 2, 2, f_in)
+        .transpose(1, 2)
+        .reshape(f_out, f_in)
+    )
+    if original_ndim == 1:
+        tensor = tensor.squeeze(-1)
+    return tensor
+
+
+def _transform_patch_embedding_reshape(
+    tensor: torch.Tensor,
+    patch_size: int,
+    in_channels: int,
+) -> torch.Tensor:
+    if tensor.ndim != 2:
+        return tensor
+    out_channels = tensor.shape[0]
+    in_features = tensor.shape[1]
+    if in_features != in_channels * patch_size * patch_size:
+        return tensor
+    tensor = tensor.reshape(out_channels, patch_size, patch_size, in_channels)
+    return tensor.permute(0, 3, 1, 2).contiguous()
+
+
 register_weight_transform("zero_mean", _transform_zero_mean, extra_staging_factor=1.0)
 register_weight_transform("squeeze", _transform_squeeze, extra_staging_factor=0.0)
 register_weight_transform(
     "l2_normalize", _transform_l2_normalize, extra_staging_factor=1.0
+)
+register_weight_transform(
+    "qk_rope_permute", _transform_qk_rope_permute, extra_staging_factor=1.0
+)
+register_weight_transform(
+    "patch_embedding_reshape",
+    _transform_patch_embedding_reshape,
+    extra_staging_factor=1.0,
 )
 
 
