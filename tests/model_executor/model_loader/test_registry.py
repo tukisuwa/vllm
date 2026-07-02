@@ -50,6 +50,7 @@ from vllm.model_executor.models import (
     granitemoehybrid,
     granitemoeshared,
     hyperclovax,
+    hrm_text,
     internlm2,
     jais2,
     lfm2,
@@ -2555,6 +2556,40 @@ def test_mamba_build_weight_plan_uses_a_log_mapper(tmp_path, model_cls, module):
     assert entries["lm_head.weight"].required is True
 
 
+def test_hrm_text_build_weight_plan_uses_mapper_and_tie_skip(tmp_path):
+    metadata = {
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "model.layers.0.attn.gqkv_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 8)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+
+    class FakeHrmText:
+        config = FakeConfig()
+        hf_to_vllm_mapper = hrm_text.HrmTextForCausalLM.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = hrm_text.HrmTextForCausalLM.build_weight_plan(FakeHrmText(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["lm_head.weight"].required is False
+    attn = entries["model.layers.0.attn.gqkv_proj.weight"]
+    assert attn.target_name == "model.layers.0.self_attn.gqkv_proj.weight"
+
+
 @pytest.mark.parametrize(
     "model_cls, module",
     [
@@ -2566,6 +2601,7 @@ def test_mamba_build_weight_plan_uses_a_log_mapper(tmp_path, model_cls, module):
         (ouro.OuroForCausalLM, ouro),
         (mamba.MambaForCausalLM, mamba),
         (mamba2.Mamba2ForCausalLM, mamba2),
+        (hrm_text.HrmTextForCausalLM, hrm_text),
     ],
 )
 def test_more_dense_load_weights_from_source_delegates_to_executor(
