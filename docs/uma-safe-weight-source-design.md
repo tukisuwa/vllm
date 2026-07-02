@@ -298,6 +298,9 @@ Implemented so far:
   - validates destination dtype, shape, device, and contiguity fail-closed
   - is implemented as a WeightSource primitive; model executors do not yet use
     it for parameter placement by default
+- `source.empty_cpu(name, source_slices=None)`
+  - allocates a correctly shaped CPU staging tensor under WeightSource
+    allocation gates and timing stats
 - source-level stats for model hook reads
   - files opened
   - tensors read/skipped
@@ -326,6 +329,8 @@ Implemented so far:
   - fails closed before payload reads for unexpected missing targets
   - supports opt-in `read_into_cpu` entries for caller-controlled CPU staging;
     parameter/device direct placement is still future work
+  - uses `source.empty_cpu(...)` for opt-in CPU staging so allocation gates stay
+    under WeightSource control
 - tests for catalog lookup, source construction, full CPU reads, contiguous
   slice reads, source stats, optional model hook dispatch, name-only plan
   building, and basic plan execution

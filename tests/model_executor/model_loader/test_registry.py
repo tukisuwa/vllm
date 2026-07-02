@@ -573,6 +573,27 @@ def test_uma_odirect_weight_source_read_into_cpu_full_and_slices(
     assert stats["bytes_sliced_tensor_payload"] == 40
 
 
+def test_uma_odirect_weight_source_empty_cpu_uses_source_shape(tmp_path, monkeypatch):
+    metadata = {"a": {"dtype": "F32", "shape": [2, 4], "data_offsets": [0, 32]}}
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 32)
+
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(load_format="uma_odirect_safetensors")
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
+    source = ODirectSafetensorsWeightSource(loader, str(tmp_path))
+
+    full = source.empty_cpu("a")
+    sliced = source.empty_cpu("a", source_slices=(slice(None), slice(2, 4)))
+
+    assert full.shape == (2, 4)
+    assert sliced.shape == (2, 2)
+    assert full.dtype == torch.float32
+    assert sliced.dtype == torch.float32
+    assert source.stats_snapshot()["tensors_read"] == 0
+
+
 def test_uma_odirect_weight_source_read_into_cpu_rejects_bad_dst(
     tmp_path, monkeypatch
 ):

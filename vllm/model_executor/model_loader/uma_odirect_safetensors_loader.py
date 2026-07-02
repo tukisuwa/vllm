@@ -640,10 +640,9 @@ def execute_weight_plan(
             source_is_sharded = source_slices is not None
 
         if entry.read_into_cpu:
-            tensor = torch.empty(
-                _source_tensor_shape(record, source_slices),
-                dtype=record.dtype,
-                device="cpu",
+            tensor = source.empty_cpu(
+                entry.checkpoint_name,
+                source_slices=source_slices,
             )
             source.read_into_cpu(
                 entry.checkpoint_name,
@@ -953,6 +952,25 @@ class ODirectSafetensorsWeightSource:
             size=element_count * element_size,
         )
         return self._read_record_cpu(slice_record, sliced=True)
+
+    def empty_cpu(
+        self,
+        name: str,
+        *,
+        source_slices: tuple[slice | int, ...] | None = None,
+    ) -> torch.Tensor:
+        record = self.catalog.get(name)
+        shape = _source_tensor_shape(record, source_slices)
+        nbytes = math.prod(shape) * _DTYPE_NBYTES[record.dtype]
+        force_allocation_gate = nbytes >= self._loader._allocation_gate_min_bytes
+        if force_allocation_gate:
+            self._maybe_gate(f"before allocating {name}", force=True)
+        t0 = time.perf_counter()
+        tensor = torch.empty(shape, dtype=record.dtype, device="cpu")
+        self._stats.time_alloc += time.perf_counter() - t0
+        if force_allocation_gate:
+            self._maybe_gate(f"after allocating {name}", force=True)
+        return tensor
 
     def read_into_cpu(
         self,
