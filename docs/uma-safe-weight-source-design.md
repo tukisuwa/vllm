@@ -746,6 +746,7 @@ Expected current behavior:
 | Param2MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for fused QKV source slices, shared/dense gate-up stacking, expert-bias normalization, and routed experts |
 | HunYuan v1 Dense/MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for routed experts, `gate_and_up_proj` source slices, split q/k/v stacking, and fused `qkv_proj` one-read dispatch; fused qkv still uses a local full-QKV staging tensor |
 | OpenPangu Dense/MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for routed experts, q/k/v and gate/up stacking, optional fused q/kv-a stacking, MTP skip, gate-bias remap, and post-load finalization |
+| Llama4 MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for q/k rotary permutation before placement, routed experts, fused all-expert gate/up and down tensors with contiguous local-expert source slicing, and qkv/gate-up stacking |
 | Other routed MoE | Base path should work if normal vLLM load works | Not yet implemented |
 | Non-safetensors | Not supported | Not supported |
 | Remote HF path | Not supported by UMA-safe loader | Not supported |

@@ -806,6 +806,16 @@ class Llama4ForCausalLM(LlamaForCausalLM, MixtureOfExperts):
         )
         return loader.load_weights(weights)
 
+    def build_weight_plan(self, catalog):
+        from .llama4_uma import build_llama4_weight_plan
+
+        return build_llama4_weight_plan(self, catalog)
+
+    def load_weights_from_source(self, source, plan) -> set[str]:
+        from .llama4_uma import load_llama4_weights_from_source
+
+        return load_llama4_weights_from_source(self, source, plan)
+
     def permute_qk_weight_for_rotary(
         self,
         name: str,

@@ -81,6 +81,7 @@ from vllm.model_executor.models import (
     longcat_flash_uma,
     kimi_linear,
     llama,
+    llama4_uma,
     mamba,
     mamba2,
     mellum,
@@ -8168,6 +8169,217 @@ def test_openpangu_source_hook_delegates_and_runs_post_weight_load(monkeypatch):
         plan,
     ) == set()
     assert model.model.finalized is True
+
+
+def test_llama4_source_plan_maps_dense_per_expert_and_fused_names(monkeypatch):
+    local_name = "model.layers.0.feed_forward.experts.1.gate_proj.weight"
+    remote_name = "model.layers.0.feed_forward.experts.3.down_proj.weight"
+    fused_gate_up = "model.layers.0.feed_forward.experts.gate_up_proj.weight"
+    q_name = "model.layers.0.self_attn.q_proj.weight"
+    catalog = TensorCatalog([
+        TensorMeta("model.safetensors", local_name, torch.float32, [1], 0, 4),
+        TensorMeta("model.safetensors", remote_name, torch.float32, [1], 4, 4),
+        TensorMeta(
+            "model.safetensors",
+            fused_gate_up,
+            torch.float32,
+            [4, 2, 6],
+            8,
+            192,
+        ),
+        TensorMeta("model.safetensors", q_name, torch.float32, [4, 1], 200, 16),
+    ])
+
+    class FakeConfig:
+        tie_word_embeddings = False
+        num_attention_heads = 2
+        num_key_value_heads = 1
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.feed_forward.experts"
+        w13_weight = object()
+        w2_weight = object()
+        quant_method = object()
+        expert_map = torch.tensor([-1, 0, 1, -1])
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 1 else -1
+
+        def weight_loader(self, **_kwargs):
+            return True
+
+    class FakeMoE:
+        def __init__(self, experts):
+            self.experts = experts
+
+    monkeypatch.setattr(llama4_uma, "Llama4MoE", FakeMoE)
+
+    class FakeLayer:
+        def __init__(self, experts):
+            self.feed_forward = FakeMoE(experts)
+
+    class FakeLayers:
+        def __init__(self, layer):
+            self._layers = [layer]
+
+        def __len__(self):
+            return len(self._layers)
+
+        def __getitem__(self, idx):
+            return self._layers[idx]
+
+    class FakeInnerModel:
+        def __init__(self, experts):
+            self.layers = FakeLayers(FakeLayer(experts))
+
+    class FakeOuter:
+        config = FakeConfig()
+
+        def __init__(self):
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+        def named_parameters(self):
+            return iter(())
+
+        def children(self):
+            return []
+
+        def permute_qk_weight_for_rotary(self, _name, tensor):
+            return _name, tensor + 1
+
+    plan = llama4_uma.build_llama4_weight_plan(FakeOuter(), catalog)
+    routed = {entry.checkpoint_name: entry for entry in plan.routed_entries}
+    assert routed[local_name].param_name == "w13_weight"
+    assert routed[local_name].shard_id == "w1"
+    assert routed[local_name].local_required is True
+    assert routed[remote_name].param_name == "w2_weight"
+    assert routed[remote_name].shard_id == "w2"
+    assert routed[remote_name].local_required is False
+
+    auto_entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    assert local_name not in auto_entries
+    assert remote_name not in auto_entries
+    assert fused_gate_up not in auto_entries
+    assert auto_entries[q_name].target_name == (
+        "model.layers.0.self_attn.qkv_proj.weight"
+    )
+    assert auto_entries[q_name].shard_id == "q"
+    assert auto_entries[q_name].transform(torch.zeros(1)).tolist() == [1.0]
+
+    fused = plan.fused_expert_entries
+    assert [(entry.target_name, entry.shard_id, entry.source_slices,
+             entry.expert_id) for entry in fused] == [
+        (
+            "model.layers.0.feed_forward.experts.w13_weight",
+            "w1",
+            (slice(1, 3), slice(None), slice(None)),
+            1,
+        ),
+        (
+            "model.layers.0.feed_forward.experts.w13_weight",
+            "w3",
+            (slice(1, 3), slice(None), slice(None)),
+            1,
+        ),
+    ]
+
+
+def test_llama4_source_hook_loads_fused_expert_source_slices(monkeypatch):
+    name = "model.layers.0.feed_forward.experts.gate_up_proj.weight"
+    catalog = TensorCatalog([
+        TensorMeta("model.safetensors", name, torch.float32, [4, 2, 6], 0, 192),
+    ])
+
+    class FakeParam:
+        def __init__(self):
+            self.calls = []
+
+        def weight_loader(self, param, tensor, weight_name, shard_id, expert_id):
+            assert param is self
+            self.calls.append((weight_name, shard_id, expert_id, tensor.clone()))
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.feed_forward.experts"
+        w13_weight = FakeParam()
+        expert_map = torch.tensor([-1, 0, 1, -1])
+
+    class FakeMoE:
+        def __init__(self, experts):
+            self.experts = experts
+
+    monkeypatch.setattr(llama4_uma, "Llama4MoE", FakeMoE)
+
+    class FakeLayer:
+        def __init__(self, experts):
+            self.feed_forward = FakeMoE(experts)
+
+    class FakeLayers:
+        def __init__(self, layer):
+            self._layers = [layer]
+            setattr(self, "0", layer)
+
+        def __len__(self):
+            return len(self._layers)
+
+        def __getitem__(self, idx):
+            return self._layers[idx]
+
+    class FakeInnerModel:
+        def __init__(self, experts):
+            self.layers = FakeLayers(FakeLayer(experts))
+
+    class FakeOuter:
+        def __init__(self):
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+    class FakeSource:
+        def __init__(self):
+            self.catalog = catalog
+            self.reads = []
+
+        def read_slice_cpu(self, checkpoint_name, source_slices):
+            self.reads.append((checkpoint_name, source_slices))
+            return torch.arange(24, dtype=torch.float32).reshape(2, 2, 6)
+
+    model = FakeOuter()
+    source = FakeSource()
+    plan = llama4_uma.Llama4SourcePlan(
+        auto_plan=WeightPlan(()),
+        routed_entries=(),
+        fused_expert_entries=(
+            llama4_uma.Llama4FusedExpertEntry(
+                checkpoint_name=name,
+                layer_id=0,
+                target_name="model.layers.0.feed_forward.experts.w13_weight",
+                shard_id="w1",
+                source_slices=(slice(1, 3), slice(None), slice(None)),
+                expert_id=1,
+                kind="gate_up",
+            ),
+            llama4_uma.Llama4FusedExpertEntry(
+                checkpoint_name=name,
+                layer_id=0,
+                target_name="model.layers.0.feed_forward.experts.w13_weight",
+                shard_id="w3",
+                source_slices=(slice(1, 3), slice(None), slice(None)),
+                expert_id=1,
+                kind="gate_up",
+            ),
+        ),
+    )
+
+    assert llama4_uma.load_llama4_weights_from_source(
+        model,
+        source,
+        plan,
+    ) == {"model.layers.0.feed_forward.experts.w13_weight"}
+    assert source.reads == [(name, (slice(1, 3), slice(None), slice(None)))]
+    calls = model.routed_experts.w13_weight.calls
+    assert [call[1] for call in calls] == ["w1", "w3"]
+    assert [call[2] for call in calls] == [1, 1]
+    assert [tuple(call[3].shape) for call in calls] == [(2, 3, 2), (2, 3, 2)]
 
 
 def test_qwen_moe_source_plan_handles_nested_language_model_before_read():
