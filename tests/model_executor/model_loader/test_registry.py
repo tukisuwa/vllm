@@ -28,6 +28,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     summarize_weight_plan,
 )
 from vllm.model_executor.models import (
+    afmoe,
     apertus,
     arcee,
     chatglm,
@@ -2821,6 +2822,61 @@ def test_glm4_build_weight_plan_skips_tied_lm_head_and_spec_layers(tmp_path):
     assert entries["lm_head.weight"].required is False
 
 
+def test_afmoe_build_weight_plan_uses_mapper(tmp_path):
+    metadata = {
+        "model.layers.0.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [0, 4],
+        },
+        "model.layers.0.mlp.gate_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "model.layers.0.mlp.shared_experts.up_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [8, 12],
+        },
+        "model.layers.0.mlp.router.gate.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [12, 16],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 16)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeAfmoe:
+        hf_to_vllm_mapper = afmoe.AfmoeForCausalLM.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = afmoe.AfmoeForCausalLM.build_weight_plan(FakeAfmoe(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    q_proj = entries["model.layers.0.self_attn.q_proj.weight"]
+    assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
+    assert q_proj.shard_id == "q"
+    gate_proj = entries["model.layers.0.mlp.gate_proj.weight"]
+    assert gate_proj.target_name == "model.layers.0.mlp.gate_up_proj.weight"
+    assert gate_proj.shard_id == 0
+    shared_up = entries["model.layers.0.mlp.shared_experts.up_proj.weight"]
+    assert shared_up.target_name == (
+        "model.layers.0.mlp.shared_experts.gate_up_proj.weight"
+    )
+    assert shared_up.shard_id == 1
+    assert entries["model.layers.0.mlp.router.gate.weight"].target_name == (
+        "model.layers.0.mlp.gate.weight"
+    )
+
+
 @pytest.mark.parametrize(
     "model_cls, module",
     [
@@ -2838,6 +2894,7 @@ def test_glm4_build_weight_plan_skips_tied_lm_head_and_spec_layers(tmp_path):
         (nemotron_nas.DeciLMForCausalLM, nemotron_nas),
         (mistral3.Mistral3ForConditionalGeneration, mistral3),
         (glm4.Glm4ForCausalLM, glm4),
+        (afmoe.AfmoeForCausalLM, afmoe),
     ],
 )
 def test_more_dense_load_weights_from_source_delegates_to_executor(
