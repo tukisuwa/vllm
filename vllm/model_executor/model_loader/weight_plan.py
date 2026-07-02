@@ -6,6 +6,7 @@ import math
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Protocol
 
 import torch
 from torch import nn
@@ -387,6 +388,28 @@ class TensorCatalog:
 
     def total_bytes(self) -> int:
         return sum(record.size for record in self._records)
+
+
+class WeightPlanBuilder(Protocol):
+    """Model-side contract for constructing a metadata-only placement plan."""
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
+        ...
+
+
+class WeightPlanExecutor(Protocol):
+    """Model-side contract for executing a plan through a weight source."""
+
+    def load_weights_from_source(
+        self,
+        source: object,
+        plan: WeightPlan,
+    ) -> set[str]:
+        ...
+
+
+class WeightPlanSourceModel(WeightPlanBuilder, WeightPlanExecutor, Protocol):
+    """Model that supports the planner/executor WeightSource path."""
 
 
 _ROTARY_EMBEDS_UNUSED_WEIGHTS = (

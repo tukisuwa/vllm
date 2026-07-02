@@ -588,3 +588,24 @@ compatibility, so existing model hooks can continue importing from the old
 loader path while future hooks can import the neutral IR directly.  A small
 unit test was added for plan construction and summary accounting without
 instantiating the O_DIRECT loader.
+
+### 2026-07-03 Phase 2 start
+
+The neutral `weight_plan.py` module now defines the first explicit planner and
+executor contracts:
+
+- `WeightPlanBuilder`
+- `WeightPlanExecutor`
+- `WeightPlanSourceModel`
+
+These protocols name the existing model hook contract:
+
+```text
+build_weight_plan(catalog) -> WeightPlan
+load_weights_from_source(source, plan) -> set[str]
+```
+
+This does not change execution behavior yet.  It gives the current
+`build_weight_plan` / `load_weights_from_source` convention a neutral API home
+so future executors can depend on the contract without importing the O_DIRECT
+loader implementation.
