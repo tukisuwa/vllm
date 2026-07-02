@@ -389,22 +389,36 @@ Current limitations:
   tensor, then delegates to existing parameter `weight_loader`.
 - It proves model-side planning and skip/map decisions before payload read, but
   does not yet perform TP-local source slicing for fused/parallel parameters.
-- MoE direct loading is still handled by the older compatibility optimization;
-  it should be moved to model-side planning in Phase 4.
+- Qwen3 MoE now has a first model-side source hook, but other MoE families and
+  full removal of the older compatibility optimization remain Phase 4/5 work.
 
 ### Phase 4: Qwen MoE prototype
+
+Status: started with `Qwen3MoeForCausalLM`.
 
 Replace `direct_per_expert_moe` with a model-side plan for Qwen MoE.
 
 Target behavior:
 
-- model plan declares local expert reads
-- non-local experts are skipped before payload read
-- gate/up/down fused placements are described by plan entries
-- quant payload and scale suffixes are handled by the model plan, not by loader
+- model plan declares local expert reads: implemented for Qwen3 MoE routed
+  expert tensors
+- non-local experts are skipped before payload read: implemented for Qwen3 MoE
+- gate/up/down fused placements are described by plan entries: implemented for
+  Qwen3 MoE per-expert gate/up/down naming
+- quant payload and scale suffixes are handled by the model plan, not by loader:
+  implemented for suffix-based Qwen3 MoE routed expert targets
 
 This should preserve the observed Qwen35B performance while moving the
 model-specific knowledge out of the loader.
+
+Remaining work:
+
+- remove or deprecate the older loader-side `direct_per_expert_moe`
+  compatibility path once the model hook is validated on a real Qwen3 MoE load
+- extend the same model-side pattern to Qwen3.5/Qwen3Next MoE if their routed
+  expert naming is compatible
+- add real-load verification that the model hook matches the previous
+  Qwen35B performance and memory behavior
 
 ### Phase 5: Other MoE families
 
@@ -512,6 +526,7 @@ Instead:
 3. Add an optional model hook for `WeightPlan`.
 4. Prototype dense Qwen/Llama.
 5. Move the current Qwen MoE direct optimization into a model-side plan.
+   Qwen3 MoE is started; validation and cleanup remain.
 
 This addresses the root issue: new models should add model-side placement
 plans, not loader-side special cases.
