@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """UMA-safe WeightSource helpers for Mixtral-style routed MoE models."""
 
-from dataclasses import dataclass
 from typing import Any
 
 from torch import nn
@@ -10,35 +9,20 @@ from torch import nn
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
     TensorCatalog,
-    WeightPlan,
-    build_auto_weight_plan_for_module,
-    execute_weight_plan,
 )
 
+from .routed_moe_uma import (
+    RoutedExpertsResolution,
+    RoutedMoeEntry,
+    RoutedMoeSourcePlan,
+    build_routed_moe_weight_plan,
+    load_routed_moe_weights_from_source,
+)
 from .utils import PPMissingLayer
 
 
-@dataclass(frozen=True)
-class MixtralMoeRoutedEntry:
-    checkpoint_name: str
-    layer_id: int
-    expert_id: int
-    param_name: str
-    shard_id: str
-    local_required: bool
-    skip_reason: str | None = None
-
-
-@dataclass(frozen=True)
-class MixtralMoeSourcePlan:
-    auto_plan: WeightPlan
-    routed_entries: tuple[MixtralMoeRoutedEntry, ...]
-
-
-@dataclass(frozen=True)
-class _RoutedExpertsResolution:
-    routed_experts: Any | None
-    skip_reason: str | None = None
+MixtralMoeRoutedEntry = RoutedMoeEntry
+MixtralMoeSourcePlan = RoutedMoeSourcePlan
 
 
 def _parse_mixtral_routed_expert_name(
@@ -81,7 +65,7 @@ def _routed_param_for_projection(
 def _resolve_routed_experts_for_layer(
     model: Any,
     layer_id: int,
-) -> _RoutedExpertsResolution:
+) -> RoutedExpertsResolution:
     layers = getattr(getattr(model, "model", None), "layers", None)
     if layers is None:
         raise RuntimeError("Mixtral MoE UMA plan could not find model layers")
@@ -92,7 +76,7 @@ def _resolve_routed_experts_for_layer(
         )
     layer = layers[layer_id]
     if isinstance(layer, PPMissingLayer):
-        return _RoutedExpertsResolution(None, "pipeline-missing routed expert layer")
+        return RoutedExpertsResolution(None, "pipeline-missing routed expert layer")
     block_sparse_moe = getattr(layer, "block_sparse_moe", None)
     routed_experts = getattr(block_sparse_moe, "experts", None)
     if routed_experts is None or not hasattr(routed_experts, "weight_loader"):
@@ -100,30 +84,11 @@ def _resolve_routed_experts_for_layer(
             "Mixtral MoE UMA plan matched a routed expert tensor for "
             f"layer {layer_id}, but no FusedMoE weight_loader was found"
         )
-    return _RoutedExpertsResolution(routed_experts)
+    return RoutedExpertsResolution(routed_experts)
 
 
 def _get_routed_experts_for_layer(model: Any, layer_id: int) -> Any | None:
     return _resolve_routed_experts_for_layer(model, layer_id).routed_experts
-
-
-def _routed_entry_requires_local_read(
-    routed_experts: Any,
-    expert_id: int,
-    weight_name: str,
-) -> bool:
-    map_global = getattr(
-        routed_experts, "_map_global_expert_id_to_local_expert_id", None
-    )
-    if not callable(map_global):
-        return True
-    if map_global(expert_id) != -1:
-        return True
-    quant_method = getattr(routed_experts, "quant_method", None)
-    use_global_sf = (
-        getattr(quant_method, "use_global_sf", False) and "input_scale" in weight_name
-    )
-    return bool(use_global_sf)
 
 
 def build_mixtral_moe_weight_plan(
@@ -134,55 +99,18 @@ def build_mixtral_moe_weight_plan(
     skip_prefixes: list[str] | None = None,
     skip_substrs: list[str] | None = None,
 ) -> MixtralMoeSourcePlan:
-    routed_entries: list[MixtralMoeRoutedEntry] = []
-    for name in catalog.names():
-        parsed = _parse_mixtral_routed_expert_name(name)
-        if parsed is None:
-            continue
-        layer_id, expert_id, proj_name, suffix = parsed
-        resolution = _resolve_routed_experts_for_layer(model, layer_id)
-        routed_experts = resolution.routed_experts
-        if routed_experts is None:
-            routed_entries.append(
-                MixtralMoeRoutedEntry(
-                    checkpoint_name=name,
-                    layer_id=layer_id,
-                    expert_id=expert_id,
-                    param_name="",
-                    shard_id="",
-                    local_required=False,
-                    skip_reason=resolution.skip_reason,
-                )
-            )
-            continue
-        param_name, shard_id = _routed_param_for_projection(proj_name, suffix)
-        weight_name = f"{routed_experts.layer_name}.{param_name}"
-        routed_entries.append(
-            MixtralMoeRoutedEntry(
-                checkpoint_name=name,
-                layer_id=layer_id,
-                expert_id=expert_id,
-                param_name=param_name,
-                shard_id=shard_id,
-                local_required=_routed_entry_requires_local_read(
-                    routed_experts, expert_id, weight_name
-                ),
-            )
-        )
-
-    auto_skip_substrs = [*(skip_substrs or []), ".block_sparse_moe.experts."]
-    auto_plan = build_auto_weight_plan_for_module(
+    return build_routed_moe_weight_plan(
         model,
         catalog,
+        family_name="Mixtral MoE",
+        parse_name=_parse_mixtral_routed_expert_name,
+        map_projection=_routed_param_for_projection,
+        resolve_routed_experts=_resolve_routed_experts_for_layer,
+        auto_skip_substr=".block_sparse_moe.experts.",
         mapper=mapper,
         skip_prefixes=skip_prefixes,
-        skip_substrs=auto_skip_substrs,
+        skip_substrs=skip_substrs,
     )
-    routed_names = {entry.checkpoint_name for entry in routed_entries}
-    auto_plan = WeightPlan(
-        tuple(entry for entry in auto_plan if entry.checkpoint_name not in routed_names)
-    )
-    return MixtralMoeSourcePlan(auto_plan, tuple(routed_entries))
 
 
 def load_mixtral_moe_weights_from_source(
@@ -190,40 +118,10 @@ def load_mixtral_moe_weights_from_source(
     source: ODirectSafetensorsWeightSource,
     plan: MixtralMoeSourcePlan,
 ) -> set[str]:
-    loaded = execute_weight_plan(model, source, plan.auto_plan)
-    for entry in plan.routed_entries:
-        if not entry.local_required:
-            source.skip(
-                entry.checkpoint_name,
-                entry.skip_reason or "non-local routed expert",
-            )
-            continue
-        routed_experts = _get_routed_experts_for_layer(model, entry.layer_id)
-        if routed_experts is None:
-            raise RuntimeError(
-                "Mixtral MoE UMA plan requires routed experts for "
-                f"{entry.checkpoint_name}, but none were found"
-            )
-        if not hasattr(routed_experts, entry.param_name):
-            raise RuntimeError(
-                "Mixtral MoE UMA plan target parameter "
-                f"{entry.param_name!r} does not exist for {entry.checkpoint_name}"
-            )
-        tensor = source.read_full_cpu(entry.checkpoint_name)
-        weight_name = f"{routed_experts.layer_name}.{entry.param_name}"
-        success = routed_experts.weight_loader(
-            param=getattr(routed_experts, entry.param_name),
-            loaded_weight=tensor,
-            weight_name=weight_name,
-            shard_id=entry.shard_id,
-            expert_id=entry.expert_id,
-            return_success=True,
-        )
-        if not success:
-            raise RuntimeError(
-                "Mixtral MoE routed expert weight_loader refused a tensor "
-                "that the UMA plan marked local: "
-                f"{entry.checkpoint_name}"
-            )
-        loaded.add(f"{routed_experts.layer_name}.{entry.param_name}")
-    return loaded
+    return load_routed_moe_weights_from_source(
+        model,
+        source,
+        plan,
+        family_name="Mixtral MoE",
+        get_routed_experts=_get_routed_experts_for_layer,
+    )

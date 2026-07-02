@@ -325,6 +325,11 @@ Implemented so far:
   - adds AutoWeightsLoader-compatible quant cache-scale mapper composition
   - adds module quant-config ignored suffixes
   - keeps model hooks small and consistent across dense model families
+- shared routed-MoE model helper
+  - keeps per-family parsing and module resolution in model-side files
+  - centralizes local-expert skip decisions and existing FusedMoE/RoutedExperts
+    `weight_loader` delegation
+  - is used by Qwen-family MoE and Mixtral-style MoE hooks
 - `execute_weight_plan(...)`
   - resolves target parameters before payload reads
   - skips `ignore_missing` entries before payload reads
@@ -461,7 +466,8 @@ Add model-side plans only where needed:
 - Mixtral: initial model-side source hook implemented for per-expert
   `block_sparse_moe.experts.<expert>.w{1,2,3}.*` tensors; it skips non-local
   experts before payload read and delegates placement to existing FusedMoE
-  `weight_loader`
+  `weight_loader`. This now uses the shared routed-MoE helper rather than a
+  second copy of the Qwen-specific plan executor.
 - DeepSeek V2/V3 style MoE
 - Granite MoE variants
 
