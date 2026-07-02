@@ -235,6 +235,18 @@ Responsibilities:
 This started as a prototype inside `uma_odirect_safetensors_loader.py` and is
 now being extracted into neutral model-loader IR modules.
 
+Two known gaps in the current extraction:
+
+- symlink rejection currently lives in the loader's `_prepare_files`, not in
+  `TensorCatalog.from_safetensors_files`; the catalog should own the check (or
+  take an explicit pre-validated-path contract) so its safety guarantees do
+  not depend on the caller;
+- the catalog rejects duplicate tensor names across all files.  That is
+  correct for standard HF sharded checkpoints but wrong for pre-sharded
+  per-rank checkpoints (`sharded_state`), where the same name legitimately
+  appears in each rank file.  Phase 4 needs a rank/namespace dimension on the
+  catalog, or per-rank catalogs with explicit merge rules.
+
 ### 2. SemanticSpec / Weight Semantics
 
 Model/module/parameter-side declaration of how checkpoint names map to runtime
@@ -270,6 +282,17 @@ Optional(source="lm_head.weight", reason="tied embedding")
 The important property is not the exact class names.  The important property is
 that these are inspectable declarations rather than arbitrary file I/O or
 loader-specific Python branches.
+
+Transforms are part of this rule, and this is now a decision rather than an
+open question: `Transform(op=...)` names an operation in a transform registry.
+Opaque Python callables are a prototype convenience only — they make a plan
+impossible to serialize, to diff in golden-plan tests, or to validate against
+executor capabilities.  Each registered op must declare its extra staging
+factor (for example, an op that concatenates two staged tensors temporarily
+doubles staging memory), so the planner and `ExecutorCapability` validation
+can account for transform memory instead of trusting arbitrary code.  Today a
+`transform` callable can allocate unbounded CPU memory invisibly to the
+planner, which is a UMA-safety hole.
 
 At this layer, the declaration is still abstract.  It should not decide which
 checkpoint tensor actually exists, which file offset will be read, or which
@@ -313,6 +336,17 @@ avoid churn, but it should narrow toward `RankLocalPlacementPlan` semantics over
 time.  Later phases should introduce aliases or replacements for clearer names
 such as `SemanticWeightSpec`, `ResolvedWeightBinding`, `PlacementPlan`, and
 `ReadSchedule`.
+
+Two hardening rules for the entry type:
+
+- entry validity constraints (for example `read_segments` requiring
+  `read_into_cpu=True` plus `staging_shape` and excluding
+  `source_slices`/`target_slices`) must be enforced at construction time —
+  via `__post_init__` validation or by splitting the entry into explicit
+  variants (full read, sliced read, segmented read, skip) — not discovered as
+  runtime errors just before payload reads;
+- an entry must arrive fully resolved: executors must not infer slices, shard
+  sizes, or locality from parameter attributes at execution time.
 
 ### 5. ExecutorCapability
 
@@ -402,6 +436,79 @@ Placement and scheduling should remain separate.  Placement describes what this
 rank needs and where it goes; scheduling describes how an executor groups,
 orders, gates, and releases concrete reads.
 
+## Known Deviations in the Current Prototype
+
+A review of the code against this design (2026-07-03) found places where the
+implementation already violates the principles above.  They are recorded here
+so the migration phases can close them explicitly instead of leaving them as
+folklore.
+
+### Executor-side TP slice inference
+
+`_infer_output_dim_source_slice` and its helpers in the O_DIRECT loader infer
+tensor-parallel source slices at execution time from parameter attributes
+(`output_dim`, `input_dim`, `tp_rank`, `_get_shard_size_mapping`,
+`output_sizes`).  This is exactly the semantic dispatch this document argues
+against, and it has a concrete cost: `summarize_weight_plan` accounts entries
+with `source_slices=None` as full reads even when the executor will later read
+only a slice, so the plan summary can over-report payload bytes.  The plan is
+not yet the source of truth for "how much will be read".  Phase 2 moves this
+inference into plan construction.
+
+Status: closed 2026-07-03.  The inference now lives in
+`resolve_weight_plan()` in the neutral `weight_plan.py`; `execute_weight_plan`
+resolves the plan before summarizing and performs no inference of its own.
+
+### `RoutedMoeSourcePlan` bypasses the plan IR
+
+The shared MoE hook helper returns a composite plan (`auto_plan` plus
+`routed_entries`) and executes the routed part through its own loop that calls
+`read_full_cpu` directly.  Consequences:
+
+- the `WeightPlanExecutor` protocol declares `plan: WeightPlan`, but its main
+  users pass a different type, so the contract is effectively untyped;
+- routed expert payloads — the largest reads in MoE models — are invisible to
+  `summarize_weight_plan`, so read-volume accounting is wrong exactly where it
+  matters most;
+- a future non-O_DIRECT executor cannot execute the routed part without
+  reimplementing the loop, which recreates the side-path problem.
+
+Phase 1 folds routed entries into first-class `WeightPlanEntry` records; the
+fields needed for it (`expert_id`, `shard_id`, `weight_name`) already exist.
+
+Status: mostly closed 2026-07-03.
+`routed_moe_source_plan_to_weight_plan()` converts the composite plan into a
+single `WeightPlan` right before execution, so routed expert bytes appear in
+the summary and the side executor loop is gone.  Model hooks still *build*
+`RoutedMoeSourcePlan` (several families post-process `auto_plan` /
+`routed_entries` between build and load), so build-side unification — hooks
+returning a plain `WeightPlan` — remains Phase 1 work.
+
+### No load completeness check
+
+`load_weights()` discards the loaded-parameter set returned by
+`load_weights_from_source`, and `build_auto_weight_plan_from_catalog` silently
+marks unmapped names `required=False`.  A mapper bug or an unexpected
+checkpoint name can therefore leave runtime parameters at their initial values
+without any error.  The legacy vLLM loader has an unloaded-parameter check;
+the plan path currently does not.  This is the largest fail-closed gap and is
+now a Phase 0 task.
+
+Status: closed 2026-07-03.  `verify_loaded_weights()` in `weight_plan.py`
+compares the loaded set against `model.named_parameters()` (with the default
+loader's quant-method exemptions) after every plan execution, and the plan
+path additionally fails if a hook returns no loaded set at all.  The
+compatibility iterator path warns instead of failing when a legacy model does
+not report its loaded set.
+
+### Safety validation split across layers
+
+The symlink rejection this document attributes to `TensorCatalog` actually
+lives in the loader's `_prepare_files`; the extracted
+`TensorCatalog.from_safetensors_files` does not perform it, so catalog safety
+currently depends on the caller.  Phase 1 moves the check (or an explicit
+validated-path contract) into the catalog.
+
 ## What This Means for the Current Branch
 
 The current branch is valid as an operational mitigation, but it should be
@@ -410,6 +517,8 @@ treated as a prototype with clear boundaries.
 Keep doing:
 
 - enforce fail-closed behavior for UMA-safe loads;
+- verify the loaded-parameter set against the model's expected parameters
+  after every plan execution;
 - keep O_DIRECT reads and metadata-first catalog validation;
 - keep adding targeted model hooks when they unblock real testing;
 - keep tests around source slicing, local expert selection, and skipped reads.
@@ -441,6 +550,10 @@ Tasks:
 
 - keep `uma_odirect_safetensors` fail-closed;
 - maintain strict metadata validation;
+- add a loaded-set completeness check: compare the parameter names returned by
+  `load_weights_from_source` against `model.named_parameters()` and fail on
+  unloaded parameters (a minimal, early version of the
+  `ResolvedWeightBinding` completeness validation);
 - keep adding only the model hooks needed for actual tests;
 - document unsupported cases explicitly;
 - keep measuring `used + buff/cache`, not just allocated tensors.
@@ -448,6 +561,8 @@ Tasks:
 Exit criteria:
 
 - Qwen 35B and selected MoE models load without memory PSI;
+- a plan that silently drops a required parameter fails loudly instead of
+  leaving initial values in place;
 - tests cover malformed metadata, duplicate names, unsafe slices, local experts,
   transforms, and plan summaries.
 
@@ -462,12 +577,18 @@ Tasks:
   `vllm/model_executor/model_loader/weight_plan.py`;
 - keep the current class names initially to avoid churn;
 - make `ODirectSafetensorsWeightSource` consume the neutral IR;
+- fold `RoutedMoeSourcePlan.routed_entries` into first-class
+  `WeightPlanEntry` records so MoE hooks return a plain `WeightPlan` and the
+  routed executor loop disappears;
+- move symlink/path validation into `TensorCatalog` construction;
 - add tests that build a plan without instantiating the O_DIRECT loader.
 
 Exit criteria:
 
 - the O_DIRECT loader imports the IR instead of owning it;
 - model hooks import the neutral IR;
+- every model hook returns a single `WeightPlan`, and `summarize_weight_plan`
+  accounts for all payload bytes including routed experts;
 - tests can validate plan construction and plan accounting separately from
   Linux O_DIRECT reads.
 
@@ -479,6 +600,14 @@ Tasks:
 
 - define a `WeightPlanBuilder` protocol or model hook contract;
 - define a `WeightPlanExecutor` protocol;
+- move executor-side TP shard-slice inference
+  (`_infer_output_dim_source_slice` and helpers) into plan construction so
+  entries arrive fully resolved;
+- wire `ExecutorCapability` into a validation step
+  (`validate_plan(plan, capability)`) that runs before payload reads, and
+  revisit its boolean fields — the design sketch already needs a "maybe" for
+  `supports_partial_read`, so tri-state values or a constraint set are likely
+  needed;
 - rename or wrap `load_weights_from_source(source, plan)` into a plan executor
   call;
 - keep legacy iterator loading as a compatibility executor/fallback outside
@@ -488,14 +617,51 @@ Exit criteria:
 
 - model code never calls raw file I/O;
 - executor code never contains model-family mappings;
+- executors perform no semantic inference at execution time: the plan summary
+  matches executed reads byte-for-byte;
+- plans are validated against executor capability before any payload read;
 - plan summary can run before payload reads and before executor selection.
 
-### Phase 3: Move from model-level hooks to module/parameter semantics
+### Phase 2.5: Read scheduling and read-amplification accounting
 
-Goal: prevent `*_uma.py` files from becoming the new mapping-table pile.
+Goal: give the `ReadSchedulePlan` layer an owner.  It is described above but
+was previously assigned to no phase.  Routed expert loading — one read per
+layer per expert per projection — is the main small-read amplification case
+today.
 
 Tasks:
 
+- derive a `ReadSchedulePlan` from a `PlacementPlan` plus `ExecutorCapability`;
+- sort and coalesce nearby byte ranges under a staging-bytes cap;
+- report expected read amplification (payload bytes read / payload bytes
+  needed) in the plan summary before execution;
+- keep placement and scheduling as separate artifacts.
+
+Exit criteria:
+
+- routed-MoE loads issue coalesced group reads instead of one read per expert
+  projection;
+- read amplification is reported for every load and tracked as a regression
+  metric.
+
+### Phase 3: Move from model-level hooks to module/parameter semantics
+
+Goal: shrink the existing `*_uma.py` mapping-table pile.
+
+This is not a future risk.  As of 2026-07-03 there are 27 `*_uma.py` model
+hooks totalling roughly 5,900 lines.  The shared `routed_moe_uma.py` helper is
+the right direction, but every family still hand-writes `parse_name`
+(checkpoint-name string splitting) and `resolve_routed_experts` (model
+traversal) — both are exactly what the SemanticSpec pattern declarations
+should replace, so this phase is more urgent than its position in the
+sequence suggests.
+
+Tasks:
+
+- replace per-family `parse_name` functions with declarative source patterns
+  (for example
+  `RoutedExpert(source="layers.{i}.mlp.experts.{e}.{proj}.{suffix}")`)
+  resolved by a shared matcher;
 - introduce small inspectable loading-spec objects for common patterns:
   column shard, row shard, fused qkv, fused gate/up, routed expert, packed
   expert, tied embedding, optional tensor, named transform;
@@ -509,6 +675,8 @@ Exit criteria:
 - adding a conventional Transformer block should require mostly module spec
   declarations, not a new model-specific planner;
 - common MoE layouts share spec helpers;
+- model-specific lines per newly added model family stay under an agreed
+  budget, tracked per addition;
 - QKV, gate/up, and routed expert handling are not reimplemented per load
   format.
 
@@ -531,11 +699,42 @@ Exit criteria:
 - UMA-safe mode is a strict executor policy, not a separate model-loading
   knowledge graph.
 
+## Success Metrics
+
+The phase exit criteria are mostly qualitative.  These quantitative metrics
+detect regression toward a semantic-dispatcher loader and should be tracked
+across phases:
+
+- read amplification: payload bytes read / payload bytes needed per load;
+- peak `used + buff/cache` during load on the UMA target machine;
+- model-specific lines added per new model family (should fall phase over
+  phase);
+- plan construction time (metadata-only, must stay trivially cheap);
+- number of plan entries whose treatment is decided at execution time (must
+  reach zero at Phase 2 and stay there).
+
+## Upstreaming Posture
+
+This tree is a vendor fork; 27 added files under `models/` plus loader changes
+carry real rebase cost, and that cost grows the longer Phase 3 is deferred.
+Working stance until an upstream RFC exists:
+
+- `weight_plan.py` (the neutral IR) is the upstream RFC candidate and must
+  stay free of fork-only dependencies;
+- `*_uma.py` hooks are disposable prototypes: they are not preserved across
+  rebases at the cost of IR clarity, and no external code should import them;
+- the O_DIRECT executor is the reference UMA-safe executor — useful upstream,
+  but secondary to the IR proposal itself.
+
 ## Open Design Questions
 
 - What is the smallest set of first-class spec objects that covers most dense,
   fused, and routed-MoE models?
-- Which transforms must become named IR operations instead of Python callables?
+- What is the minimal transform-op vocabulary, and how does each op declare
+  its staging-memory factor?  (Named ops themselves are decided; see the
+  SemanticSpec section.)
+- How should `TensorCatalog` represent pre-sharded per-rank checkpoints where
+  the same tensor name legitimately appears in each rank file?
 - How should quantization methods attach auxiliary tensors, scales, and
   packed layouts to the plan?
 - Can direct destination placement be expressed safely for CUDA tensors, or
@@ -547,14 +746,21 @@ Exit criteria:
 
 ## Practical Next Steps
 
-For this branch, the next useful work is:
+For this branch, the next useful work is, in priority order (items completed
+on 2026-07-03: the loaded-set completeness check, the load-side routed-plan
+fold, and moving TP slice inference into plan resolution — see Implementation
+Notes):
 
-1. keep current UMA loader working and tested;
-2. avoid adding new model-specific logic to the storage loader;
-3. extract the current plan dataclasses into a neutral module;
-4. update existing model hooks to import the neutral plan types;
-5. add a short design note in each future model hook explaining which generic
-   spec pattern it should eventually become.
+1. finish routed-plan unification on the build side so model hooks return a
+   plain `WeightPlan` instead of `RoutedMoeSourcePlan`;
+2. replace `transform` callables with named registry ops that declare their
+   staging factor;
+3. start the Phase 2.5 read scheduler and report read amplification;
+4. move symlink/path validation into `TensorCatalog` construction;
+5. begin `parse_name` spec-ification to stop further `*_uma.py` growth
+   (Phase 3);
+6. keep adding a short design note in each future model hook explaining which
+   generic spec pattern it should eventually become.
 
 This lets the branch keep solving the immediate UMA safety problem while moving
 toward a loader architecture that does not grow a new special-case path for
@@ -620,3 +826,127 @@ an `ExecutorCapability.uma_odirect()` constructor.  This is not wired into read
 scheduling yet, but it gives future schedule validation a model-independent
 place to express fail-closed behavior, mmap policy, alignment requirements, and
 staging limits.
+
+### 2026-07-03 design review
+
+A review of the code against this document added the "Known Deviations in the
+Current Prototype" section and reprioritized the phases.  The
+highest-priority gaps found:
+
+- no loaded-set completeness check — `load_weights()` discards the loaded set
+  and auto plans silently skip unmapped names (now a Phase 0 task);
+- `RoutedMoeSourcePlan` bypasses the plan IR and its summary accounting, so
+  routed expert bytes are invisible to `summarize_weight_plan` (now a Phase 1
+  task);
+- executor-side TP slice inference makes the plan summary diverge from actual
+  reads (now a Phase 2 task).
+
+Transforms-as-named-ops was promoted from an open question to a decision,
+Phase 2.5 was added for read scheduling and read-amplification accounting,
+and quantitative success metrics plus an upstreaming posture were added.
+
+### 2026-07-03 review fixes implemented
+
+The three highest-priority gaps from the review were closed in code:
+
+- **Loaded-set completeness check (Phase 0).**  `verify_loaded_weights()` was
+  added to `weight_plan.py` and is called by
+  `UmaODirectSafetensorsModelLoader.load_weights()` on both the plan path and
+  the compatibility iterator path.  The plan path fails closed if a model hook
+  returns no loaded set; the compat path logs a warning for legacy models
+  that return `None`.
+- **Routed MoE entries folded into the plan IR (Phase 1, load side).**
+  `routed_moe_source_plan_to_weight_plan()` in `routed_moe_uma.py` converts
+  `RoutedMoeSourcePlan` into a single `WeightPlan` — local routed entries
+  become required `WeightPlanEntry` records (target names resolved through
+  `model.named_parameters()`, loader metadata carried in `shard_id` /
+  `expert_id` / `weight_name`), non-local entries become skips with a
+  `skip_reason`.  `load_routed_moe_weights_from_source` is now a thin wrapper
+  over `execute_weight_plan`, so routed expert bytes are included in
+  `summarize_weight_plan` accounting and the side executor loop is gone.
+  Family hooks are unchanged; build-side unification remains open.
+- **Executor-side TP slice inference moved to plan resolution (Phase 2).**
+  `_infer_output_dim_source_slice` and helpers moved to `weight_plan.py`, and
+  a new `resolve_weight_plan(model, catalog, plan)` fills TP source slices
+  before summary and execution.  `execute_weight_plan` resolves first, then
+  executes without inference, so the logged summary matches actual reads.
+  Entries with `expert_id` are exempt from inference (expert loaders narrow
+  internally).
+
+Supporting changes: `WeightPlanEntry.skip_reason` was added and is surfaced
+in skip logging; `_call_weight_loader` now validates `return_success` for
+expert entries whose loader supports it, so a loader refusing a tensor the
+plan marked local fails closed instead of being silently ignored.  Unit tests
+cover plan resolution, completeness verification, routed plan folding, and
+the refusal path
+(`tests/model_executor/model_loader/test_weight_plan.py`,
+`tests/model_executor/model_loader/test_routed_moe_uma_plan.py`).
+
+### 2026-07-03 runtime validation
+
+The review fixes were validated on DGX Spark after explicit pre-clean
+(`drop_caches` and swap cycle on both nodes) and a final preflight check:
+no backend-like processes, local `MemAvailable` 109 GiB, remote
+`MemAvailable` 112 GiB, swap 0 on both nodes, and memory PSI avg10 0.
+
+Runs used `load_format=uma_odirect_safetensors`, `max_model_len=128`,
+`max_num_seqs=1`, `enforce_eager=True`, `min_available_gib=20`,
+`max_swap_gib=0`, and `psi_gate_seconds=30`.  The vLLM engine was stopped
+immediately after model-load completion to avoid unrelated post-load profile
+JIT failures in the local test environment.  Full logs and RAM/PSI CSV files
+were written under `/tmp/vllm-uma-load-tests/`.
+
+Results:
+
+```text
+tiny-random-qwen3-moe
+  plan entries: 46 required, 0 skipped
+  total_read_payload: 0.02 GiB
+  source bytes_read / bytes_copied: 0.03 GiB / 0.02 GiB
+  model load: 0.02 GiB, 2.24 s
+  peak used + buff/cache: 16.44 GiB
+  min available: 107.49 GiB
+  swap: 0
+  memory PSI avg10 max: 0 / 0
+
+PrimeIntellect-qwen3-moe-tiny
+  plan entries: 1325 required, 0 skipped
+  total_read_payload: 1.25 GiB
+  source bytes_read / bytes_copied: 150.39 GiB / 1.25 GiB
+  model load: 1.26 GiB, 61.47 s
+  peak used + buff/cache: 17.44 GiB
+  min available: 106.52 GiB
+  swap: 0
+  memory PSI avg10 max: 0 / 0
+
+tiny-random-qwen3.5-moe
+  plan entries: 2017 required, 17 skipped
+  total_read_payload: 0.01 GiB
+  source bytes_read / bytes_copied: 2.24 GiB / 0.01 GiB
+  model load: 0.02 GiB, 86.39 s
+  peak used + buff/cache: 17.66 GiB
+  min available: 106.32 GiB
+  swap: 0
+  memory PSI avg10 max: 0 / 0
+
+Qwen3.6-35B-A3B-heretic-NVFP4
+  settings difference: chunk_size=1 MiB, window_size=1 MiB,
+    gate_interval_mib=16, metadata_limit_mib=32
+  plan entries: 124306 required, 0 skipped
+  total_read_payload: 21.73 GiB
+  source bytes_read / bytes_copied: 125.91 GiB / 21.73 GiB
+  model load: 21.88 GiB, 90.99 s
+  peak used + buff/cache: 40.00 GiB
+  min available: 84.06 GiB
+  swap: 0
+  memory PSI avg10 max: 0 / 0
+  IO PSI avg10 max: 10.01 / 10.01
+```
+
+No loaded-set completeness false positive was observed in these model-side
+plan runs.  The most important metric is read amplification: the
+PrimeIntellect tiny MoE run read 150.39 GiB for 1.25 GiB of payload with the
+128 MiB window setting, while the 35B NVFP4 run read 125.91 GiB for
+21.73 GiB of payload after reducing the O_DIRECT window to 1 MiB.  This
+validates the Phase 2.5 priority: read scheduling and coalescing should become
+a first-class regression metric rather than relying on window-size tuning.

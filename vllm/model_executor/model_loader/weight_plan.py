@@ -5,7 +5,7 @@ import json
 import math
 import os
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 import torch
@@ -217,6 +217,7 @@ class WeightPlanEntry:
     expert_id: int | None = None
     weight_name: str | None = None
     ignore_missing: bool = False
+    skip_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -461,6 +462,254 @@ def resolve_weight_plan_source_hooks(
             "build_weight_plan(catalog) and load_weights_from_source(source, plan)"
         )
     return build_weight_plan, load_weights_from_source
+
+
+def _resolve_attr(root: object, path: str) -> object:
+    current = root
+    for part in path.split("."):
+        if not hasattr(current, part):
+            raise RuntimeError(f"Cannot resolve weight plan target {path!r}")
+        current = getattr(current, part)
+    return current
+
+
+def _infer_output_dim_source_slice(
+    param: object,
+    record: TensorMeta,
+    *,
+    shard_id: int | str | tuple[int, ...] | None = None,
+    weight_loader: Callable | None = None,
+) -> tuple[slice | int, ...] | None:
+    """Infer a safe source-side TP slice for tensor-parallel params.
+
+    vLLM fused loaders (QKV/MergedColumn) normally receive a full checkpoint
+    shard and narrow it to this rank. If we can prove the source tensor is
+    exactly ``tp_size`` copies of the local shard along output dim, we can read
+    only this rank's source rows and temporarily mark the input as already
+    sharded before delegating to the existing weight_loader.  RowParallel-like
+    input-dim shards use the same proof but may require strided source reads.
+    """
+    if getattr(param, "is_sharded_weight", False):
+        return None
+    if getattr(param, "use_bitsandbytes_4bit", False):
+        return None
+
+    param_data = getattr(param, "data", None)
+    if param_data is None:
+        return None
+    param_shape = list(param_data.shape)
+    if len(record.shape) != len(param_shape) or not param_shape:
+        return None
+
+    tp_rank = getattr(param, "tp_rank", None)
+    tp_size = getattr(param, "tp_size", None)
+    if not isinstance(tp_rank, int) or not isinstance(tp_size, int):
+        return None
+    if tp_size <= 1 or tp_rank < 0 or tp_rank >= tp_size:
+        return None
+
+    output_dim = getattr(param, "output_dim", None)
+    if output_dim == 0:
+        if getattr(param, "packed_dim", None) != output_dim:
+            shard_size = _infer_output_dim_local_shard_size(
+                param,
+                record,
+                shard_id=shard_id,
+                weight_loader=weight_loader,
+                param_output_size=param_shape[output_dim],
+            )
+            output_slice = _infer_dim_tp_source_slice(
+                record,
+                param_shape,
+                output_dim,
+                shard_size,
+                tp_rank,
+                tp_size,
+            )
+            if output_slice is not None:
+                return output_slice
+
+    input_dim = getattr(param, "input_dim", None)
+    if shard_id is None and isinstance(input_dim, int):
+        if getattr(param, "packed_dim", None) != input_dim:
+            normalized_input_dim = input_dim
+            if normalized_input_dim < 0:
+                normalized_input_dim += len(param_shape)
+            input_slice = _infer_dim_tp_source_slice(
+                record,
+                param_shape,
+                normalized_input_dim,
+                (
+                    param_shape[normalized_input_dim]
+                    if 0 <= normalized_input_dim < len(param_shape)
+                    else None
+                ),
+                tp_rank,
+                tp_size,
+            )
+            if input_slice is not None:
+                return input_slice
+
+    return None
+
+
+def _infer_dim_tp_source_slice(
+    record: TensorMeta,
+    param_shape: list[int],
+    dim: int,
+    shard_size: int | None,
+    tp_rank: int,
+    tp_size: int,
+) -> tuple[slice | int, ...] | None:
+    if dim < 0:
+        dim += len(param_shape)
+    if dim < 0 or dim >= len(param_shape):
+        return None
+    if shard_size is None or shard_size <= 0:
+        return None
+    if record.shape[dim] != shard_size * tp_size:
+        return None
+    for idx, (source_size, target_size) in enumerate(zip(record.shape, param_shape)):
+        if idx == dim:
+            continue
+        if source_size != target_size:
+            return None
+
+    start = tp_rank * shard_size
+    slices: list[slice | int] = [slice(None)] * len(param_shape)
+    slices[dim] = slice(start, start + shard_size)
+    return tuple(slices)
+
+
+def _infer_output_dim_local_shard_size(
+    param: object,
+    record: TensorMeta,
+    *,
+    shard_id: int | str | tuple[int, ...] | None,
+    weight_loader: Callable | None,
+    param_output_size: int,
+) -> int | None:
+    if shard_id is None:
+        return param_output_size
+
+    if isinstance(shard_id, tuple):
+        return None
+
+    owner = getattr(weight_loader, "__self__", None)
+    if owner is None:
+        return None
+
+    get_size = getattr(owner, "_get_shard_size_mapping", None)
+    if callable(get_size):
+        try:
+            shard_size = get_size(shard_id)
+        except Exception:
+            shard_size = None
+        if isinstance(shard_size, int) and shard_size > 0:
+            if shard_size <= param_output_size:
+                return shard_size
+            return None
+
+    if isinstance(shard_id, int):
+        output_sizes = getattr(owner, "output_sizes", None)
+        if (
+            isinstance(output_sizes, (list, tuple))
+            and 0 <= shard_id < len(output_sizes)
+        ):
+            total_size = output_sizes[shard_id]
+            tp_size = getattr(param, "tp_size", None)
+            if isinstance(total_size, int) and isinstance(tp_size, int):
+                if tp_size > 1 and total_size > 0 and total_size % tp_size == 0:
+                    shard_size = total_size // tp_size
+                    if shard_size <= param_output_size:
+                        return shard_size
+
+    return None
+
+
+def resolve_weight_plan(
+    model: nn.Module,
+    catalog: TensorCatalog,
+    plan: WeightPlan,
+) -> WeightPlan:
+    """Resolve implicit placement decisions before any payload read.
+
+    Fills in the tensor-parallel source slices that executors used to infer at
+    execution time, so entries arrive fully resolved, the plan summary matches
+    executed reads byte-for-byte, and executors never perform semantic
+    inference.  Entries that are skipped, already sliced, segmented, routed to
+    an expert loader, or missing from the catalog are left untouched
+    (`summarize_weight_plan` raises the canonical error for missing required
+    tensors).
+    """
+
+    resolved: list[WeightPlanEntry] = []
+    changed = False
+    for entry in plan:
+        if (
+            not entry.required
+            or entry.source_slices is not None
+            or entry.read_segments is not None
+            or entry.expert_id is not None
+            or not catalog.has(entry.checkpoint_name)
+        ):
+            resolved.append(entry)
+            continue
+        try:
+            param = _resolve_attr(model, entry.target_name)
+        except RuntimeError:
+            if entry.ignore_missing:
+                resolved.append(entry)
+                continue
+            raise
+        source_slices = _infer_output_dim_source_slice(
+            param,
+            catalog.get(entry.checkpoint_name),
+            shard_id=entry.shard_id,
+            weight_loader=getattr(param, "weight_loader", None),
+        )
+        if source_slices is None:
+            resolved.append(entry)
+            continue
+        changed = True
+        resolved.append(
+            replace(entry, source_slices=source_slices, source_is_sharded=True)
+        )
+    if not changed:
+        return plan
+    return WeightPlan(tuple(resolved))
+
+
+def verify_loaded_weights(model: nn.Module, loaded_weights: set[str]) -> None:
+    """Fail closed when loading left model parameters uninitialized.
+
+    Minimal early version of the ResolvedWeightBinding completeness check.
+    Mirrors the exemptions of the default loader's weight tracking: modules
+    whose quant method materializes or rewrites weights after loading may have
+    parameters that legitimately never appear in a checkpoint.
+    """
+
+    loaded = set(loaded_weights)
+    for module_name, module in model.named_modules():
+        quant_method = getattr(module, "quant_method", None)
+        has_online_quant = getattr(quant_method, "uses_meta_device", False)
+        has_postprocess_quant = getattr(
+            quant_method, "process_weights_after_loading", None
+        )
+        if has_online_quant or has_postprocess_quant:
+            for param_name, _ in module.named_parameters():
+                full_name = (
+                    f"{module_name}.{param_name}" if module_name else param_name
+                )
+                loaded.add(full_name)
+    weights_not_loaded = {name for name, _ in model.named_parameters()} - loaded
+    if weights_not_loaded:
+        preview = ", ".join(sorted(weights_not_loaded)[:8])
+        suffix = ", ..." if len(weights_not_loaded) > 8 else ""
+        raise RuntimeError(
+            f"Weight loading left {len(weights_not_loaded)} parameters "
+            f"uninitialized (fail closed): {preview}{suffix}"
+        )
 
 
 _ROTARY_EMBEDS_UNUSED_WEIGHTS = (

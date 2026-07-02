@@ -15,6 +15,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
     WeightPlan,
+    WeightPlanEntry,
     build_auto_weight_plan_for_module,
 )
 
@@ -142,20 +143,31 @@ def build_routed_moe_weight_plan(
     return RoutedMoeSourcePlan(auto_plan, tuple(routed_entries))
 
 
-def load_routed_moe_weights_from_source(
+def routed_moe_source_plan_to_weight_plan(
     model: nn.Module,
-    source: ODirectSafetensorsWeightSource,
     plan: RoutedMoeSourcePlan,
     *,
     family_name: str,
     get_routed_experts: Callable[[nn.Module, int], Any | None],
-) -> set[str]:
-    loaded = execute_weight_plan(model, source, plan.auto_plan)
+) -> WeightPlan:
+    """Fold routed entries into one executable `WeightPlan`.
+
+    Routed expert payloads become first-class plan entries, so
+    `summarize_weight_plan` accounts for them and a single executor performs
+    the whole load instead of a side loop issuing its own reads.
+    """
+
+    param_names: dict[int, str] | None = None
+    entries: list[WeightPlanEntry] = list(plan.auto_plan.entries)
     for entry in plan.routed_entries:
         if not entry.local_required:
-            source.skip(
-                entry.checkpoint_name,
-                entry.skip_reason or "non-local routed expert",
+            entries.append(
+                WeightPlanEntry(
+                    checkpoint_name=entry.checkpoint_name,
+                    target_name=entry.checkpoint_name,
+                    required=False,
+                    skip_reason=entry.skip_reason or "non-local routed expert",
+                )
             )
             continue
         routed_experts = get_routed_experts(model, entry.layer_id)
@@ -169,27 +181,42 @@ def load_routed_moe_weights_from_source(
                 f"{family_name} UMA plan target parameter "
                 f"{entry.param_name!r} does not exist for {entry.checkpoint_name}"
             )
-        if entry.source_slices is None:
-            tensor = source.read_full_cpu(entry.checkpoint_name)
-        else:
-            tensor = source.read_slice_cpu(
-                entry.checkpoint_name,
-                entry.source_slices,
-            )
-        weight_name = f"{routed_experts.layer_name}.{entry.param_name}"
-        success = routed_experts.weight_loader(
-            param=getattr(routed_experts, entry.param_name),
-            loaded_weight=tensor,
-            weight_name=weight_name,
-            shard_id=entry.shard_id,
-            expert_id=entry.expert_id,
-            return_success=True,
-        )
-        if not success:
+        if param_names is None:
+            param_names = {
+                id(param): name for name, param in model.named_parameters()
+            }
+        target_name = param_names.get(id(getattr(routed_experts, entry.param_name)))
+        if target_name is None:
             raise RuntimeError(
-                f"{family_name} routed expert weight_loader refused a tensor "
-                "that the UMA plan marked local: "
-                f"{entry.checkpoint_name}"
+                f"{family_name} routed expert parameter {entry.param_name!r} "
+                f"for {entry.checkpoint_name} is not a registered model "
+                "parameter"
             )
-        loaded.add(f"{routed_experts.layer_name}.{entry.param_name}")
-    return loaded
+        entries.append(
+            WeightPlanEntry(
+                checkpoint_name=entry.checkpoint_name,
+                target_name=target_name,
+                source_slices=entry.source_slices,
+                shard_id=entry.shard_id,
+                expert_id=entry.expert_id,
+                weight_name=f"{routed_experts.layer_name}.{entry.param_name}",
+            )
+        )
+    return WeightPlan(tuple(entries))
+
+
+def load_routed_moe_weights_from_source(
+    model: nn.Module,
+    source: ODirectSafetensorsWeightSource,
+    plan: RoutedMoeSourcePlan,
+    *,
+    family_name: str,
+    get_routed_experts: Callable[[nn.Module, int], Any | None],
+) -> set[str]:
+    weight_plan = routed_moe_source_plan_to_weight_plan(
+        model,
+        plan,
+        family_name=family_name,
+        get_routed_experts=get_routed_experts,
+    )
+    return execute_weight_plan(model, source, weight_plan)

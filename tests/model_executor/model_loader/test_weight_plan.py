@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import types
+
 import pytest
 import torch
 
@@ -11,8 +13,10 @@ from vllm.model_executor.model_loader.weight_plan import (
     WeightPlan,
     WeightPlanEntry,
     build_auto_weight_plan_from_catalog,
+    resolve_weight_plan,
     resolve_weight_plan_source_hooks,
     summarize_weight_plan,
+    verify_loaded_weights,
 )
 
 
@@ -91,6 +95,73 @@ def test_resolve_weight_plan_source_hooks_requires_complete_contract():
     build_weight_plan, load_weights_from_source = hooks
     assert build_weight_plan("catalog") == "catalog"
     assert load_weights_from_source("source", "plan") == {"loaded"}
+
+
+def test_resolve_weight_plan_fills_tp_source_slices():
+    param = torch.nn.Parameter(torch.zeros(4, 4), requires_grad=False)
+    param.output_dim = 0
+    param.tp_rank = 1
+    param.tp_size = 2
+    model = types.SimpleNamespace(w=param)
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", "w", torch.float32, [8, 4], 0, 128),
+        ]
+    )
+    plan = WeightPlan((WeightPlanEntry("w", "w"),))
+
+    resolved = resolve_weight_plan(model, catalog, plan)
+
+    entry = resolved.entries[0]
+    assert entry.source_slices == (slice(4, 8), slice(None, None))
+    assert entry.source_is_sharded is True
+
+    summary = summarize_weight_plan(catalog, resolved)
+    assert summary.sliced_payload_bytes == 64
+    assert summary.full_payload_bytes == 0
+
+
+def test_resolve_weight_plan_leaves_expert_and_explicit_entries_untouched():
+    param = torch.nn.Parameter(torch.zeros(4, 4), requires_grad=False)
+    param.output_dim = 0
+    param.tp_rank = 1
+    param.tp_size = 2
+    model = types.SimpleNamespace(w=param)
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", "w", torch.float32, [8, 4], 0, 128),
+        ]
+    )
+    expert_entry = WeightPlanEntry("w", "w", expert_id=3)
+    explicit_entry = WeightPlanEntry(
+        "w",
+        "w",
+        source_slices=(slice(0, 4), slice(None)),
+    )
+    plan = WeightPlan((expert_entry, explicit_entry))
+
+    resolved = resolve_weight_plan(model, catalog, plan)
+
+    assert resolved.entries[0] is expert_entry
+    assert resolved.entries[1] is explicit_entry
+
+
+def test_verify_loaded_weights_fails_closed_on_missing_parameters():
+    model = torch.nn.Linear(2, 2, bias=True)
+
+    with pytest.raises(RuntimeError, match="bias"):
+        verify_loaded_weights(model, {"weight"})
+
+    verify_loaded_weights(model, {"weight", "bias"})
+
+
+def test_verify_loaded_weights_exempts_postprocess_quant_modules():
+    model = torch.nn.Linear(2, 2, bias=True)
+    model.quant_method = types.SimpleNamespace(
+        process_weights_after_loading=lambda module: None,
+    )
+
+    verify_loaded_weights(model, set())
 
 
 def test_executor_capability_uma_odirect_defaults_fail_closed():

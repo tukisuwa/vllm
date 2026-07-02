@@ -918,6 +918,13 @@ def test_uma_odirect_load_weights_uses_model_source_hook(tmp_path, monkeypatch):
         def load_weights_from_source(self, source, plan):
             assert plan == ["a"]
             self.loaded = source.read_full_cpu("a")
+            return {"a"}
+
+        def named_modules(self):
+            return (("", self),)
+
+        def named_parameters(self):
+            return ()
 
         def load_weights(self, _weights):
             raise AssertionError("compatibility iterator path should not be used")

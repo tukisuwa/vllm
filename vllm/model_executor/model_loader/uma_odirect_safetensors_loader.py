@@ -32,12 +32,15 @@ from vllm.model_executor.model_loader.weight_plan import (
     WeightPlanSummary,
     _normalize_single_dim_slice_selection,
     _normalize_slice_selection,
+    _resolve_attr,
     _TensorRecord,
     _weight_plan_entry_target_shape,
     build_auto_weight_plan_for_module,
     build_auto_weight_plan_from_catalog,
+    resolve_weight_plan,
     resolve_weight_plan_source_hooks,
     summarize_weight_plan,
+    verify_loaded_weights,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
@@ -60,8 +63,10 @@ __all__ = [
     "build_auto_weight_plan_for_module",
     "build_auto_weight_plan_from_catalog",
     "execute_weight_plan",
+    "resolve_weight_plan",
     "resolve_weight_plan_source_hooks",
     "summarize_weight_plan",
+    "verify_loaded_weights",
 ]
 
 
@@ -153,169 +158,6 @@ def _select_contiguous_target_view(
     return target
 
 
-def _resolve_attr(root: object, path: str) -> object:
-    current = root
-    for part in path.split("."):
-        if not hasattr(current, part):
-            raise RuntimeError(f"Cannot resolve weight plan target {path!r}")
-        current = getattr(current, part)
-    return current
-
-
-def _infer_output_dim_source_slice(
-    param: object,
-    record: TensorMeta,
-    *,
-    shard_id: int | str | tuple[int, ...] | None = None,
-    weight_loader: Callable | None = None,
-) -> tuple[slice | int, ...] | None:
-    """Infer a safe source-side TP slice for tensor-parallel params.
-
-    vLLM fused loaders (QKV/MergedColumn) normally receive a full checkpoint
-    shard and narrow it to this rank. If we can prove the source tensor is
-    exactly ``tp_size`` copies of the local shard along output dim, we can read
-    only this rank's source rows and temporarily mark the input as already
-    sharded before delegating to the existing weight_loader.  RowParallel-like
-    input-dim shards use the same proof but may require strided source reads.
-    """
-    if getattr(param, "is_sharded_weight", False):
-        return None
-    if getattr(param, "use_bitsandbytes_4bit", False):
-        return None
-
-    param_data = getattr(param, "data", None)
-    if param_data is None:
-        return None
-    param_shape = list(param_data.shape)
-    if len(record.shape) != len(param_shape) or not param_shape:
-        return None
-
-    tp_rank = getattr(param, "tp_rank", None)
-    tp_size = getattr(param, "tp_size", None)
-    if not isinstance(tp_rank, int) or not isinstance(tp_size, int):
-        return None
-    if tp_size <= 1 or tp_rank < 0 or tp_rank >= tp_size:
-        return None
-
-    output_dim = getattr(param, "output_dim", None)
-    if output_dim == 0:
-        if getattr(param, "packed_dim", None) != output_dim:
-            shard_size = _infer_output_dim_local_shard_size(
-                param,
-                record,
-                shard_id=shard_id,
-                weight_loader=weight_loader,
-                param_output_size=param_shape[output_dim],
-            )
-            output_slice = _infer_dim_tp_source_slice(
-                record,
-                param_shape,
-                output_dim,
-                shard_size,
-                tp_rank,
-                tp_size,
-            )
-            if output_slice is not None:
-                return output_slice
-
-    input_dim = getattr(param, "input_dim", None)
-    if shard_id is None and isinstance(input_dim, int):
-        if getattr(param, "packed_dim", None) != input_dim:
-            normalized_input_dim = input_dim
-            if normalized_input_dim < 0:
-                normalized_input_dim += len(param_shape)
-            input_slice = _infer_dim_tp_source_slice(
-                record,
-                param_shape,
-                normalized_input_dim,
-                (
-                    param_shape[normalized_input_dim]
-                    if 0 <= normalized_input_dim < len(param_shape)
-                    else None
-                ),
-                tp_rank,
-                tp_size,
-            )
-            if input_slice is not None:
-                return input_slice
-
-    return None
-
-
-def _infer_dim_tp_source_slice(
-    record: TensorMeta,
-    param_shape: list[int],
-    dim: int,
-    shard_size: int | None,
-    tp_rank: int,
-    tp_size: int,
-) -> tuple[slice | int, ...] | None:
-    if dim < 0:
-        dim += len(param_shape)
-    if dim < 0 or dim >= len(param_shape):
-        return None
-    if shard_size is None or shard_size <= 0:
-        return None
-    if record.shape[dim] != shard_size * tp_size:
-        return None
-    for idx, (source_size, target_size) in enumerate(zip(record.shape, param_shape)):
-        if idx == dim:
-            continue
-        if source_size != target_size:
-            return None
-
-    start = tp_rank * shard_size
-    slices: list[slice | int] = [slice(None)] * len(param_shape)
-    slices[dim] = slice(start, start + shard_size)
-    return tuple(slices)
-
-
-def _infer_output_dim_local_shard_size(
-    param: object,
-    record: TensorMeta,
-    *,
-    shard_id: int | str | tuple[int, ...] | None,
-    weight_loader: Callable | None,
-    param_output_size: int,
-) -> int | None:
-    if shard_id is None:
-        return param_output_size
-
-    if isinstance(shard_id, tuple):
-        return None
-
-    owner = getattr(weight_loader, "__self__", None)
-    if owner is None:
-        return None
-
-    get_size = getattr(owner, "_get_shard_size_mapping", None)
-    if callable(get_size):
-        try:
-            shard_size = get_size(shard_id)
-        except Exception:
-            shard_size = None
-        if isinstance(shard_size, int) and shard_size > 0:
-            if shard_size <= param_output_size:
-                return shard_size
-            return None
-
-    if isinstance(shard_id, int):
-        output_sizes = getattr(owner, "output_sizes", None)
-        if (
-            isinstance(output_sizes, (list, tuple))
-            and 0 <= shard_id < len(output_sizes)
-        ):
-            total_size = output_sizes[shard_id]
-            tp_size = getattr(param, "tp_size", None)
-            if isinstance(total_size, int) and isinstance(tp_size, int):
-                if tp_size > 1 and total_size > 0 and total_size % tp_size == 0:
-                    shard_size = total_size // tp_size
-                    if shard_size <= param_output_size:
-                        return shard_size
-
-    return None
-
-
 def _source_tensor_shape(
     record: TensorMeta,
     source_slices: tuple[slice | int, ...] | None,
@@ -342,6 +184,7 @@ def _call_weight_loader(
     *,
     source_is_sharded: bool,
     kwargs: dict[str, object],
+    entry_name: str,
 ) -> None:
     had_attr = hasattr(param, "is_sharded_weight")
     old_value = getattr(param, "is_sharded_weight", None)
@@ -350,21 +193,38 @@ def _call_weight_loader(
     try:
         call_kwargs = dict(kwargs)
         extra_args: list[object] = []
-        if "shard_id" in call_kwargs:
+        expects_success = False
+        if "shard_id" in call_kwargs or "expert_id" in call_kwargs:
             signature = inspect.signature(weight_loader)
             params = signature.parameters
             accepts_kwargs = any(
                 p.kind == inspect.Parameter.VAR_KEYWORD
                 for p in params.values()
             )
-            if "shard_id" not in params and not accepts_kwargs:
+            if (
+                "shard_id" in call_kwargs
+                and "shard_id" not in params
+                and not accepts_kwargs
+            ):
                 # Several vLLM weight_loader_v2 implementations name this
                 # argument loaded_shard_id and expect it positionally.  Keep the
                 # plan IR field generic while preserving the layer call
                 # convention.
                 if "loaded_shard_id" in params:
                     extra_args.append(call_kwargs.pop("shard_id"))
-        weight_loader(param, tensor, *extra_args, **call_kwargs)
+            if "expert_id" in call_kwargs and "return_success" in params:
+                # Expert loaders report refusal (for example a non-local
+                # expert) through return_success.  The plan already decided
+                # this entry is local and required, so a refusal means the
+                # plan and the loader disagree and the load must fail closed.
+                call_kwargs["return_success"] = True
+                expects_success = True
+        result = weight_loader(param, tensor, *extra_args, **call_kwargs)
+        if expects_success and not result:
+            raise RuntimeError(
+                "weight_loader refused a tensor the weight plan marked "
+                f"local and required: {entry_name}"
+            )
     finally:
         if source_is_sharded:
             if had_attr:
@@ -383,6 +243,7 @@ def execute_weight_plan(
 ) -> set[str]:
     """Execute a simple model-side WeightPlan with UMA-safe source reads."""
 
+    plan = resolve_weight_plan(model, source.catalog, plan)
     summary = summarize_weight_plan(source.catalog, plan)
     logger.info(
         "uma_odirect_safetensors weight plan: entries=%d required=%d skipped=%d "
@@ -406,7 +267,10 @@ def execute_weight_plan(
     loaded: set[str] = set()
     for entry in plan:
         if not entry.required:
-            source.skip(entry.checkpoint_name, "weight plan marked not required")
+            source.skip(
+                entry.checkpoint_name,
+                entry.skip_reason or "weight plan marked not required",
+            )
             continue
 
         try:
@@ -430,17 +294,11 @@ def execute_weight_plan(
                 )
             weight_loader = default_weight_loader
 
+        # The plan was resolved above; executing without further semantic
+        # inference keeps the logged summary equal to the actual reads.
         source_slices = entry.source_slices
         source_is_sharded = entry.source_is_sharded
         record = source.catalog.get(entry.checkpoint_name)
-        if source_slices is None:
-            source_slices = _infer_output_dim_source_slice(
-                param,
-                record,
-                shard_id=entry.shard_id,
-                weight_loader=weight_loader,
-            )
-            source_is_sharded = source_slices is not None
 
         if entry.target_slices is not None and not entry.read_into_cpu:
             raise RuntimeError(
@@ -527,6 +385,7 @@ def execute_weight_plan(
             tensor,
             source_is_sharded=source_is_sharded,
             kwargs=kwargs,
+            entry_name=entry.checkpoint_name,
         )
         loaded.add(entry.target_name)
     return loaded
@@ -1581,9 +1440,16 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
             )
             plan = build_weight_plan(source.catalog)
             try:
-                load_weights_from_source(source, plan)
+                loaded_weights = load_weights_from_source(source, plan)
             finally:
                 source.log_stats("model-source")
+            if loaded_weights is None:
+                raise RuntimeError(
+                    "load_weights_from_source must return the loaded "
+                    "parameter name set so UMA-safe loading can fail closed "
+                    f"on uninitialized parameters: {type(model).__name__}"
+                )
+            verify_loaded_weights(model, loaded_weights)
             return
 
         logger.info(
@@ -1591,6 +1457,15 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
             type(model).__name__,
         )
         try:
-            model.load_weights(source.iter_full_tensors())
+            loaded_weights = model.load_weights(source.iter_full_tensors())
         finally:
             source.log_stats("compat-iterator")
+        if loaded_weights is None:
+            logger.warning(
+                "uma_odirect_safetensors: model %s load_weights did not "
+                "report a loaded set; skipping the fail-closed completeness "
+                "check",
+                type(model).__name__,
+            )
+            return
+        verify_loaded_weights(model, loaded_weights)
