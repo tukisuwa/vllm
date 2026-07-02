@@ -36,6 +36,7 @@ from vllm.model_executor.models import (
     granitemoe,
     granitemoehybrid,
     granitemoeshared,
+    internlm2,
     llama,
     mixtral,
     nemotron,
@@ -2037,6 +2038,69 @@ def test_gemma_dense_load_weights_from_source_delegates_to_executor(
     plan = WeightPlan(())
 
     loaded = model_cls.load_weights_from_source(model, source, plan)
+
+    assert loaded == {"loaded"}
+    assert calls == [(model, source, plan)]
+
+
+def test_internlm2_build_weight_plan_uses_mapper_and_tie_skip(tmp_path):
+    metadata = {
+        "output.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "model.layers.0.feed_forward.w1.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "model.layers.0.feed_forward.w3.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [8, 12],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 12)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+
+    class FakeInternLM2:
+        config = FakeConfig()
+        hf_to_vllm_mapper = internlm2.InternLM2ForCausalLM.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = internlm2.InternLM2ForCausalLM.build_weight_plan(FakeInternLM2(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["output.weight"].required is False
+    w1 = entries["model.layers.0.feed_forward.w1.weight"]
+    assert w1.target_name == "model.layers.0.feed_forward.gate_up_proj.weight"
+    assert w1.shard_id == 0
+    w3 = entries["model.layers.0.feed_forward.w3.weight"]
+    assert w3.target_name == "model.layers.0.feed_forward.gate_up_proj.weight"
+    assert w3.shard_id == 1
+
+
+def test_internlm2_load_weights_from_source_delegates_to_executor(monkeypatch):
+    calls = []
+
+    def fake_load(model, source, plan):
+        calls.append((model, source, plan))
+        return {"loaded"}
+
+    monkeypatch.setattr(internlm2, "load_auto_uma_weights_from_source", fake_load)
+    model = object()
+    source = object()
+    plan = WeightPlan(())
+
+    loaded = internlm2.InternLM2ForCausalLM.load_weights_from_source(
+        model, source, plan
+    )
 
     assert loaded == {"loaded"}
     assert calls == [(model, source, plan)]
