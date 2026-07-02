@@ -2648,7 +2648,7 @@ def test_minimax_m2_build_weight_plan_replays_inner_mapper_and_mtp_skip(tmp_path
         FakeMiniMaxM2(),
         catalog,
     )
-    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+    entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
 
     q_proj = entries["model.layers.0.self_attn.q_proj.weight"]
     assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
@@ -2656,6 +2656,130 @@ def test_minimax_m2_build_weight_plan_replays_inner_mapper_and_mtp_skip(tmp_path
     assert entries["model.layers.2.self_attn.q_proj.weight"].required is False
     assert entries["lm_head.weight"].target_name == "lm_head.weight"
     assert entries["lm_head.weight"].required is True
+
+
+def test_minimax_m2_moe_source_plan_skips_nonlocal_experts_before_read():
+    names = [
+        "model.layers.0.mlp.experts.0.w1.weight",
+        "model.layers.0.mlp.experts.1.w1.weight",
+        "model.layers.2.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+    ]
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", names[0], torch.float32, [1], 0, 4),
+            TensorMeta("model.safetensors", names[1], torch.float32, [1], 4, 4),
+            TensorMeta("model.safetensors", names[2], torch.float32, [1], 8, 4),
+            TensorMeta("model.safetensors", names[3], torch.float32, [1, 1], 12, 4),
+        ]
+    )
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.block_sparse_moe.experts"
+        w13_weight = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 0 else -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeSelfAttn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv_proj = nn.Linear(1, 3, bias=False)
+            nn.init.zeros_(self.qkv_proj.weight)
+            self.qkv_calls = []
+
+            def weight_loader(param, loaded_weight, shard_id):
+                self.qkv_calls.append(
+                    {
+                        "param": param,
+                        "loaded_weight": loaded_weight,
+                        "shard_id": shard_id,
+                    }
+                )
+                if shard_id == "q":
+                    param.data.narrow(0, 0, 1).copy_(loaded_weight)
+
+            self.qkv_proj.weight.weight_loader = weight_loader
+
+    class FakeMoE:
+        def __init__(self, routed_experts=None):
+            self.experts = routed_experts
+
+    class FakeLayer(nn.Module):
+        def __init__(self, routed_experts=None):
+            super().__init__()
+            self.block_sparse_moe = FakeMoE(routed_experts)
+            self.self_attn = FakeSelfAttn()
+
+    class FakeInnerModel(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.layers = nn.ModuleList([
+                FakeLayer(routed_experts),
+                FakeLayer(),
+                FakeLayer(),
+            ])
+
+    class FakeConfig:
+        num_hidden_layers = 2
+        num_mtp_modules = 1
+
+    class FakeMiniMaxM2(minimax_m2.MiniMaxM2ForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = FakeConfig()
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            if name == names[3]:
+                return torch.tensor([[5.0]])
+            return torch.ones(1)
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    model = FakeMiniMaxM2()
+    source = FakeSource(catalog)
+
+    plan = model.build_weight_plan(catalog)
+    auto_entries = {
+        entry.checkpoint_name: entry for entry in plan.auto_plan.entries
+    }
+    assert auto_entries[names[2]].required is False
+    assert auto_entries[names[3]].target_name == (
+        "model.layers.0.self_attn.qkv_proj.weight"
+    )
+    assert auto_entries[names[3]].shard_id == "q"
+    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+
+    loaded = model.load_weights_from_source(source, plan)
+
+    assert source.reads == [names[3], names[0]]
+    assert source.skips == [
+        (names[2], "weight plan marked not required"),
+        (names[1], "non-local routed expert"),
+    ]
+    assert "model.layers.0.self_attn.qkv_proj.weight" in loaded
+    assert "model.layers.0.block_sparse_moe.experts.w13_weight" in loaded
+    assert model.model.layers[0].self_attn.qkv_calls[0]["shard_id"] == "q"
+    assert model.routed_experts.calls[0]["expert_id"] == 0
+    assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
 
 def test_chatglm_build_weight_plan_replays_transformer_child_mapper(tmp_path):
@@ -3053,7 +3177,6 @@ def test_arctic_load_weights_from_source_places_expert_slices():
         (mamba.MambaForCausalLM, mamba),
         (mamba2.Mamba2ForCausalLM, mamba2),
         (hrm_text.HrmTextForCausalLM, hrm_text),
-        (minimax_m2.MiniMaxM2ForCausalLM, minimax_m2),
         (chatglm.ChatGLMForCausalLM, chatglm),
         (nemotron_nas.DeciLMForCausalLM, nemotron_nas),
         (mistral3.Mistral3ForConditionalGeneration, mistral3),
@@ -3076,6 +3199,32 @@ def test_more_dense_load_weights_from_source_delegates_to_executor(
     plan = WeightPlan(())
 
     loaded = model_cls.load_weights_from_source(model, source, plan)
+
+    assert loaded == {"loaded"}
+    assert calls == [(model, source, plan)]
+
+
+def test_minimax_m2_load_weights_from_source_delegates_to_moe_executor(monkeypatch):
+    calls = []
+
+    def fake_load(model, source, plan):
+        calls.append((model, source, plan))
+        return {"loaded"}
+
+    monkeypatch.setattr(
+        minimax_m2,
+        "load_minimax_m2_moe_weights_from_source",
+        fake_load,
+    )
+    model = object()
+    source = object()
+    plan = object()
+
+    loaded = minimax_m2.MiniMaxM2ForCausalLM.load_weights_from_source(
+        model,
+        source,
+        plan,
+    )
 
     assert loaded == {"loaded"}
     assert calls == [(model, source, plan)]

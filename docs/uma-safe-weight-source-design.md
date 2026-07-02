@@ -459,7 +459,7 @@ Status: started with `Qwen2ForCausalLM`, `Qwen3ForCausalLM`,
 `ExaoneForCausalLM`, `CohereForCausalLM`, `TeleChat2ForCausalLM`,
 `FalconH1ForCausalLM`, `Zamba2ForCausalLM`, `OuroForCausalLM`,
 `MambaForCausalLM`, `Mamba2ForCausalLM`, `HrmTextForCausalLM`,
-`MiniMaxM2ForCausalLM`, `ChatGLMForCausalLM`, `DeciLMForCausalLM`,
+`ChatGLMForCausalLM`, `DeciLMForCausalLM`,
 `Mistral3ForConditionalGeneration`, `Glm4ForCausalLM`, and
 `AfmoeForCausalLM`.
 
@@ -489,8 +489,7 @@ Target behavior:
   assembling K and V staging tensors from alternating source head blocks before
   delegating to the existing qkv parameter loader
 - plan can replay nested AutoWeightsLoader behavior where it is explicit and
-  bounded; MiniMaxM2 maps `model.*` checkpoint names through its inner model
-  mapper and skips appended MTP layers before payload read
+  bounded
 - ChatGLM maps `transformer.*` checkpoint names through the transformer's child
   mapper before payload read, preserving the existing nested AutoWeightsLoader
   behavior without adding loader-side branches
@@ -676,6 +675,13 @@ Add model-side plans only where needed:
   - reuses the Qwen-family routed-MoE helper for language-model experts
   - preserves InternS1Pro's visual/language-model prefix remapping and visual
     skip when the tower is absent
+- MiniMaxM2 MoE
+  - initial hook implemented for `mlp.experts.<expert>.w{1,2,3}.*` tensors
+  - maps checkpoint `mlp.experts` names to the model-side
+    `block_sparse_moe.experts` FusedMoE placement path
+  - skips non-local routed experts before payload read
+  - preserves `model.*` checkpoint name replay through the inner qkv mapper and
+    appended MTP-layer skip before payload read
 
 Each model family should implement its own plan builder instead of adding
 loader-side conditionals.
@@ -686,7 +692,7 @@ Expected current behavior:
 
 | Model type | Base `uma_odirect_safetensors` | Direct plan path |
 | --- | --- | --- |
-| Dense safetensors | Should work if normal vLLM load works | Phase 3 hooks for Qwen2/Qwen3/Llama/Gemma/Gemma2/Gemma3/InternLM2/Phi/Starcoder2/Falcon/FalconH1/Mistral/GPTBigCode/OPT/BLOOM/GPT-J/MPT/Orion/Step1/Apertus/StableLM/Solar/GPT-NeoX/Persimmon/Granite/Jais2/EXAONE4/Plamo3/Arcee/SeedOss/HyperCLOVAX/LFM2/MiMo/OLMo/OLMo2/Nemotron/EXAONE/Cohere/TeleChat2/Zamba2/Ouro/Mamba/Mamba2/HrmText/MiniMaxM2/ChatGLM/DeciLM/Mistral3/GLM4/AFMoE-style AutoWeightsLoader models |
+| Dense safetensors | Should work if normal vLLM load works | Phase 3 hooks for Qwen2/Qwen3/Llama/Gemma/Gemma2/Gemma3/InternLM2/Phi/Starcoder2/Falcon/FalconH1/Mistral/GPTBigCode/OPT/BLOOM/GPT-J/MPT/Orion/Step1/Apertus/StableLM/Solar/GPT-NeoX/Persimmon/Granite/Jais2/EXAONE4/Plamo3/Arcee/SeedOss/HyperCLOVAX/LFM2/MiMo/OLMo/OLMo2/Nemotron/EXAONE/Cohere/TeleChat2/Zamba2/Ouro/Mamba/Mamba2/HrmText/ChatGLM/DeciLM/Mistral3/GLM4/AFMoE-style AutoWeightsLoader models |
 | Sharded dense safetensors | Should work if no duplicate names | Phase 3 |
 | Qwen2/Qwen3 / OLMoE / Cohere2 routed MoE | Base path should work if normal vLLM load works | Phase 4/5 model hook for `mlp.experts` gate/up/down tensors; loader-side direct path removed |
 | Mixtral / PhiMoE routed MoE | Base path should work if normal vLLM load works | Phase 5 initial model hook for `block_sparse_moe.experts` w1/w2/w3 tensors |
@@ -705,6 +711,7 @@ Expected current behavior:
 | Laguna MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts while preserving bias/shared-expert auto loads |
 | Kimi Linear MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for `block_sparse_moe` routed experts, spec-layer skip, and shared-expert stacking |
 | InternS1Pro MoE | Base path should work if normal vLLM load works | Phase 5 initial hook via Qwen-family helper with wrapper prefix mapping |
+| MiniMaxM2 MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for `mlp.experts` w1/w2/w3 tensors, non-local expert skip, inner qkv mapper replay, and MTP skip |
 | Other routed MoE | Base path should work if normal vLLM load works | Not yet implemented |
 | Non-safetensors | Not supported | Not supported |
 | Remote HF path | Not supported by UMA-safe loader | Not supported |
