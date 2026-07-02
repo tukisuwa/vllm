@@ -267,12 +267,50 @@ Status: current `uma_odirect_safetensors`.
 
 ### Phase 1: Extract TensorCatalog and WeightSource
 
-Refactor without behavioral change:
+Status: started on `uma-safe-weight-source`.
 
-- move `_TensorRecord` and `_read_records()` into a catalog object
-- move `_ODirectFile` orchestration into `ODirectSafetensorsWeightSource`
-- keep existing `get_weights_iterator()` implemented via
-  `source.read_full_cpu(name)`
+Implemented so far:
+
+- `TensorMeta` / `TensorCatalog`
+  - metadata-only safetensors catalog
+  - duplicate name, dtype, shape, range, and overlap validation
+  - lookup by name and stable file/offset ordering
+- `ODirectSafetensorsWeightSource`
+  - builds the catalog before payload reads
+  - exposes `source.catalog`
+  - keeps the compatibility full-tensor iterator
+- optional model hook dispatch:
+  - `build_weight_plan(catalog)`
+  - `load_weights_from_source(source, plan)`
+  - unsupported models still use `model.load_weights(iterator)`
+- `source.read_full_cpu(name)`
+  - uses the same O_DIRECT full-record read helper as the iterator path
+  - keeps allocation/read memory gates on the pull path
+- `source.read_slice_cpu(name, source_slices)`
+  - supports only row-major contiguous slices
+  - rejects stepped or non-contiguous slices instead of full-tensor fallback
+  - records only the requested payload bytes in source stats
+- source-level stats for model hook reads
+  - files opened
+  - tensors read/skipped
+  - direct reads/window reads
+  - bytes read/copied/payload
+  - gate/allocation/read timing
+- stable `source.stats_snapshot()` for tests and diagnostics
+- minimal `WeightPlanEntry`, `WeightPlan`, and `execute_weight_plan(...)`
+  - supports required/skipped entries
+  - supports full CPU reads and contiguous source slices
+  - routes tensors to a target parameter's `weight_loader`
+- tests for catalog lookup, source construction, full CPU reads, contiguous
+  slice reads, source stats, optional model hook dispatch, and basic plan
+  execution
+
+Remaining refactor without behavioral change:
+
+- move more `_ODirectFile` orchestration into `ODirectSafetensorsWeightSource`
+- add `source.read_into_cpu(...)` for destination-buffer reads
+- expand plan execution only where generic semantics are clear; model-specific
+  transforms should stay in model-side plan code
 
 Benefit:
 
@@ -281,6 +319,8 @@ Benefit:
 - creates a stable API for plan experiments
 
 ### Phase 2: Add optional model hook
+
+Status: initial hook and minimal generic executor implemented.
 
 In `UmaODirectSafetensorsModelLoader.load_weights()`:
 
@@ -295,10 +335,17 @@ else:
 
 Requirements:
 
-- must be opt-in
-- must log whether the model-source path or iterator path was used
+- must be opt-in: implemented
+- must log whether the model-source path or iterator path was used: implemented
 - must fail closed if the model requested source loading but the source cannot
-  provide a required operation
+  provide a required operation: implemented for missing paired hooks,
+  unsupported slices, missing targets, and missing `weight_loader`
+
+Remaining:
+
+- implement the first real model-side `build_weight_plan(...)`
+- decide where generic helpers should live once more than one model uses them
+- add broader tests around actual vLLM parameter loaders
 
 ### Phase 3: Dense model prototype
 

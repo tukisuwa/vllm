@@ -16,9 +16,14 @@ from vllm.model_executor.model_loader.uma_safetensors_loader import (
     UmaSafetensorsModelLoader,
 )
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
     UmaODirectSafetensorsModelLoader,
+    WeightPlan,
+    WeightPlanEntry,
     _Qwen35MoeDirectLoader,
     _TensorRecord,
+    execute_weight_plan,
 )
 
 
@@ -331,6 +336,368 @@ def test_uma_odirect_safetensors_allows_end_at_file_boundary(tmp_path):
     records = loader._read_records([str(path)])
     assert len(records) == 1
     assert records[0].name == "a"
+
+
+def test_uma_odirect_tensor_catalog_lookup(tmp_path):
+    metadata = {
+        "b": {"dtype": "F32", "shape": [1], "data_offsets": [4, 8]},
+        "a": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 8)
+
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    assert catalog.names() == ("a", "b")
+    assert catalog.has("a")
+    assert not catalog.has("missing")
+    assert catalog.get("a").offset < catalog.get("b").offset
+    assert catalog.total_bytes() == 8
+
+
+def test_uma_odirect_weight_source_builds_catalog_without_payload_read(
+    tmp_path, monkeypatch
+):
+    metadata = {"a": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 4)
+
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(load_format="uma_odirect_safetensors")
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
+    source = ODirectSafetensorsWeightSource(loader, str(tmp_path))
+
+    assert source.files == [str(path)]
+    assert source.catalog.names() == ("a",)
+    assert source.catalog.get("a").size == 4
+
+
+def test_uma_odirect_weight_source_read_full_cpu(tmp_path, monkeypatch):
+    metadata = {"a": {"dtype": "F32", "shape": [2], "data_offsets": [0, 8]}}
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 8)
+
+    class FakeODirectFile:
+        window_size = 64 * 1024 * 1024
+
+        def __init__(self, *_args):
+            self.direct_reads = 0
+            self.window_loads = 0
+            self.window_hits = 0
+            self.bytes_read = 0
+            self.bytes_copied = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback):
+            pass
+
+        def read_record_into_tensor(self, tensor, _offset, size, gate=None):
+            self.direct_reads += 1
+            self.bytes_read += size
+            self.bytes_copied += size
+            tensor.fill_(3)
+            if gate is not None:
+                gate(size)
+
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(load_format="uma_odirect_safetensors")
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.uma_odirect_safetensors_loader."
+        "_ODirectFile",
+        FakeODirectFile,
+    )
+
+    source = ODirectSafetensorsWeightSource(loader, str(tmp_path))
+    tensor = source.read_full_cpu("a")
+
+    assert tensor.device.type == "cpu"
+    assert tensor.dtype == torch.float32
+    assert tensor.tolist() == [3.0, 3.0]
+    stats = source.stats_snapshot()
+    assert stats["files_opened"] == 1
+    assert stats["tensors_read"] == 1
+    assert stats["bytes_read"] == 8
+    assert stats["bytes_copied"] == 8
+    assert stats["bytes_tensor_payload"] == 8
+
+
+def test_uma_odirect_weight_source_read_contiguous_slice_cpu(tmp_path, monkeypatch):
+    metadata = {"a": {"dtype": "F32", "shape": [4, 3], "data_offsets": [0, 48]}}
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 48)
+    calls = []
+
+    class FakeODirectFile:
+        window_size = 64 * 1024 * 1024
+
+        def __init__(self, *_args):
+            self.direct_reads = 0
+            self.window_loads = 0
+            self.window_hits = 0
+            self.bytes_read = 0
+            self.bytes_copied = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback):
+            pass
+
+        def read_record_into_tensor(self, tensor, offset, size, gate=None):
+            calls.append((offset, size, tuple(tensor.shape)))
+            self.direct_reads += 1
+            self.bytes_read += size
+            self.bytes_copied += size
+            tensor.fill_(7)
+            if gate is not None:
+                gate(size)
+
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(load_format="uma_odirect_safetensors")
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.uma_odirect_safetensors_loader."
+        "_ODirectFile",
+        FakeODirectFile,
+    )
+
+    source = ODirectSafetensorsWeightSource(loader, str(tmp_path))
+    tensor = source.read_slice_cpu("a", (slice(1, 3), slice(None)))
+
+    record = source.catalog.get("a")
+    assert calls == [(record.offset + 12, 24, (2, 3))]
+    assert tensor.tolist() == [[7.0, 7.0, 7.0], [7.0, 7.0, 7.0]]
+    assert source.stats_snapshot()["bytes_tensor_payload"] == 24
+
+
+def test_uma_odirect_weight_source_rejects_noncontiguous_slice(tmp_path, monkeypatch):
+    metadata = {"a": {"dtype": "F32", "shape": [4, 3], "data_offsets": [0, 48]}}
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 48)
+
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(load_format="uma_odirect_safetensors")
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
+    source = ODirectSafetensorsWeightSource(loader, str(tmp_path))
+
+    with pytest.raises(ValueError, match="not contiguous"):
+        source.read_slice_cpu("a", (slice(None), slice(1, 3)))
+
+
+def test_uma_odirect_weight_source_rejects_stepped_slice(tmp_path, monkeypatch):
+    metadata = {"a": {"dtype": "F32", "shape": [4], "data_offsets": [0, 16]}}
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 16)
+
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(load_format="uma_odirect_safetensors")
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
+    source = ODirectSafetensorsWeightSource(loader, str(tmp_path))
+
+    with pytest.raises(ValueError, match="step=1"):
+        source.read_slice_cpu("a", (slice(None, None, 2),))
+
+
+def test_uma_odirect_load_weights_uses_model_source_hook(tmp_path, monkeypatch):
+    metadata = {"a": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 4)
+
+    class FakeODirectFile:
+        window_size = 64 * 1024 * 1024
+
+        def __init__(self, *_args):
+            self.direct_reads = 0
+            self.window_loads = 0
+            self.window_hits = 0
+            self.bytes_read = 0
+            self.bytes_copied = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback):
+            pass
+
+        def read_record_into_tensor(self, tensor, _offset, size, gate=None):
+            self.direct_reads += 1
+            self.bytes_read += size
+            self.bytes_copied += size
+            tensor.fill_(5)
+            if gate is not None:
+                gate(size)
+
+    class FakeModel:
+        def __init__(self):
+            self.plan_names = ()
+            self.loaded = None
+
+        def build_weight_plan(self, catalog):
+            self.plan_names = catalog.names()
+            return ["a"]
+
+        def load_weights_from_source(self, source, plan):
+            assert plan == ["a"]
+            self.loaded = source.read_full_cpu("a")
+
+        def load_weights(self, _weights):
+            raise AssertionError("compatibility iterator path should not be used")
+
+    class FakeModelConfig:
+        model = str(tmp_path)
+        model_weights = None
+
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(load_format="uma_odirect_safetensors")
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.uma_odirect_safetensors_loader."
+        "_ODirectFile",
+        FakeODirectFile,
+    )
+
+    model = FakeModel()
+    loader.load_weights(model, FakeModelConfig())
+
+    assert model.plan_names == ("a",)
+    assert model.loaded is not None
+    assert model.loaded.tolist() == [5.0]
+
+
+def test_uma_odirect_execute_weight_plan_reads_full_and_slice(tmp_path, monkeypatch):
+    metadata = {
+        "full": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "rows": {"dtype": "F32", "shape": [4, 2], "data_offsets": [4, 36]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 36)
+    calls = []
+
+    class FakeODirectFile:
+        window_size = 64 * 1024 * 1024
+
+        def __init__(self, *_args):
+            self.direct_reads = 0
+            self.window_loads = 0
+            self.window_hits = 0
+            self.bytes_read = 0
+            self.bytes_copied = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback):
+            pass
+
+        def read_record_into_tensor(self, tensor, offset, size, gate=None):
+            calls.append((offset, size, tuple(tensor.shape)))
+            self.direct_reads += 1
+            self.bytes_read += size
+            self.bytes_copied += size
+            tensor.fill_(len(calls))
+            if gate is not None:
+                gate(size)
+
+    class FakeParam:
+        def __init__(self):
+            self.loaded = []
+
+        def weight_loader(self, param, tensor, **kwargs):
+            assert param is self
+            self.loaded.append((tensor.clone(), kwargs))
+
+    class FakeModel:
+        def __init__(self):
+            self.full_param = FakeParam()
+            self.slice_param = FakeParam()
+
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(load_format="uma_odirect_safetensors")
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.uma_odirect_safetensors_loader."
+        "_ODirectFile",
+        FakeODirectFile,
+    )
+    source = ODirectSafetensorsWeightSource(loader, str(tmp_path))
+    model = FakeModel()
+    plan = WeightPlan(
+        (
+            WeightPlanEntry("full", "full_param"),
+            WeightPlanEntry(
+                "rows",
+                "slice_param",
+                source_slices=(slice(1, 3), slice(None)),
+                shard_id="rows",
+            ),
+        )
+    )
+
+    loaded = execute_weight_plan(model, source, plan)
+
+    rows_record = source.catalog.get("rows")
+    assert loaded == {"full_param", "slice_param"}
+    assert calls == [
+        (source.catalog.get("full").offset, 4, (1,)),
+        (rows_record.offset + 8, 16, (2, 2)),
+    ]
+    assert model.full_param.loaded[0][0].tolist() == [1.0]
+    assert model.slice_param.loaded[0][0].tolist() == [[2.0, 2.0], [2.0, 2.0]]
+    assert model.slice_param.loaded[0][1] == {"shard_id": "rows"}
+
+
+def test_uma_odirect_execute_weight_plan_skips_not_required(tmp_path, monkeypatch):
+    metadata = {"a": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 4)
+
+    class FakeModel:
+        pass
+
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(load_format="uma_odirect_safetensors")
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
+    source = ODirectSafetensorsWeightSource(loader, str(tmp_path))
+    plan = WeightPlan((WeightPlanEntry("a", "missing", required=False),))
+
+    assert execute_weight_plan(FakeModel(), source, plan) == set()
+    assert source.stats_snapshot()["tensors_skipped"] == 1
+
+
+def test_uma_odirect_model_source_hook_requires_both_methods(tmp_path, monkeypatch):
+    metadata = {"a": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 4)
+
+    class IncompleteFakeModel:
+        def build_weight_plan(self, _catalog):
+            return []
+
+    class FakeModelConfig:
+        model = str(tmp_path)
+        model_weights = None
+
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(load_format="uma_odirect_safetensors")
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
+
+    with pytest.raises(RuntimeError, match="must implement both"):
+        loader.load_weights(IncompleteFakeModel(), FakeModelConfig())
 
 
 def test_uma_odirect_safetensors_accepts_generic_direct_moe_flag():

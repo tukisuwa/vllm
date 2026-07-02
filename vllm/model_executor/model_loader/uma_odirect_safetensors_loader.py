@@ -120,14 +120,472 @@ def _tensor_nbytes(shape: list[int], dtype: torch.dtype) -> int:
     return elements * _DTYPE_NBYTES[dtype]
 
 
+def _row_major_strides(shape: list[int]) -> list[int]:
+    strides: list[int] = []
+    current = 1
+    for dim in reversed(shape):
+        strides.append(current)
+        current *= dim
+    return list(reversed(strides))
+
+
+def _normalize_slice_selection(
+    shape: list[int],
+    selection: tuple[slice | int, ...],
+) -> tuple[int, int, list[int]]:
+    """Return byte-independent element offset/count/shape for a contiguous slice.
+
+    Only selections representable as one contiguous row-major range are accepted.
+    This is deliberately conservative: unsupported slices fail closed instead of
+    reading a full tensor and slicing it in CPU RAM.
+    """
+
+    if len(selection) != len(shape):
+        raise ValueError(
+            f"Slice rank mismatch: got {len(selection)} indices for shape {shape}"
+        )
+
+    strides = _row_major_strides(shape)
+    first_offset = 0
+    last_offset = 0
+    output_shape: list[int] = []
+    selected_elements = 1
+
+    for dim, stride, item in zip(shape, strides, selection):
+        if isinstance(item, bool):
+            raise ValueError(f"Boolean indices are not supported: {selection!r}")
+        if isinstance(item, int):
+            index = item + dim if item < 0 else item
+            if index < 0 or index >= dim:
+                raise IndexError(
+                    f"Index {item} is out of bounds for dimension of size {dim}"
+                )
+            first_offset += index * stride
+            last_offset += index * stride
+            continue
+        if not isinstance(item, slice):
+            raise TypeError(f"Unsupported slice item {item!r}")
+        if item.step not in (None, 1):
+            raise ValueError(f"Only contiguous step=1 slices are supported: {item!r}")
+        start, stop, _step = item.indices(dim)
+        length = max(0, stop - start)
+        output_shape.append(length)
+        selected_elements *= length
+        if length == 0:
+            continue
+        first_offset += start * stride
+        last_offset += (stop - 1) * stride
+
+    if selected_elements == 0:
+        return first_offset, 0, output_shape
+
+    span_elements = last_offset - first_offset + 1
+    if span_elements != selected_elements:
+        raise ValueError(
+            "Slice is not contiguous in row-major storage and would require "
+            f"multiple reads: shape={shape}, selection={selection!r}"
+        )
+    return first_offset, selected_elements, output_shape
+
+
 @dataclass(frozen=True)
-class _TensorRecord:
+class TensorMeta:
+    """Metadata-only view of one safetensors tensor payload.
+
+    The UMA-safe loader should make skip/slice/placement decisions from this
+    catalog before it reads payload bytes.  Keep the fields intentionally close
+    to the existing loader internals while the current iterator path is still
+    supported.
+    """
+
     file_path: str
     name: str
     dtype: torch.dtype
     shape: list[int]
     offset: int
     size: int
+
+
+_TensorRecord = TensorMeta
+
+
+@dataclass(frozen=True)
+class WeightPlanEntry:
+    checkpoint_name: str
+    target_name: str
+    required: bool = True
+    source_slices: tuple[slice | int, ...] | None = None
+    shard_id: str | int | None = None
+    expert_id: int | None = None
+    weight_name: str | None = None
+
+
+@dataclass(frozen=True)
+class WeightPlan:
+    entries: tuple[WeightPlanEntry, ...]
+
+    def __iter__(self):
+        return iter(self.entries)
+
+
+def _resolve_attr(root: object, path: str) -> object:
+    current = root
+    for part in path.split("."):
+        if not hasattr(current, part):
+            raise RuntimeError(f"Cannot resolve weight plan target {path!r}")
+        current = getattr(current, part)
+    return current
+
+
+def execute_weight_plan(
+    model: nn.Module,
+    source: "ODirectSafetensorsWeightSource",
+    plan: WeightPlan,
+) -> set[str]:
+    """Execute a simple model-side WeightPlan with UMA-safe source reads."""
+
+    loaded: set[str] = set()
+    for entry in plan:
+        if not entry.required:
+            source.skip(entry.checkpoint_name, "weight plan marked not required")
+            continue
+
+        if entry.source_slices is None:
+            tensor = source.read_full_cpu(entry.checkpoint_name)
+        else:
+            tensor = source.read_slice_cpu(entry.checkpoint_name, entry.source_slices)
+
+        param = _resolve_attr(model, entry.target_name)
+        weight_loader = getattr(param, "weight_loader", None)
+        if not callable(weight_loader):
+            raise RuntimeError(
+                f"Weight plan target {entry.target_name!r} has no weight_loader"
+            )
+
+        kwargs = {}
+        if entry.shard_id is not None:
+            kwargs["shard_id"] = entry.shard_id
+        if entry.expert_id is not None:
+            kwargs["expert_id"] = entry.expert_id
+        if entry.weight_name is not None:
+            kwargs["weight_name"] = entry.weight_name
+        weight_loader(param, tensor, **kwargs)
+        loaded.add(entry.target_name)
+    return loaded
+
+
+class TensorCatalog:
+    """Validated, metadata-only catalog of safetensors records."""
+
+    def __init__(self, records: list[TensorMeta]) -> None:
+        self._records = tuple(records)
+        self._by_name = {record.name: record for record in records}
+        if len(self._by_name) != len(records):
+            raise RuntimeError("Duplicate tensor names in TensorCatalog")
+
+    @classmethod
+    def from_safetensors_files(
+        cls,
+        files: list[str],
+        *,
+        metadata_limit_bytes: int,
+    ) -> "TensorCatalog":
+        records: list[TensorMeta] = []
+        seen_names: dict[str, str] = {}
+        for path in files:
+            file_size = os.path.getsize(path)
+            with open(path, "rb", buffering=0) as f:
+                raw_size = f.read(8)
+                if len(raw_size) != 8:
+                    raise RuntimeError(f"Invalid safetensors header in {path}")
+                metadata_size = int.from_bytes(raw_size, "little")
+                if metadata_size > metadata_limit_bytes:
+                    raise RuntimeError(
+                        f"Safetensors metadata too large in {path}: "
+                        f"{metadata_size} bytes > {metadata_limit_bytes} bytes"
+                    )
+                if metadata_size > file_size - 8:
+                    raise RuntimeError(
+                        f"Invalid safetensors metadata size in {path}: "
+                        f"{metadata_size} bytes exceeds file payload"
+                    )
+                metadata_raw = f.read(metadata_size)
+                if len(metadata_raw) != metadata_size:
+                    raise RuntimeError(f"Short safetensors metadata read in {path}")
+            metadata = json.loads(metadata_raw)
+            data_start = 8 + metadata_size
+            file_ranges: list[tuple[int, int, str]] = []
+            for name, info in metadata.items():
+                if name == "__metadata__":
+                    continue
+                if name in seen_names:
+                    raise RuntimeError(
+                        f"Duplicate safetensors tensor name {name!r}: "
+                        f"{seen_names[name]} and {path}"
+                    )
+                seen_names[name] = path
+                if not isinstance(info, dict):
+                    raise RuntimeError(f"Invalid safetensors metadata for {name}")
+                try:
+                    dtype_name = info["dtype"]
+                    data_offsets = info["data_offsets"]
+                    shape_raw = info["shape"]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"Missing safetensors metadata key {exc.args[0]!r} for {name}"
+                    ) from exc
+                if dtype_name not in _DTYPE_MAP:
+                    raise RuntimeError(
+                        f"Unsupported safetensors dtype {dtype_name!r} for {name}"
+                    )
+                dtype = _DTYPE_MAP[dtype_name]
+                if not isinstance(data_offsets, list) or len(data_offsets) != 2:
+                    raise RuntimeError(
+                        f"Invalid safetensors data_offsets for {name}: "
+                        f"{data_offsets!r}"
+                    )
+                if not isinstance(shape_raw, list):
+                    raise RuntimeError(
+                        f"Invalid safetensors shape for {name}: {shape_raw!r}"
+                    )
+                start, end = data_offsets
+                shape = list(shape_raw)
+                if (
+                    not isinstance(start, int)
+                    or not isinstance(end, int)
+                    or start < 0
+                    or end < start
+                    or data_start + end > file_size
+                ):
+                    raise RuntimeError(
+                        f"Invalid safetensors byte range for {name}: "
+                        f"start={start}, end={end}, file_size={file_size}, "
+                        f"data_start={data_start}"
+                    )
+                if not all(isinstance(dim, int) and dim >= 0 for dim in shape):
+                    raise RuntimeError(f"Invalid safetensors shape for {name}: {shape}")
+                size = end - start
+                expected_size = _tensor_nbytes(shape, dtype)
+                if expected_size != size:
+                    raise RuntimeError(
+                        f"Tensor size mismatch for {name}: metadata has {size} "
+                        f"bytes, shape/dtype imply {expected_size} bytes"
+                    )
+                file_ranges.append((start, end, name))
+                records.append(
+                    TensorMeta(
+                        file_path=path,
+                        name=name,
+                        dtype=dtype,
+                        shape=shape,
+                        offset=data_start + start,
+                        size=size,
+                    )
+                )
+            file_ranges.sort(key=lambda item: item[0])
+            previous_end = 0
+            previous_name = ""
+            for start, _end, name in file_ranges:
+                if start < previous_end:
+                    raise RuntimeError(
+                        f"Overlapping safetensors data ranges in {path}: "
+                        f"{previous_name} ends at {previous_end}, {name} starts at {start}"
+                    )
+                previous_end = _end
+                previous_name = name
+        records.sort(key=lambda r: (r.file_path, r.offset))
+        return cls(records)
+
+    def records(self) -> tuple[TensorMeta, ...]:
+        return self._records
+
+    def names(self) -> tuple[str, ...]:
+        return tuple(record.name for record in self._records)
+
+    def has(self, name: str) -> bool:
+        return name in self._by_name
+
+    def get(self, name: str) -> TensorMeta:
+        return self._by_name[name]
+
+    def total_bytes(self) -> int:
+        return sum(record.size for record in self._records)
+
+
+@dataclass
+class _SourceReadStats:
+    files_opened: int = 0
+    tensors_read: int = 0
+    tensors_skipped: int = 0
+    direct_reads: int = 0
+    window_loads: int = 0
+    window_hits: int = 0
+    bytes_read: int = 0
+    bytes_copied: int = 0
+    bytes_tensor_payload: int = 0
+    time_gate: float = 0.0
+    time_alloc: float = 0.0
+    time_read: float = 0.0
+
+    def collect_file(self, file: "_ODirectFile") -> None:
+        self.direct_reads += getattr(file, "direct_reads", 0)
+        self.window_loads += getattr(file, "window_loads", 0)
+        self.window_hits += getattr(file, "window_hits", 0)
+        self.bytes_read += getattr(file, "bytes_read", 0)
+        self.bytes_copied += getattr(file, "bytes_copied", 0)
+
+    def log(self, label: str) -> None:
+        logger.info(
+            "uma_odirect_safetensors source stats (%s): files_opened=%d "
+            "tensors_read=%d tensors_skipped=%d direct_reads=%d "
+            "window_loads=%d window_hits=%d bytes_read=%s bytes_copied=%s "
+            "tensor_payload=%s",
+            label,
+            self.files_opened,
+            self.tensors_read,
+            self.tensors_skipped,
+            self.direct_reads,
+            self.window_loads,
+            self.window_hits,
+            _format_gib(self.bytes_read),
+            _format_gib(self.bytes_copied),
+            _format_gib(self.bytes_tensor_payload),
+        )
+        logger.info(
+            "uma_odirect_safetensors source timings (%s): gate=%.3fs "
+            "alloc=%.3fs read_copy=%.3fs",
+            label,
+            self.time_gate,
+            self.time_alloc,
+            self.time_read,
+        )
+
+    def snapshot(self) -> dict[str, int | float]:
+        return {
+            "files_opened": self.files_opened,
+            "tensors_read": self.tensors_read,
+            "tensors_skipped": self.tensors_skipped,
+            "direct_reads": self.direct_reads,
+            "window_loads": self.window_loads,
+            "window_hits": self.window_hits,
+            "bytes_read": self.bytes_read,
+            "bytes_copied": self.bytes_copied,
+            "bytes_tensor_payload": self.bytes_tensor_payload,
+            "time_gate": self.time_gate,
+            "time_alloc": self.time_alloc,
+            "time_read": self.time_read,
+        }
+
+
+class ODirectSafetensorsWeightSource:
+    """Pull-oriented source for UMA-safe safetensors loading.
+
+    Phase 1 keeps the existing full-tensor iterator behavior, but exposes a
+    catalog-first object so model-side plans can inspect metadata before any
+    payload bytes are read.
+    """
+
+    def __init__(
+        self,
+        loader: "UmaODirectSafetensorsModelLoader",
+        model_or_path: str,
+    ) -> None:
+        self._loader = loader
+        loader._gate_memory("preflight")
+        self.files = loader._prepare_files(model_or_path)
+        self.catalog = loader._build_catalog(self.files)
+        self._stats = _SourceReadStats()
+        self._bytes_since_gate = 0
+
+    def iter_full_tensors(
+        self,
+        direct_consumer: Callable[[TensorMeta, torch.Tensor], bool] | None = None,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        yield from self._loader._iter_records(
+            self.files,
+            self.catalog,
+            direct_consumer=direct_consumer,
+        )
+
+    def read_full_cpu(self, name: str) -> torch.Tensor:
+        record = self.catalog.get(name)
+        return self._read_record_cpu(record)
+
+    def read_slice_cpu(
+        self,
+        name: str,
+        source_slices: tuple[slice | int, ...],
+    ) -> torch.Tensor:
+        record = self.catalog.get(name)
+        element_offset, element_count, output_shape = _normalize_slice_selection(
+            record.shape,
+            source_slices,
+        )
+        element_size = _DTYPE_NBYTES[record.dtype]
+        slice_record = TensorMeta(
+            file_path=record.file_path,
+            name=f"{record.name}[slice]",
+            dtype=record.dtype,
+            shape=output_shape,
+            offset=record.offset + element_offset * element_size,
+            size=element_count * element_size,
+        )
+        return self._read_record_cpu(slice_record)
+
+    def _read_record_cpu(self, record: TensorMeta) -> torch.Tensor:
+        self._maybe_gate(f"before reading {record.name}", force=True)
+        with _ODirectFile(
+            record.file_path,
+            self._loader._chunk_size,
+            self._loader._alignment,
+            self._loader._window_size,
+        ) as odirect_file:
+            self._stats.files_opened += 1
+            tensor, time_alloc, time_read = self._loader._read_record_tensor(
+                record,
+                odirect_file,
+                self._note_loaded_bytes,
+                gate_memory=lambda reason: self._maybe_gate(reason, force=True),
+            )
+            self._stats.collect_file(odirect_file)
+        self._stats.tensors_read += 1
+        self._stats.bytes_tensor_payload += record.size
+        self._stats.time_alloc += time_alloc
+        self._stats.time_read += time_read
+        self._maybe_gate(f"after reading {record.name}", force=True)
+        return tensor
+
+    def skip(self, name: str, reason: str) -> None:
+        record = self.catalog.get(name)
+        self._stats.tensors_skipped += 1
+        logger.debug(
+            "uma_odirect_safetensors skipping tensor %s bytes=%s reason=%s",
+            name,
+            _format_gib(record.size),
+            reason,
+        )
+
+    def log_stats(self, label: str) -> None:
+        self._stats.log(label)
+
+    def stats_snapshot(self) -> dict[str, int | float]:
+        return self._stats.snapshot()
+
+    def _maybe_gate(self, reason: str, force: bool = False) -> None:
+        if (
+            not force
+            and self._loader._gate_interval_bytes > 0
+            and self._bytes_since_gate < self._loader._gate_interval_bytes
+        ):
+            return
+        t0 = time.perf_counter()
+        self._loader._gate_memory(reason)
+        self._stats.time_gate += time.perf_counter() - t0
+        self._bytes_since_gate = 0
+
+    def _note_loaded_bytes(self, nbytes: int) -> None:
+        self._bytes_since_gate += nbytes
+        self._maybe_gate(f"after {self._bytes_since_gate} loaded bytes")
 
 
 class _ConsumerProfile:
@@ -731,123 +1189,91 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
         return files
 
     def _read_records(self, files: list[str]) -> list[_TensorRecord]:
-        records: list[_TensorRecord] = []
-        seen_names: dict[str, str] = {}
-        for path in files:
-            file_size = os.path.getsize(path)
-            with open(path, "rb", buffering=0) as f:
-                raw_size = f.read(8)
-                if len(raw_size) != 8:
-                    raise RuntimeError(f"Invalid safetensors header in {path}")
-                metadata_size = int.from_bytes(raw_size, "little")
-                if metadata_size > self._metadata_limit_bytes:
-                    raise RuntimeError(
-                        f"Safetensors metadata too large in {path}: "
-                        f"{metadata_size} bytes > {self._metadata_limit_bytes} bytes"
-                    )
-                if metadata_size > file_size - 8:
-                    raise RuntimeError(
-                        f"Invalid safetensors metadata size in {path}: "
-                        f"{metadata_size} bytes exceeds file payload"
-                    )
-                metadata_raw = f.read(metadata_size)
-                if len(metadata_raw) != metadata_size:
-                    raise RuntimeError(f"Short safetensors metadata read in {path}")
-            metadata = json.loads(metadata_raw)
-            data_start = 8 + metadata_size
-            file_ranges: list[tuple[int, int, str]] = []
-            for name, info in metadata.items():
-                if name == "__metadata__":
-                    continue
-                if name in seen_names:
-                    raise RuntimeError(
-                        f"Duplicate safetensors tensor name {name!r}: "
-                        f"{seen_names[name]} and {path}"
-                    )
-                seen_names[name] = path
-                if not isinstance(info, dict):
-                    raise RuntimeError(f"Invalid safetensors metadata for {name}")
-                try:
-                    dtype_name = info["dtype"]
-                    data_offsets = info["data_offsets"]
-                    shape_raw = info["shape"]
-                except KeyError as exc:
-                    raise RuntimeError(
-                        f"Missing safetensors metadata key {exc.args[0]!r} for {name}"
-                    ) from exc
-                if dtype_name not in _DTYPE_MAP:
-                    raise RuntimeError(
-                        f"Unsupported safetensors dtype {dtype_name!r} for {name}"
-                    )
-                dtype = _DTYPE_MAP[dtype_name]
-                if (
-                    not isinstance(data_offsets, list)
-                    or len(data_offsets) != 2
-                ):
-                    raise RuntimeError(
-                        f"Invalid safetensors data_offsets for {name}: {data_offsets!r}"
-                    )
-                if not isinstance(shape_raw, list):
-                    raise RuntimeError(
-                        f"Invalid safetensors shape for {name}: {shape_raw!r}"
-                    )
-                start, end = data_offsets
-                shape = list(shape_raw)
-                if (
-                    not isinstance(start, int)
-                    or not isinstance(end, int)
-                    or start < 0
-                    or end < start
-                    or data_start + end > file_size
-                ):
-                    raise RuntimeError(
-                        f"Invalid safetensors byte range for {name}: "
-                        f"start={start}, end={end}, file_size={file_size}, "
-                        f"data_start={data_start}"
-                    )
-                if not all(isinstance(dim, int) and dim >= 0 for dim in shape):
-                    raise RuntimeError(f"Invalid safetensors shape for {name}: {shape}")
-                size = end - start
-                expected_size = _tensor_nbytes(shape, dtype)
-                if expected_size != size:
-                    raise RuntimeError(
-                        f"Tensor size mismatch for {name}: metadata has {size} "
-                        f"bytes, shape/dtype imply {expected_size} bytes"
-                    )
-                file_ranges.append((start, end, name))
-                records.append(
-                    _TensorRecord(
-                        file_path=path,
-                        name=name,
-                        dtype=dtype,
-                        shape=shape,
-                        offset=data_start + start,
-                        size=size,
-                    )
-                )
-            file_ranges.sort(key=lambda item: item[0])
-            previous_end = 0
-            previous_name = ""
-            for start, _end, name in file_ranges:
-                if start < previous_end:
-                    raise RuntimeError(
-                        f"Overlapping safetensors data ranges in {path}: "
-                        f"{previous_name} ends at {previous_end}, {name} starts at {start}"
-                    )
-                previous_end = _end
-                previous_name = name
-        records.sort(key=lambda r: (r.file_path, r.offset))
-        return records
+        return list(self._build_catalog(files).records())
+
+    def _build_catalog(self, files: list[str]) -> TensorCatalog:
+        return TensorCatalog.from_safetensors_files(
+            files,
+            metadata_limit_bytes=self._metadata_limit_bytes,
+        )
 
     def _get_weights_iterator(
         self,
         model_or_path: str,
         direct_consumer: Callable[[_TensorRecord, torch.Tensor], bool] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        self._gate_memory("preflight")
-        files = self._prepare_files(model_or_path)
-        records = self._read_records(files)
-        total_bytes = sum(record.size for record in records)
+        source = ODirectSafetensorsWeightSource(self, model_or_path)
+        yield from source.iter_full_tensors(direct_consumer=direct_consumer)
+
+    def _read_record_tensor(
+        self,
+        record: TensorMeta,
+        odirect_file: _ODirectFile,
+        note_loaded_bytes: Callable[[int], None],
+        gate_memory: Callable[[str], None] | None = None,
+    ) -> tuple[torch.Tensor, float, float]:
+        gate_memory = gate_memory or self._gate_memory
+        force_allocation_gate = record.size >= self._allocation_gate_min_bytes
+        if force_allocation_gate:
+            gate_memory(f"before allocating {record.name}")
+        t0 = time.perf_counter()
+        tensor = torch.empty(record.shape, dtype=record.dtype, device="cpu")
+        time_alloc = time.perf_counter() - t0
+        if force_allocation_gate:
+            gate_memory(f"after allocating {record.name}")
+
+        t0 = time.perf_counter()
+        odirect_file.read_record_into_tensor(
+            tensor,
+            record.offset,
+            record.size,
+            gate=(
+                note_loaded_bytes
+                if record.size > odirect_file.window_size
+                else None
+            ),
+        )
+        time_read = time.perf_counter() - t0
+        if record.size <= odirect_file.window_size:
+            note_loaded_bytes(record.size)
+        return tensor, time_alloc, time_read
+
+    def _read_record_full_cpu(self, record: TensorMeta) -> torch.Tensor:
+        bytes_since_gate = 0
+
+        def note_loaded_bytes(nbytes: int) -> None:
+            nonlocal bytes_since_gate
+            bytes_since_gate += nbytes
+            if (
+                self._gate_interval_bytes > 0
+                and bytes_since_gate >= self._gate_interval_bytes
+            ):
+                self._gate_memory(f"after {bytes_since_gate} loaded bytes")
+                bytes_since_gate = 0
+
+        self._gate_memory(f"before reading {record.name}")
+        with _ODirectFile(
+            record.file_path,
+            self._chunk_size,
+            self._alignment,
+            self._window_size,
+        ) as odirect_file:
+            tensor, _time_alloc, _time_read = self._read_record_tensor(
+                record,
+                odirect_file,
+                note_loaded_bytes,
+            )
+        self._gate_memory(f"after reading {record.name}")
+        return tensor
+
+    def _iter_records(
+        self,
+        files: list[str],
+        catalog: TensorCatalog,
+        direct_consumer: Callable[[TensorMeta, torch.Tensor], bool] | None = None,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        records = catalog.records()
+        total_bytes = catalog.total_bytes()
         logger.info(
             "uma_odirect_safetensors using O_DIRECT: files=%d tensors=%d "
             "total=%s chunk_size=%d window_size=%d alignment=%d",
@@ -920,34 +1346,15 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
                     )
                     files_opened += 1
 
-                force_allocation_gate = record.size >= self._allocation_gate_min_bytes
-                maybe_gate(
-                    f"before allocating {record.name}",
-                    force=force_allocation_gate,
-                )
-                t0 = time.perf_counter()
-                tensor = torch.empty(record.shape, dtype=record.dtype, device="cpu")
-                time_alloc += time.perf_counter() - t0
-                maybe_gate(
-                    f"after allocating {record.name}",
-                    force=force_allocation_gate,
-                )
-
                 assert odirect_file is not None
-                t0 = time.perf_counter()
-                odirect_file.read_record_into_tensor(
-                    tensor,
-                    record.offset,
-                    record.size,
-                    gate=(
-                        note_loaded_bytes
-                        if record.size > odirect_file.window_size
-                        else None
-                    ),
+                tensor, elapsed_alloc, elapsed_read = self._read_record_tensor(
+                    record,
+                    odirect_file,
+                    note_loaded_bytes,
+                    gate_memory=lambda reason: maybe_gate(reason, force=True),
                 )
-                time_read += time.perf_counter() - t0
-                if record.size <= odirect_file.window_size:
-                    note_loaded_bytes(record.size)
+                time_alloc += elapsed_alloc
+                time_read += elapsed_read
 
                 t0 = time.perf_counter()
                 if direct_consumer is not None and direct_consumer(record, tensor):
@@ -1004,7 +1411,32 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
         model_weights = model_config.model
         if model_weights_override := model_config.model_weights:
             model_weights = model_weights_override
+        source = ODirectSafetensorsWeightSource(self, model_weights)
+        build_weight_plan = getattr(model, "build_weight_plan", None)
+        load_weights_from_source = getattr(model, "load_weights_from_source", None)
+        if callable(build_weight_plan) or callable(load_weights_from_source):
+            if not callable(build_weight_plan) or not callable(load_weights_from_source):
+                raise RuntimeError(
+                    "Models using UMA-safe source loading must implement both "
+                    "build_weight_plan(catalog) and "
+                    "load_weights_from_source(source, plan)"
+                )
+            logger.info(
+                "uma_odirect_safetensors using model WeightSource path: %s",
+                type(model).__name__,
+            )
+            plan = build_weight_plan(source.catalog)
+            try:
+                load_weights_from_source(source, plan)
+            finally:
+                source.log_stats("model-source")
+            return
+
+        logger.info(
+            "uma_odirect_safetensors using compatibility iterator path: %s",
+            type(model).__name__,
+        )
         direct_consumer = (
             _PerExpertMoeDirectLoader(model) if self._direct_per_expert_moe else None
         )
-        model.load_weights(self._get_weights_iterator(model_weights, direct_consumer))
+        model.load_weights(source.iter_full_tensors(direct_consumer=direct_consumer))
