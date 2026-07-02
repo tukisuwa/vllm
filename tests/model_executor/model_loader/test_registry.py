@@ -40,6 +40,7 @@ from vllm.model_executor.models import (
     internlm2,
     llama,
     mixtral,
+    mistral,
     nemotron,
     olmo,
     olmo2,
@@ -2338,6 +2339,78 @@ def test_falcon_load_weights_from_source_delegates_to_executor(monkeypatch):
     plan = WeightPlan(())
 
     loaded = falcon.FalconForCausalLM.load_weights_from_source(model, source, plan)
+
+    assert loaded == {"loaded"}
+    assert calls == [(model, source, plan)]
+
+
+def test_mistral_build_weight_plan_remaps_names_and_permute_transform(tmp_path):
+    metadata = {
+        "layers.0.attention.wq.weight": {
+            "dtype": "F32",
+            "shape": [4, 4],
+            "data_offsets": [0, 64],
+        },
+        "output.weight": {"dtype": "F32", "shape": [1], "data_offsets": [64, 68]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 68)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+        head_dim = 2
+        hidden_size = 4
+        num_attention_heads = 2
+        num_key_value_heads = 2
+
+    class FakeMistral:
+        config = FakeConfig()
+        hf_to_vllm_mapper = mistral.MistralForCausalLM.hf_to_vllm_mapper
+        mistral_mapping = mistral.MistralForCausalLM.mistral_mapping
+        _permute_mistral_weight = mistral.MistralForCausalLM._permute_mistral_weight
+        _remap_mistral_name = mistral.MistralForCausalLM._remap_mistral_name
+        _mistral_source_name_transform = (
+            mistral.MistralForCausalLM._mistral_source_name_transform
+        )
+
+        def children(self):
+            return []
+
+    fake = FakeMistral()
+    plan = mistral.MistralForCausalLM.build_weight_plan(fake, catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    wq = entries["layers.0.attention.wq.weight"]
+    assert wq.target_name == "model.layers.0.self_attn.qkv_proj.weight"
+    assert wq.shard_id == "q"
+    assert wq.transform is not None
+    tensor = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    assert torch.equal(
+        wq.transform(tensor),
+        fake._permute_mistral_weight(tensor, 2, 4),
+    )
+    output = entries["output.weight"]
+    assert output.required is False
+    assert output.target_name == "lm_head.weight"
+
+
+def test_mistral_load_weights_from_source_delegates_to_executor(monkeypatch):
+    calls = []
+
+    def fake_load(model, source, plan):
+        calls.append((model, source, plan))
+        return {"loaded"}
+
+    monkeypatch.setattr(mistral, "load_auto_uma_weights_from_source", fake_load)
+    model = object()
+    source = object()
+    plan = WeightPlan(())
+
+    loaded = mistral.MistralForCausalLM.load_weights_from_source(model, source, plan)
 
     assert loaded == {"loaded"}
     assert calls == [(model, source, plan)]

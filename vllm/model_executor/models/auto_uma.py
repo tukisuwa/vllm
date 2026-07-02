@@ -5,6 +5,7 @@
 
 from collections.abc import Callable
 
+import torch
 from torch import nn
 
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
@@ -21,6 +22,10 @@ def build_auto_uma_weight_plan(
     catalog: TensorCatalog,
     *,
     mapper: object | None = None,
+    name_transform: (
+        Callable[[str], tuple[str, Callable[[torch.Tensor], torch.Tensor] | None] | None]
+        | None
+    ) = None,
     skip_prefixes: list[str] | None = None,
     skip_substrs: list[str] | None = None,
     skip_predicate: Callable[[str], bool] | None = None,
@@ -29,6 +34,7 @@ def build_auto_uma_weight_plan(
         model,
         catalog,
         mapper=mapper,
+        name_transform=name_transform,
         skip_prefixes=skip_prefixes,
         skip_substrs=skip_substrs,
         skip_predicate=skip_predicate,

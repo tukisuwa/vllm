@@ -23,9 +23,15 @@ from vllm.model_executor.models.llama import (
     LlamaForCausalLM,
     LlamaModel,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+    WeightPlan,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 
+from .auto_uma import build_auto_uma_weight_plan, load_auto_uma_weights_from_source
 from .utils import AutoWeightsLoader
 
 
@@ -291,23 +297,13 @@ class MistralForCausalLM(LlamaForCausalLM):
         name: str,
         loaded_weight: torch.Tensor,
     ) -> tuple[str, torch.Tensor]:
-        def permute(w: torch.Tensor, n_heads: int, attn_out: int):
-            attn_in = self.config.head_dim * n_heads
-
-            return (
-                w.view(n_heads, attn_in // n_heads // 2, 2, attn_out)
-                .transpose(1, 2)
-                .reshape(attn_in, attn_out)
-            )
-
-        mapping = self.mistral_mapping
         modules = name.split(".")
 
         # rotary embeds should be sliced
         # If using quantized model in mistral format,
         # quantization scales (qscale_weight) also need to be sliced
         if "wk" in modules and modules[-1] == "weight":
-            loaded_weight = permute(
+            loaded_weight = self._permute_mistral_weight(
                 loaded_weight, self.config.num_key_value_heads, self.config.hidden_size
             )
         elif (
@@ -315,9 +311,11 @@ class MistralForCausalLM(LlamaForCausalLM):
             and modules[-1] == "qscale_weight"
             and loaded_weight.numel() > 1
         ):
-            loaded_weight = permute(loaded_weight, self.config.num_key_value_heads, 1)
+            loaded_weight = self._permute_mistral_weight(
+                loaded_weight, self.config.num_key_value_heads, 1
+            )
         elif "wq" in modules and modules[-1] == "weight":
-            loaded_weight = permute(
+            loaded_weight = self._permute_mistral_weight(
                 loaded_weight, self.config.num_attention_heads, self.config.hidden_size
             )
         elif (
@@ -325,8 +323,30 @@ class MistralForCausalLM(LlamaForCausalLM):
             and modules[-1] == "qscale_weight"
             and loaded_weight.numel() > 1
         ):
-            loaded_weight = permute(loaded_weight, self.config.num_attention_heads, 1)
+            loaded_weight = self._permute_mistral_weight(
+                loaded_weight, self.config.num_attention_heads, 1
+            )
 
+        name = self._remap_mistral_name(name)
+
+        return name, loaded_weight
+
+    def _permute_mistral_weight(
+        self,
+        weight: torch.Tensor,
+        n_heads: int,
+        attn_out: int,
+    ) -> torch.Tensor:
+        attn_in = self.config.head_dim * n_heads
+        return (
+            weight.view(n_heads, attn_in // n_heads // 2, 2, attn_out)
+            .transpose(1, 2)
+            .reshape(attn_in, attn_out)
+        )
+
+    def _remap_mistral_name(self, name: str) -> str:
+        mapping = self.mistral_mapping
+        modules = name.split(".")
         num_modules = len(modules)
         for i in range(num_modules):
             item = modules[i]
@@ -338,5 +358,56 @@ class MistralForCausalLM(LlamaForCausalLM):
                 name = name.replace(combined_item, mapping[combined_item])
             elif item in mapping and mapping[item] not in name:
                 name = name.replace(item, mapping[item])
+        return name
 
-        return name, loaded_weight
+    def _mistral_source_name_transform(
+        self,
+        name: str,
+    ):
+        modules = name.split(".")
+        transform = None
+        if "wk" in modules and modules[-1] == "weight":
+            transform = lambda tensor: self._permute_mistral_weight(
+                tensor, self.config.num_key_value_heads, self.config.hidden_size
+            )
+        elif (
+            "wk" in modules
+            and modules[-1] == "qscale_weight"
+            and self.config.num_key_value_heads > 0
+        ):
+            transform = lambda tensor: (
+                self._permute_mistral_weight(tensor, self.config.num_key_value_heads, 1)
+                if tensor.numel() > 1
+                else tensor
+            )
+        elif "wq" in modules and modules[-1] == "weight":
+            transform = lambda tensor: self._permute_mistral_weight(
+                tensor, self.config.num_attention_heads, self.config.hidden_size
+            )
+        elif (
+            "wq" in modules
+            and modules[-1] == "qscale_weight"
+            and self.config.num_attention_heads > 0
+        ):
+            transform = lambda tensor: (
+                self._permute_mistral_weight(tensor, self.config.num_attention_heads, 1)
+                if tensor.numel() > 1
+                else tensor
+            )
+        return self._remap_mistral_name(name), transform
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
+        return build_auto_uma_weight_plan(
+            self,
+            catalog,
+            mapper=self.hf_to_vllm_mapper,
+            name_transform=self._mistral_source_name_transform,
+            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: WeightPlan,
+    ) -> set[str]:
+        return load_auto_uma_weights_from_source(self, source, plan)

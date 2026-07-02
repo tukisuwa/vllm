@@ -337,6 +337,10 @@ def build_auto_weight_plan_from_catalog(
     catalog: "TensorCatalog",
     *,
     mapper: object | None = None,
+    name_transform: (
+        Callable[[str], tuple[str, Callable[[torch.Tensor], torch.Tensor] | None] | None]
+        | None
+    ) = None,
     skip_prefixes: list[str] | None = None,
     skip_substrs: list[str] | None = None,
     skip_predicate: Callable[[str], bool] | None = None,
@@ -355,13 +359,28 @@ def build_auto_weight_plan_from_catalog(
     ignored_suffixes = ignore_unexpected_suffixes or []
     map_name_with_shard = getattr(mapper, "_map_name_with_shard", None)
     entries: list[WeightPlanEntry] = []
-    for name in catalog.names():
+    for checkpoint_name in catalog.names():
+        name = checkpoint_name
+        transform = None
+        if name_transform is not None:
+            transformed = name_transform(checkpoint_name)
+            if transformed is None:
+                entries.append(
+                    WeightPlanEntry(
+                        checkpoint_name=checkpoint_name,
+                        target_name=checkpoint_name,
+                        required=False,
+                    )
+                )
+                continue
+            name, transform = transformed
         if skip_predicate is not None and skip_predicate(name):
             entries.append(
                 WeightPlanEntry(
-                    checkpoint_name=name,
+                    checkpoint_name=checkpoint_name,
                     target_name=name,
                     required=False,
+                    transform=transform,
                 )
             )
             continue
@@ -370,9 +389,10 @@ def build_auto_weight_plan_from_catalog(
         ):
             entries.append(
                 WeightPlanEntry(
-                    checkpoint_name=name,
+                    checkpoint_name=checkpoint_name,
                     target_name=name,
                     required=False,
+                    transform=transform,
                 )
             )
             continue
@@ -384,9 +404,10 @@ def build_auto_weight_plan_from_catalog(
             if mapped is None:
                 entries.append(
                     WeightPlanEntry(
-                        checkpoint_name=name,
+                        checkpoint_name=checkpoint_name,
                         target_name=name,
                         required=False,
+                        transform=transform,
                     )
                 )
                 continue
@@ -394,8 +415,9 @@ def build_auto_weight_plan_from_catalog(
 
         entries.append(
             WeightPlanEntry(
-                checkpoint_name=name,
+                checkpoint_name=checkpoint_name,
                 target_name=target_name,
+                transform=transform,
                 shard_id=shard_id,
                 ignore_missing=any(
                     target_name.endswith(suffix) for suffix in ignored_suffixes
@@ -410,6 +432,10 @@ def build_auto_weight_plan_for_module(
     catalog: "TensorCatalog",
     *,
     mapper: object | None = None,
+    name_transform: (
+        Callable[[str], tuple[str, Callable[[torch.Tensor], torch.Tensor] | None] | None]
+        | None
+    ) = None,
     skip_prefixes: list[str] | None = None,
     skip_substrs: list[str] | None = None,
     skip_predicate: Callable[[str], bool] | None = None,
@@ -432,6 +458,7 @@ def build_auto_weight_plan_for_module(
     return build_auto_weight_plan_from_catalog(
         catalog,
         mapper=mapper,
+        name_transform=name_transform,
         skip_prefixes=skip_prefixes,
         skip_substrs=skip_substrs,
         skip_predicate=skip_predicate,
