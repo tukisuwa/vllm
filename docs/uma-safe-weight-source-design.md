@@ -638,6 +638,12 @@ Add model-side plans only where needed:
     `feed_forward.experts.<expert>.{gate,up,down}_proj.*` tensors
   - skips non-local routed experts before payload read
   - keeps Jamba's existing dense name mapper model-side
+- Sarvam MLA MoE
+  - initial hook implemented for standard
+    `mlp.experts.<expert>.{gate,up,down}_proj.*` tensors
+  - skips non-local routed experts before payload read
+  - preserves Sarvam's gate expert-bias zero-mean normalization in the
+    model-side plan
 
 Each model family should implement its own plan builder instead of adding
 loader-side conditionals.
@@ -660,6 +666,7 @@ Expected current behavior:
 | Arctic MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for local expert slices into `ws` / `w2s` |
 | HYV3 MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts and speculative-layer skip |
 | Jamba MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts |
+| Sarvam MLA MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts and gate-bias normalization |
 | Other routed MoE | Base path should work if normal vLLM load works | Not yet implemented |
 | Non-safetensors | Not supported | Not supported |
 | Remote HF path | Not supported by UMA-safe loader | Not supported |

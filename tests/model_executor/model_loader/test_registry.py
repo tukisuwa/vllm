@@ -93,6 +93,8 @@ from vllm.model_executor.models import (
     qwen3_next,
     seed_oss,
     solar,
+    sarvam,
+    sarvam_uma,
     stablelm,
     step1,
     starcoder2,
@@ -4399,6 +4401,118 @@ def test_jamba_moe_source_plan_skips_nonlocal_experts_before_read():
     assert source.reads == [names[0]]
     assert source.skips == [(names[1], "non-local routed expert")]
     assert loaded == {"model.layers.0.feed_forward.experts.w13_weight"}
+    assert model.routed_experts.calls[0]["expert_id"] == 0
+    assert model.routed_experts.calls[0]["shard_id"] == "w1"
+
+
+def test_sarvam_moe_source_plan_skips_nonlocal_experts_and_normalizes_gate_bias():
+    names = [
+        "model.layers.0.mlp.experts.0.gate_proj.weight",
+        "model.layers.0.mlp.experts.1.gate_proj.weight",
+        "model.layers.0.mlp.gate.e_score_correction_bias",
+    ]
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", names[0], torch.float32, [1], 0, 4),
+            TensorMeta("model.safetensors", names[1], torch.float32, [1], 4, 4),
+            TensorMeta("model.safetensors", names[2], torch.float32, [2], 8, 8),
+        ]
+    )
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.mlp.experts"
+        w13_weight = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 0 else -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeGate(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.e_score_correction_bias = nn.Parameter(torch.zeros(2))
+
+    class FakeMLP(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.experts = routed_experts
+            self.gate = FakeGate()
+
+    class FakeLayer(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.mlp = FakeMLP(routed_experts)
+
+    class FakeLayers:
+        def __init__(self, routed_experts):
+            self._layers = [FakeLayer(routed_experts)]
+
+        def __len__(self):
+            return len(self._layers)
+
+        def __getitem__(self, idx):
+            return self._layers[idx]
+
+        def __getattr__(self, name):
+            if name.isdigit():
+                return self._layers[int(name)]
+            raise AttributeError(name)
+
+    class FakeInnerModel(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.layers = FakeLayers(routed_experts)
+
+    class FakeSarvam(sarvam.SarvamMLAForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.tie_word_embeddings = False
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            if name == names[2]:
+                return torch.tensor([1.0, 3.0])
+            return torch.ones(1)
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    model = FakeSarvam()
+    source = FakeSource(catalog)
+
+    plan = model.build_weight_plan(catalog)
+    assert len(plan.auto_plan.entries) == 1
+    assert plan.auto_plan.entries[0].checkpoint_name == names[2]
+    assert [entry.checkpoint_name for entry in plan.routed_entries] == names[:2]
+    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+
+    loaded = model.load_weights_from_source(source, plan)
+
+    assert source.reads == [names[2], names[0]]
+    assert source.skips == [(names[1], "non-local routed expert")]
+    assert torch.equal(
+        model.model.layers[0].mlp.gate.e_score_correction_bias,
+        torch.tensor([-1.0, 1.0]),
+    )
+    assert loaded == {
+        "model.layers.0.mlp.gate.e_score_correction_bias",
+        "model.layers.0.mlp.experts.w13_weight",
+    }
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 

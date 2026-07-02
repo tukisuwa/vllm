@@ -55,11 +55,20 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
 from .bailing_moe import BailingMoeForCausalLM
 from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
+from .sarvam_uma import (
+    SarvamMoeSourcePlan,
+    build_sarvam_moe_weight_plan,
+    load_sarvam_moe_weights_from_source,
+)
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -766,6 +775,20 @@ class SarvamMLAForCausalLM(nn.Module, SupportsPP, SupportsLoRA, SarvamMixtureOfE
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> SarvamMoeSourcePlan:
+        return build_sarvam_moe_weight_plan(
+            self,
+            catalog,
+            skip_prefixes=(["lm_head."] if self.tie_word_embeddings else None),
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: SarvamMoeSourcePlan,
+    ) -> set[str]:
+        return load_sarvam_moe_weights_from_source(self, source, plan)
 
 
 class SarvamMoEForCausalLM(BailingMoeForCausalLM):

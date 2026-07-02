@@ -75,6 +75,9 @@ def build_routed_moe_weight_plan(
     resolve_routed_experts: RoutedExpertResolver,
     auto_skip_substr: str,
     mapper: object | None = None,
+    name_transform: (
+        Callable[[str], tuple[str, Callable[[Any], Any] | None] | None] | None
+    ) = None,
     skip_prefixes: list[str] | None = None,
     skip_substrs: list[str] | None = None,
     skip_predicate: Callable[[str], bool] | None = None,
@@ -123,6 +126,7 @@ def build_routed_moe_weight_plan(
         model,
         catalog,
         mapper=mapper,
+        name_transform=name_transform,
         skip_prefixes=skip_prefixes,
         skip_substrs=auto_skip_substrs,
         skip_predicate=skip_predicate,
