@@ -61,9 +61,18 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
+)
+from vllm.model_executor.models.deepseek_uma import (
+    DeepseekMoeSourcePlan,
+    build_deepseek_moe_weight_plan,
+    load_deepseek_moe_weights_from_source,
 )
 from vllm.model_executor.models.deepseek_v2 import (
     DeepseekAttention,
@@ -1127,6 +1136,23 @@ class AXK1ForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> DeepseekMoeSourcePlan:
+        def skip_predicate(name: str) -> bool:
+            return get_spec_layer_idx_from_weight_name(self.config, name) is not None
+
+        return build_deepseek_moe_weight_plan(
+            self,
+            catalog,
+            skip_predicate=skip_predicate,
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: DeepseekMoeSourcePlan,
+    ) -> set[str]:
+        return load_deepseek_moe_weights_from_source(self, source, plan)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales

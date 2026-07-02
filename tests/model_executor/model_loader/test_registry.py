@@ -28,6 +28,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     summarize_weight_plan,
 )
 from vllm.model_executor.models import (
+    AXK1,
     afmoe,
     apertus,
     arctic,
@@ -5415,6 +5416,140 @@ def test_deepseek_moe_source_plan_skips_nonlocal_experts_before_read():
     ]
     assert "model.layers.2.input_layernorm.weight" in loaded
     assert "model.layers.0.mlp.experts.w13_weight" in loaded
+    assert model.routed_experts.calls[0]["expert_id"] == 0
+    assert model.routed_experts.calls[0]["shard_id"] == "w1"
+
+
+def test_axk1_source_plan_reuses_deepseek_moe_helper():
+    names = [
+        "model.layers.0.mlp.experts.0.gate_proj.weight",
+        "model.layers.0.mlp.experts.1.gate_proj.weight",
+        "model.layers.3.input_layernorm.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+    ]
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", names[0], torch.float32, [1], 0, 4),
+            TensorMeta("model.safetensors", names[1], torch.float32, [1], 4, 4),
+            TensorMeta("model.safetensors", names[2], torch.float32, [1], 8, 4),
+            TensorMeta("model.safetensors", names[3], torch.float32, [1, 1], 12, 4),
+        ]
+    )
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.mlp.experts"
+        w13_weight = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 0 else -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeMLP:
+        def __init__(self, routed_experts=None):
+            self.experts = routed_experts
+
+    class FakeSelfAttn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv_proj = nn.Linear(1, 3, bias=False)
+            nn.init.zeros_(self.qkv_proj.weight)
+            self.qkv_calls = []
+
+            def weight_loader(param, loaded_weight, shard_id):
+                self.qkv_calls.append(
+                    {
+                        "param": param,
+                        "loaded_weight": loaded_weight,
+                        "shard_id": shard_id,
+                    }
+                )
+                if shard_id == "q":
+                    param.data.narrow(0, 0, 1).copy_(loaded_weight)
+
+            self.qkv_proj.weight.weight_loader = weight_loader
+
+    class FakeLayer(nn.Module):
+        def __init__(self, routed_experts=None):
+            super().__init__()
+            self.mlp = FakeMLP(routed_experts)
+            self.input_layernorm = nn.LayerNorm(1)
+            self.self_attn = FakeSelfAttn()
+
+    class FakeInnerModel(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.layers = nn.ModuleList([
+                FakeLayer(routed_experts),
+                FakeLayer(),
+                FakeLayer(),
+                FakeLayer(),
+                FakeLayer(),
+            ])
+
+    class FakeConfig:
+        num_hidden_layers = 3
+        num_nextn_predict_layers = 1
+        n_routed_experts = 2
+        n_shared_experts = 0
+
+    class FakeAXK1(AXK1.AXK1ForCausalLM):
+        use_mha = True
+
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = FakeConfig()
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            if name == names[3]:
+                return torch.tensor([[5.0]])
+            return torch.ones(1)
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    model = FakeAXK1()
+    source = FakeSource(catalog)
+
+    plan = model.build_weight_plan(catalog)
+    auto_entries = {
+        entry.checkpoint_name: entry for entry in plan.routed_plan.auto_plan.entries
+    }
+    assert auto_entries[names[2]].required is False
+    assert auto_entries[names[3]].target_name == (
+        "model.layers.0.self_attn.qkv_proj.weight"
+    )
+    assert auto_entries[names[3]].shard_id == "q"
+    assert [entry.local_required for entry in plan.routed_plan.routed_entries] == [
+        True,
+        False,
+    ]
+
+    loaded = model.load_weights_from_source(source, plan)
+
+    assert source.reads == [names[3], names[0]]
+    assert source.skips == [
+        (names[2], "weight plan marked not required"),
+        (names[1], "non-local routed expert"),
+    ]
+    assert "model.layers.0.self_attn.qkv_proj.weight" in loaded
+    assert "model.layers.0.mlp.experts.w13_weight" in loaded
+    assert model.model.layers[0].self_attn.qkv_calls[0]["shard_id"] == "q"
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
