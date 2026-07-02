@@ -676,3 +676,34 @@ class Qwen3_5MoeForConditionalGeneration(
 
         # set MoE hyperparameters
         self.set_moe_parameters()
+
+    def _uma_weight_mapper(self) -> WeightsMapper | None:
+        mapper = (
+            self.hf_to_vllm_mapper
+            | self.language_model.model.hf_to_vllm_mapper
+            | self.visual.hf_to_vllm_mapper
+        )
+        is_fse = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled() and (
+            _is_shared_expert_fse_compatible(self.language_model.quant_config)
+        )
+        if is_fse:
+            num_routed = self.language_model.config.num_experts
+            mapper = mapper | WeightsMapper(
+                orig_to_new_substr={"mlp.shared_expert.": f"mlp.experts.{num_routed}."}
+            )
+        return mapper
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> QwenMoeSourcePlan:
+        return build_qwen_moe_weight_plan(
+            self,
+            catalog,
+            mapper=self._uma_weight_mapper(),
+            skip_prefixes=["mtp."],
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: QwenMoeSourcePlan,
+    ) -> set[str]:
+        return load_qwen_moe_weights_from_source(self, source, plan)

@@ -1113,6 +1113,7 @@ def test_qwen3_moe_source_plan_skips_nonlocal_experts_before_read():
         (qwen3_moe.Qwen3MoeForCausalLM, qwen3_moe),
         (qwen3_next.Qwen3NextForCausalLM, qwen3_next),
         (qwen3_5.Qwen3_5MoeForCausalLM, qwen3_5),
+        (qwen3_5.Qwen3_5MoeForConditionalGeneration, qwen3_5),
     ],
 )
 def test_qwen_moe_source_hook_delegates_to_shared_helper(
@@ -1150,6 +1151,79 @@ def test_qwen_moe_source_hook_delegates_to_shared_helper(
     assert calls[0][1] is model
     assert calls[0][2] is catalog
     assert calls[1] == ("load", model, source, "plan")
+
+
+def test_qwen_moe_source_plan_handles_nested_language_model_before_read():
+    name = "model.language_model.model.layers.0.mlp.experts.1.up_proj.weight"
+    catalog = TensorCatalog(
+        [TensorMeta("model.safetensors", name, torch.float32, [1], 0, 4)]
+    )
+
+    class FakeRoutedExperts:
+        layer_name = "language_model.model.layers.0.mlp.experts.routed_experts"
+        w13_weight = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, _expert_id):
+            return -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeExperts:
+        def __init__(self, routed_experts):
+            self.routed_experts = routed_experts
+
+    class FakeMLP:
+        def __init__(self, routed_experts):
+            self.experts = FakeExperts(routed_experts)
+
+    class FakeLayer:
+        def __init__(self, routed_experts):
+            self.mlp = FakeMLP(routed_experts)
+
+    class FakeInnerModel:
+        def __init__(self, routed_experts):
+            self.layers = [FakeLayer(routed_experts)]
+
+    class FakeLanguageModel:
+        def __init__(self, routed_experts):
+            self.model = FakeInnerModel(routed_experts)
+
+    class FakeWrapper:
+        def __init__(self):
+            self.routed_experts = FakeRoutedExperts()
+            self.language_model = FakeLanguageModel(self.routed_experts)
+
+        def children(self):
+            return []
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            return torch.ones(1)
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    model = FakeWrapper()
+    source = FakeSource(catalog)
+    plan = qwen3_5.build_qwen_moe_weight_plan(model, catalog)
+
+    assert len(plan.auto_plan.entries) == 0
+    assert [entry.local_required for entry in plan.routed_entries] == [False]
+    assert qwen3_5.load_qwen_moe_weights_from_source(model, source, plan) == set()
+    assert source.reads == []
+    assert source.skips == [(name, "non-local routed expert")]
 
 
 def test_uma_odirect_model_source_hook_requires_both_methods(tmp_path, monkeypatch):

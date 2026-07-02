@@ -72,8 +72,16 @@ def _routed_param_for_projection(
     raise ValueError(f"Unsupported routed expert projection {proj_name!r}")
 
 
+def _get_model_layers(model: Any) -> Any | None:
+    direct_layers = getattr(getattr(model, "model", None), "layers", None)
+    if direct_layers is not None:
+        return direct_layers
+    language_model = getattr(model, "language_model", None)
+    return getattr(getattr(language_model, "model", None), "layers", None)
+
+
 def _get_routed_experts_for_layer(model: Any, layer_id: int) -> Any | None:
-    layers = getattr(getattr(model, "model", None), "layers", None)
+    layers = _get_model_layers(model)
     if layers is None or layer_id < 0 or layer_id >= len(layers):
         return None
     layer = layers[layer_id]
