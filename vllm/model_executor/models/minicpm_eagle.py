@@ -41,12 +41,19 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+    WeightPlan,
+    WeightPlanEntry,
+)
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsEagle, SupportsLoRA, SupportsPP
 from .minicpm import MiniCPMAttention as EagleMiniCPMAttention
 from .minicpm import MiniCPMMLP as EagleMiniCPMMLP
 from .minicpm import MiniCPMMoE as EagleMiniCPMMoE
+from .minicpm import _minicpm_load_weights_from_source, _minicpm_model_weight_plan
 from .utils import (
     AutoWeightsLoader,
     is_pp_missing_parameter,
@@ -384,3 +391,33 @@ class EagleMiniCPMForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
         return loader.load_weights(map(transform, weights))
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
+        for name in catalog.names():
+            process_eagle_weight(self, name)
+        plan = _minicpm_model_weight_plan(self.model, catalog)
+        lm_head_entries: list[WeightPlanEntry] = []
+        if catalog.has("lm_head.weight"):
+            lm_head_entries.append(
+                WeightPlanEntry(
+                    "lm_head.weight",
+                    "lm_head.weight",
+                    required=not self.config.tie_word_embeddings,
+                )
+            )
+        existing = {entry.checkpoint_name for entry in plan}
+        return WeightPlan(
+            tuple(plan.entries)
+            + tuple(
+                entry
+                for entry in lm_head_entries
+                if entry.checkpoint_name not in existing
+            )
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: WeightPlan,
+    ) -> set[str]:
+        return _minicpm_load_weights_from_source(self, source, plan)

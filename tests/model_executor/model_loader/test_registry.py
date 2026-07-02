@@ -78,6 +78,7 @@ from vllm.model_executor.models import (
     mamba,
     mamba2,
     minicpm,
+    minicpm_eagle,
     minimax_m2,
     mistral3,
     nemotron_h,
@@ -3690,6 +3691,57 @@ def test_minicpm_load_weights_from_source_places_expert_slices():
     assert mlp.ws[0, 2:, :].tolist() == [[3.0, 3.0, 3.0], [3.0, 3.0, 3.0]]
     assert mlp.w2s[0].tolist() == [[2.0, 2.0], [2.0, 2.0], [2.0, 2.0]]
     assert len(source.reads) == 3
+
+
+def test_eagle_minicpm_build_weight_plan_updates_eagle_flags(tmp_path, monkeypatch):
+    metadata = {
+        "model.eagle_layers.2.mlp.experts.0.w1.weight": {
+            "dtype": "F32",
+            "shape": [4, 3],
+            "data_offsets": [0, 48],
+        },
+        "model.embed_tokens.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [48, 52],
+        },
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [52, 56]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 56)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+        intermediate_size = 4
+        num_experts = 1
+
+    class FakeEagleMiniCPMModel:
+        config = FakeConfig()
+
+    class FakeEagleMiniCPM(minicpm_eagle.EagleMiniCPMForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = FakeConfig()
+            self.model = FakeEagleMiniCPMModel()
+            self.has_own_lm_head = False
+            self.has_own_embed_tokens = False
+
+    monkeypatch.setattr(minicpm, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(minicpm, "get_tensor_model_parallel_world_size", lambda: 2)
+    model = FakeEagleMiniCPM()
+    plan = model.build_weight_plan(catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    expert_w1 = entries["model.eagle_layers.2.mlp.experts.0.w1.weight"]
+    assert expert_w1.target_name == "model.eagle_layers.2.mlp.ws"
+    assert expert_w1.source_slices == (slice(0, 2), slice(None))
+    assert entries["lm_head.weight"].required is False
+    assert model.has_own_lm_head is True
+    assert model.has_own_embed_tokens is True
 
 
 @pytest.mark.parametrize(
