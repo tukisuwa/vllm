@@ -336,7 +336,8 @@ Implemented so far:
   - shared model-side helpers for dense AutoWeightsLoader-style source hooks
   - keeps model files from depending directly on generic executor internals
   - is used by Qwen2, Qwen3, Llama, Gemma, Gemma2, Gemma3, InternLM2, Phi,
-    Starcoder2, Falcon, OLMo, OLMo2, Nemotron, EXAONE, and Cohere
+    Starcoder2, Falcon, Mistral, GPTBigCode, OPT, BLOOM, OLMo, OLMo2,
+    Nemotron, EXAONE, and Cohere
 - shared routed-MoE model helper
   - keeps per-family parsing and module resolution in model-side files
   - centralizes local-expert skip decisions and existing FusedMoE/RoutedExperts
@@ -408,6 +409,7 @@ Status: started with `Qwen2ForCausalLM`, `Qwen3ForCausalLM`,
 `LlamaForCausalLM`, `GemmaForCausalLM`, `Gemma2ForCausalLM`,
 `Gemma3ForCausalLM`, `InternLM2ForCausalLM`, `PhiForCausalLM`,
 `Starcoder2ForCausalLM`, `FalconForCausalLM`, `MistralForCausalLM`,
+`GPTBigCodeForCausalLM`, `OPTForCausalLM`, `BloomForCausalLM`,
 `OlmoForCausalLM`, `Olmo2ForCausalLM`, `NemotronForCausalLM`,
 `ExaoneForCausalLM`, and `CohereForCausalLM`.
 
@@ -430,6 +432,8 @@ Target behavior:
 - plan skips tied Falcon `lm_head`: implemented where its existing loader skips it
 - plan remaps Mistral consolidated-checkpoint names before payload read and
   attaches q/k permutation transforms to the affected entries
+- plan remaps BLOOM checkpoint names with the existing `transformer.` prefix
+  rule before payload read
 - plan skips static non-payload entries such as Cohere `rotary_emb.inv_freq`
 - plan skips rotary/cache tensors: implemented through shared auto-plan helper
 - dense model hooks use the shared `auto_uma` model-side helper instead of
@@ -540,7 +544,7 @@ Expected current behavior:
 
 | Model type | Base `uma_odirect_safetensors` | Direct plan path |
 | --- | --- | --- |
-| Dense safetensors | Should work if normal vLLM load works | Phase 3 hooks for Qwen2/Qwen3/Llama/Gemma/Gemma2/Gemma3/InternLM2/Phi/Starcoder2/Falcon/Mistral/OLMo/OLMo2/Nemotron/EXAONE/Cohere-style AutoWeightsLoader models |
+| Dense safetensors | Should work if normal vLLM load works | Phase 3 hooks for Qwen2/Qwen3/Llama/Gemma/Gemma2/Gemma3/InternLM2/Phi/Starcoder2/Falcon/Mistral/GPTBigCode/OPT/BLOOM/OLMo/OLMo2/Nemotron/EXAONE/Cohere-style AutoWeightsLoader models |
 | Sharded dense safetensors | Should work if no duplicate names | Phase 3 |
 | Qwen2/Qwen3 / OLMoE / Cohere2 routed MoE | Base path should work if normal vLLM load works | Phase 4/5 model hook for `mlp.experts` gate/up/down tensors; loader-side direct path removed |
 | Mixtral / PhiMoE routed MoE | Base path should work if normal vLLM load works | Phase 5 initial model hook for `block_sparse_moe.experts` w1/w2/w3 tensors |

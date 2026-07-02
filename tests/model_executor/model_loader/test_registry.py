@@ -28,12 +28,14 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 from vllm.model_executor.models import (
     commandr,
     cohere2_moe,
+    bloom,
     deepseek_v2,
     exaone,
     falcon,
     gemma,
     gemma2,
     gemma3,
+    gpt_bigcode,
     granitemoe,
     granitemoehybrid,
     granitemoeshared,
@@ -44,6 +46,7 @@ from vllm.model_executor.models import (
     nemotron,
     olmo,
     olmo2,
+    opt,
     olmoe,
     phimoe,
     phi,
@@ -2411,6 +2414,114 @@ def test_mistral_load_weights_from_source_delegates_to_executor(monkeypatch):
     plan = WeightPlan(())
 
     loaded = mistral.MistralForCausalLM.load_weights_from_source(model, source, plan)
+
+    assert loaded == {"loaded"}
+    assert calls == [(model, source, plan)]
+
+
+@pytest.mark.parametrize(
+    "model_cls, module, skip_prefix",
+    [
+        (gpt_bigcode.GPTBigCodeForCausalLM, gpt_bigcode, "lm_head."),
+        (opt.OPTForCausalLM, opt, "lm_head.weight"),
+    ],
+)
+def test_gpt_bigcode_opt_dense_hooks_use_tie_skip(
+    tmp_path, model_cls, module, skip_prefix
+):
+    metadata = {
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "model.layers.0.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 8)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+
+    class FakeModel:
+        config = FakeConfig()
+        hf_to_vllm_mapper = getattr(model_cls, "hf_to_vllm_mapper", None)
+
+        def children(self):
+            return []
+
+    plan = model_cls.build_weight_plan(FakeModel(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["lm_head.weight"].required is False
+    assert entries["model.layers.0.weight"].required is True
+    assert skip_prefix
+
+
+def test_bloom_build_weight_plan_adds_transformer_prefix_and_tie_skip(tmp_path):
+    metadata = {
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "h.0.self_attention.query_key_value.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "transformer.word_embeddings.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [8, 12],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 12)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeBloom:
+        def children(self):
+            return []
+
+    plan = bloom.BloomForCausalLM.build_weight_plan(FakeBloom(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["lm_head.weight"].target_name == "transformer.lm_head.weight"
+    assert entries["h.0.self_attention.query_key_value.weight"].target_name == (
+        "transformer.h.0.self_attention.query_key_value.weight"
+    )
+    assert entries["transformer.word_embeddings.weight"].target_name == (
+        "transformer.word_embeddings.weight"
+    )
+
+
+@pytest.mark.parametrize(
+    "model_cls, module",
+    [
+        (gpt_bigcode.GPTBigCodeForCausalLM, gpt_bigcode),
+        (opt.OPTForCausalLM, opt),
+        (bloom.BloomForCausalLM, bloom),
+    ],
+)
+def test_more_dense_compat_load_weights_from_source_delegates_to_executor(
+    monkeypatch, model_cls, module
+):
+    calls = []
+
+    def fake_load(model, source, plan):
+        calls.append((model, source, plan))
+        return {"loaded"}
+
+    monkeypatch.setattr(module, "load_auto_uma_weights_from_source", fake_load)
+    model = object()
+    source = object()
+    plan = WeightPlan(())
+
+    loaded = model_cls.load_weights_from_source(model, source, plan)
 
     assert loaded == {"loaded"}
     assert calls == [(model, source, plan)]

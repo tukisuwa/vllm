@@ -47,9 +47,15 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+    WeightPlan,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
+from .auto_uma import build_auto_uma_weight_plan, load_auto_uma_weights_from_source
 from .interfaces import SupportsPP, SupportsQuant
 from .utils import (
     AutoWeightsLoader,
@@ -380,11 +386,31 @@ class BloomForCausalLM(nn.Module, SupportsPP, SupportsQuant):
         weights = _add_transformer_prefix(weights)
         return loader.load_weights(weights)
 
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
+        return build_auto_uma_weight_plan(
+            self,
+            catalog,
+            name_transform=_add_transformer_prefix_name,
+            skip_prefixes=["lm_head.weight"],
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: WeightPlan,
+    ) -> set[str]:
+        return load_auto_uma_weights_from_source(self, source, plan)
+
 
 def _add_transformer_prefix(
     weights: Iterable[tuple[str, torch.Tensor]],
 ) -> Iterable[tuple[str, torch.Tensor]]:
     for name, tensor in weights:
-        if not name.startswith("transformer."):
-            name = "transformer." + name
+        name = _add_transformer_prefix_name(name)[0]
         yield name, tensor
+
+
+def _add_transformer_prefix_name(name: str):
+    if not name.startswith("transformer."):
+        name = "transformer." + name
+    return name, None
