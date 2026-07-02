@@ -38,6 +38,8 @@ from vllm.model_executor.models import (
     deepseek_uma,
     bloom,
     deepseek_v2,
+    ernie45_moe,
+    ernie45_moe_uma,
     exaone,
     exaone4,
     falcon,
@@ -4508,6 +4510,133 @@ def test_sarvam_moe_source_plan_skips_nonlocal_experts_and_normalizes_gate_bias(
     assert torch.equal(
         model.model.layers[0].mlp.gate.e_score_correction_bias,
         torch.tensor([-1.0, 1.0]),
+    )
+    assert loaded == {
+        "model.layers.0.mlp.gate.e_score_correction_bias",
+        "model.layers.0.mlp.experts.w13_weight",
+    }
+    assert model.routed_experts.calls[0]["expert_id"] == 0
+    assert model.routed_experts.calls[0]["shard_id"] == "w1"
+
+
+def test_ernie45_moe_source_plan_skips_and_maps_gate_bias():
+    names = [
+        "model.layers.0.mlp.experts.0.gate_proj.weight",
+        "model.layers.0.mlp.experts.1.gate_proj.weight",
+        "model.layers.0.mlp.moe_statics.e_score_correction_bias",
+        "model.layers.0.mtp.dummy.weight",
+        "lm_head.weight",
+    ]
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", names[0], torch.float32, [1], 0, 4),
+            TensorMeta("model.safetensors", names[1], torch.float32, [1], 4, 4),
+            TensorMeta("model.safetensors", names[2], torch.float32, [1, 2], 8, 8),
+            TensorMeta("model.safetensors", names[3], torch.float32, [1], 16, 4),
+            TensorMeta("model.safetensors", names[4], torch.float32, [1], 20, 4),
+        ]
+    )
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.mlp.experts"
+        w13_weight = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 0 else -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeGate(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.e_score_correction_bias = nn.Parameter(torch.zeros(2))
+
+    class FakeMLP(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.experts = routed_experts
+            self.gate = FakeGate()
+
+    class FakeLayer(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.mlp = FakeMLP(routed_experts)
+
+    class FakeLayers:
+        def __init__(self, routed_experts):
+            self._layers = [FakeLayer(routed_experts)]
+
+        def __len__(self):
+            return len(self._layers)
+
+        def __getitem__(self, idx):
+            return self._layers[idx]
+
+        def __getattr__(self, name):
+            if name.isdigit():
+                return self._layers[int(name)]
+            raise AttributeError(name)
+
+    class FakeInnerModel(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.layers = FakeLayers(routed_experts)
+
+    class FakeConfig:
+        tie_word_embeddings = True
+
+    class FakeErnie45(ernie45_moe.Ernie4_5_MoeForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = FakeConfig()
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            if name == names[2]:
+                return torch.tensor([[2.0, 4.0]])
+            return torch.ones(1)
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    model = FakeErnie45()
+    source = FakeSource(catalog)
+
+    plan = model.build_weight_plan(catalog)
+    auto_entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    assert auto_entries[names[2]].target_name == (
+        "model.layers.0.mlp.gate.e_score_correction_bias"
+    )
+    assert auto_entries[names[3]].required is False
+    assert auto_entries[names[4]].required is False
+    assert [entry.checkpoint_name for entry in plan.routed_entries] == names[:2]
+    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+
+    loaded = model.load_weights_from_source(source, plan)
+
+    assert source.reads == [names[2], names[0]]
+    assert source.skips == [
+        (names[3], "weight plan marked not required"),
+        (names[4], "weight plan marked not required"),
+        (names[1], "non-local routed expert"),
+    ]
+    assert torch.equal(
+        model.model.layers[0].mlp.gate.e_score_correction_bias,
+        torch.tensor([2.0, 4.0]),
     )
     assert loaded == {
         "model.layers.0.mlp.gate.e_score_correction_bias",
