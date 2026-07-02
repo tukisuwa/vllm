@@ -27,6 +27,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 )
 from vllm.model_executor.models import (
     apertus,
+    arcee,
     commandr,
     cohere2_moe,
     deepseek_uma,
@@ -45,6 +46,7 @@ from vllm.model_executor.models import (
     granitemoe,
     granitemoehybrid,
     granitemoeshared,
+    hyperclovax,
     internlm2,
     jais2,
     llama,
@@ -67,6 +69,7 @@ from vllm.model_executor.models import (
     qwen3_5,
     qwen3_moe,
     qwen3_next,
+    seed_oss,
     solar,
     stablelm,
     step1,
@@ -2676,6 +2679,24 @@ def test_bloom_build_weight_plan_adds_transformer_prefix_and_tie_skip(tmp_path):
             "model.layers.0.mlp.gate_up_proj.weight",
             1,
         ),
+        (
+            arcee.ArceeForCausalLM,
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.qkv_proj.weight",
+            "v",
+        ),
+        (
+            seed_oss.SeedOssForCausalLM,
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.0.mlp.gate_up_proj.weight",
+            0,
+        ),
+        (
+            hyperclovax.HyperCLOVAXForCausalLM,
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.qkv_proj.weight",
+            "k",
+        ),
     ],
 )
 def test_more_dense_compat_hooks_apply_mapper(
@@ -2788,6 +2809,43 @@ def test_dense_build_weight_plan_skips_tied_lm_head(tmp_path, model_cls, mapper)
         assert entries["model.layers.0.self_attn.q_proj.weight"].shard_id is None
 
 
+def test_arcee_build_weight_plan_skips_gate_proj(tmp_path):
+    metadata = {
+        "model.layers.0.mlp.gate_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [0, 4],
+        },
+        "model.layers.0.mlp.up_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 8)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = False
+
+    class FakeArcee:
+        config = FakeConfig()
+        hf_to_vllm_mapper = arcee.ArceeForCausalLM.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = arcee.ArceeForCausalLM.build_weight_plan(FakeArcee(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["model.layers.0.mlp.gate_proj.weight"].required is False
+    assert entries["model.layers.0.mlp.up_proj.weight"].required is True
+
+
 @pytest.mark.parametrize(
     "model_cls, module",
     [
@@ -2807,6 +2865,9 @@ def test_dense_build_weight_plan_skips_tied_lm_head(tmp_path, model_cls, mapper)
         (jais2.Jais2ForCausalLM, jais2),
         (exaone4.Exaone4ForCausalLM, exaone4),
         (plamo3.Plamo3ForCausalLM, plamo3),
+        (arcee.ArceeForCausalLM, arcee),
+        (seed_oss.SeedOssForCausalLM, seed_oss),
+        (hyperclovax.HyperCLOVAXForCausalLM, hyperclovax),
     ],
 )
 def test_more_dense_compat_load_weights_from_source_delegates_to_executor(
