@@ -54,6 +54,8 @@ from vllm.model_executor.models import (
     jais2,
     lfm2,
     llama,
+    mamba,
+    mamba2,
     mixtral,
     mistral,
     mpt,
@@ -2517,6 +2519,43 @@ def test_ouro_build_weight_plan_uses_mapper_and_tie_skip(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "model_cls,module",
+    [
+        (mamba.MambaForCausalLM, mamba),
+        (mamba2.Mamba2ForCausalLM, mamba2),
+    ],
+)
+def test_mamba_build_weight_plan_uses_a_log_mapper(tmp_path, model_cls, module):
+    metadata = {
+        "backbone.layers.0.mixer.A_log.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [0, 4],
+        },
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [4, 8]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 8)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeMamba:
+        hf_to_vllm_mapper = model_cls.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = model_cls.build_weight_plan(FakeMamba(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    a_log = entries["backbone.layers.0.mixer.A_log.weight"]
+    assert a_log.target_name == "backbone.layers.0.mixer.A.weight"
+    assert entries["lm_head.weight"].required is True
+
+
+@pytest.mark.parametrize(
     "model_cls, module",
     [
         (olmo.OlmoForCausalLM, olmo),
@@ -2525,6 +2564,8 @@ def test_ouro_build_weight_plan_uses_mapper_and_tie_skip(tmp_path):
         (falcon_h1.FalconH1ForCausalLM, falcon_h1),
         (zamba2.Zamba2ForCausalLM, zamba2),
         (ouro.OuroForCausalLM, ouro),
+        (mamba.MambaForCausalLM, mamba),
+        (mamba2.Mamba2ForCausalLM, mamba2),
     ],
 )
 def test_more_dense_load_weights_from_source_delegates_to_executor(
