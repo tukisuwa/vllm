@@ -26,7 +26,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     build_auto_weight_plan_from_catalog,
     execute_weight_plan,
 )
-from vllm.model_executor.models import qwen3
+from vllm.model_executor.models import llama, qwen3
 from vllm.model_executor.models.utils import WeightsMapper
 
 
@@ -910,6 +910,113 @@ def test_qwen3_load_weights_from_source_delegates_to_executor(monkeypatch):
     plan = WeightPlan(())
 
     loaded = qwen3.Qwen3ForCausalLM.load_weights_from_source(model, source, plan)
+
+    assert loaded == {"loaded"}
+    assert calls == [(model, source, plan)]
+
+
+def test_llama_build_weight_plan_uses_catalog_mapper_and_tie_skip(tmp_path):
+    metadata = {
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "model.layers.0.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "model.layers.0.mlp.gate_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [8, 12],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 12)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+
+    class FakeLlama:
+        config = FakeConfig()
+        hf_to_vllm_mapper = llama.LlamaForCausalLM.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = llama.LlamaForCausalLM.build_weight_plan(FakeLlama(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["lm_head.weight"].required is False
+    q_proj = entries["model.layers.0.self_attn.q_proj.weight"]
+    assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
+    assert q_proj.shard_id == "q"
+    gate_proj = entries["model.layers.0.mlp.gate_proj.weight"]
+    assert gate_proj.target_name == "model.layers.0.mlp.gate_up_proj.weight"
+    assert gate_proj.shard_id == 0
+
+
+def test_llama_build_weight_plan_uses_quant_cache_mapper_and_ignore_suffixes(
+    tmp_path,
+):
+    metadata = {
+        "cache_scale": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "ignored_quant.ignored": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 8)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeQuantConfig:
+        _ignore_unexpected_suffixes = [".ignored"]
+
+        def get_cache_scale_mapper(self):
+            return WeightsMapper(
+                orig_to_new_substr={"cache_scale": "model.layers.0.cache_scale"}
+            )
+
+    class FakeConfig:
+        tie_word_embeddings = False
+
+    class FakeChild:
+        quant_config = FakeQuantConfig()
+
+    class FakeLlama:
+        config = FakeConfig()
+        hf_to_vllm_mapper = llama.LlamaForCausalLM.hf_to_vllm_mapper
+
+        def children(self):
+            return [FakeChild()]
+
+    plan = llama.LlamaForCausalLM.build_weight_plan(FakeLlama(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["cache_scale"].target_name == "model.layers.0.cache_scale"
+    assert entries["ignored_quant.ignored"].ignore_missing is True
+
+
+def test_llama_load_weights_from_source_delegates_to_executor(monkeypatch):
+    calls = []
+
+    def fake_execute(model, source, plan):
+        calls.append((model, source, plan))
+        return {"loaded"}
+
+    monkeypatch.setattr(llama, "execute_weight_plan", fake_execute)
+    model = object()
+    source = object()
+    plan = WeightPlan(())
+
+    loaded = llama.LlamaForCausalLM.load_weights_from_source(model, source, plan)
 
     assert loaded == {"loaded"}
     assert calls == [(model, source, plan)]

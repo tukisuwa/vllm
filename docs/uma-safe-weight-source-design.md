@@ -306,6 +306,10 @@ Implemented so far:
   - applies `WeightsMapper`-style name and shard mapping before payload reads
   - can mark known ignorable missing suffixes such as `.bias`
   - keeps missing target detection fail-closed in the executor
+- `build_auto_weight_plan_for_module(...)`
+  - adds AutoWeightsLoader-compatible quant cache-scale mapper composition
+  - adds module quant-config ignored suffixes
+  - keeps model hooks small and consistent across dense model families
 - `execute_weight_plan(...)`
   - resolves target parameters before payload reads
   - skips `ignore_missing` entries before payload reads
@@ -358,7 +362,7 @@ Remaining:
 
 ### Phase 3: Dense model prototype
 
-Status: started with `Qwen3ForCausalLM`.
+Status: started with `Qwen3ForCausalLM` and `LlamaForCausalLM`.
 
 Start with Llama/Qwen dense, not MoE.
 
@@ -370,12 +374,13 @@ Why:
 
 Target behavior:
 
-- plan skips tied `lm_head`: implemented for Qwen3
+- plan skips tied `lm_head`: implemented for Qwen3 and Llama
 - plan skips rotary/cache tensors: implemented through shared auto-plan helper
 - plan maps q/k/v into qkv placement before read: implemented through
   `hf_to_vllm_mapper` and `shard_id`
+- plan maps gate/up into gate_up placement before read: implemented for Llama
 - plan includes AutoWeightsLoader-compatible quant cache-scale mapper and
-  ignored suffix handling for Qwen3
+  ignored suffix handling for Qwen3 and Llama
 - plan can read only local TP shard where possible: not implemented yet
 
 Current limitations:

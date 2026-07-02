@@ -48,7 +48,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
     TensorCatalog,
     WeightPlan,
-    build_auto_weight_plan_from_catalog,
+    build_auto_weight_plan_for_module,
     execute_weight_plan,
 )
 from vllm.sequence import IntermediateTensors
@@ -346,20 +346,11 @@ class Qwen3ForCausalLM(
         return loader.load_weights(weights)
 
     def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
-        mapper = self.hf_to_vllm_mapper
-        ignore_unexpected_suffixes = [".bias"]
-        modules = (self, *self.children())
-        iterator = (m.quant_config for m in modules if hasattr(m, "quant_config"))
-        if quant_config := next(iterator, None):
-            cache_scale_mapper = quant_config.get_cache_scale_mapper()
-            if cache_scale_mapper is not None:
-                mapper = mapper | cache_scale_mapper
-            ignore_unexpected_suffixes.extend(quant_config._ignore_unexpected_suffixes)
-        return build_auto_weight_plan_from_catalog(
+        return build_auto_weight_plan_for_module(
+            self,
             catalog,
-            mapper=mapper,
+            mapper=self.hf_to_vllm_mapper,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
-            ignore_unexpected_suffixes=ignore_unexpected_suffixes,
         )
 
     def load_weights_from_source(

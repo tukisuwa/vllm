@@ -299,6 +299,38 @@ def build_auto_weight_plan_from_catalog(
     return WeightPlan(tuple(entries))
 
 
+def build_auto_weight_plan_for_module(
+    module: nn.Module,
+    catalog: "TensorCatalog",
+    *,
+    mapper: object | None = None,
+    skip_prefixes: list[str] | None = None,
+    skip_substrs: list[str] | None = None,
+) -> WeightPlan:
+    """Build an AutoWeightsLoader-like plan for a real vLLM module."""
+
+    ignore_unexpected_suffixes = [".bias"]
+    modules = (module, *module.children())
+    iterator = (m.quant_config for m in modules if hasattr(m, "quant_config"))
+    if quant_config := next(iterator, None):
+        cache_scale_mapper = quant_config.get_cache_scale_mapper()
+        if cache_scale_mapper is not None:
+            mapper = (
+                mapper | cache_scale_mapper
+                if mapper is not None
+                else cache_scale_mapper
+            )
+        ignore_unexpected_suffixes.extend(quant_config._ignore_unexpected_suffixes)
+
+    return build_auto_weight_plan_from_catalog(
+        catalog,
+        mapper=mapper,
+        skip_prefixes=skip_prefixes,
+        skip_substrs=skip_substrs,
+        ignore_unexpected_suffixes=ignore_unexpected_suffixes,
+    )
+
+
 def _resolve_attr(root: object, path: str) -> object:
     current = root
     for part in path.split("."):
