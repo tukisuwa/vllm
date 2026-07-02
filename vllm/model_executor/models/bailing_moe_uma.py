@@ -14,12 +14,12 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 )
 from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
+    WeightPlan,
 )
 
 from .routed_moe_uma import (
     RoutedExpertsResolution,
     RoutedMoeEntry,
-    RoutedMoeSourcePlan,
     build_routed_moe_weight_plan,
     load_routed_moe_weights_from_source,
 )
@@ -27,7 +27,7 @@ from .utils import PPMissingLayer, WeightsMapper
 
 
 BailingMoeRoutedEntry = RoutedMoeEntry
-BailingMoeSourcePlan = RoutedMoeSourcePlan
+BailingMoeSourcePlan = WeightPlan
 NameTransform = Callable[
     [str], tuple[str, Callable[[torch.Tensor], torch.Tensor] | None] | None
 ]

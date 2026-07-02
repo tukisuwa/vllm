@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """UMA-safe WeightSource helpers for Granite MoE checkpoints."""
 
-from dataclasses import dataclass
 from typing import Any
 
 from torch import nn
@@ -19,17 +18,14 @@ from vllm.model_executor.model_loader.weight_plan import (
 
 from .routed_moe_uma import (
     RoutedMoeEntry,
-    RoutedMoeSourcePlan,
     load_routed_moe_weights_from_source,
     routed_entry_requires_local_read,
+    routed_moe_entries_to_weight_plan,
 )
 from .utils import PPMissingLayer
 
 
-@dataclass(frozen=True)
-class GraniteMoeSourcePlan:
-    auto_plan: WeightPlan
-    routed_entries: tuple[RoutedMoeEntry, ...]
+GraniteMoeSourcePlan = WeightPlan
 
 
 class _GraniteSourceMapper:
@@ -207,7 +203,7 @@ def build_granite_moe_weight_plan(
     skip_prefixes: list[str] | None = None,
     include_weight_scales: bool = False,
     map_a_log: bool = False,
-) -> GraniteMoeSourcePlan:
+) -> WeightPlan:
     routed_entries = _make_granite_expert_entries(
         model,
         catalog,
@@ -245,9 +241,13 @@ def build_granite_moe_weight_plan(
             continue
         rewritten_entries.append(entry)
 
-    return GraniteMoeSourcePlan(
-        auto_plan=WeightPlan(tuple(rewritten_entries)),
-        routed_entries=tuple(routed_entries),
+    return routed_moe_entries_to_weight_plan(
+        model,
+        WeightPlan(tuple(rewritten_entries)),
+        tuple(routed_entries),
+        family_name="Granite MoE",
+        get_routed_experts=_get_routed_experts_for_layer,
+        require_registered_params=False,
     )
 
 
@@ -256,11 +256,10 @@ def load_granite_moe_weights_from_source(
     source: ODirectSafetensorsWeightSource,
     plan: GraniteMoeSourcePlan,
 ) -> set[str]:
-    source_plan = RoutedMoeSourcePlan(plan.auto_plan, plan.routed_entries)
     return load_routed_moe_weights_from_source(
         model,
         source,
-        source_plan,
+        plan,
         family_name="Granite MoE",
         get_routed_experts=_get_routed_experts_for_layer,
     )

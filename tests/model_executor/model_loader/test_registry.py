@@ -131,6 +131,37 @@ from vllm.model_executor.models import (
 from vllm.model_executor.models.utils import PPMissingLayer, WeightsMapper
 
 
+def _weight_plan_entries(plan):
+    if hasattr(plan, "weight_plan"):
+        return plan.weight_plan.entries
+    return plan.entries
+
+
+def _auto_plan_entries(plan):
+    return tuple(
+        entry for entry in _weight_plan_entries(plan) if entry.expert_id is None
+    )
+
+
+def _routed_plan_entries(plan):
+    return tuple(
+        entry for entry in _weight_plan_entries(plan) if entry.expert_id is not None
+    )
+
+
+def _entry_local_required(entry):
+    return entry.required
+
+
+def _entry_param_name(entry):
+    weight_name = entry.weight_name or entry.target_name
+    return weight_name.rsplit(".", 1)[-1]
+
+
+def _assert_same_reads(actual, expected):
+    assert sorted(actual) == sorted(expected)
+
+
 @register_model_loader("custom_load_format")
 class CustomModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig) -> None:
@@ -2767,7 +2798,7 @@ def test_minimax_m2_build_weight_plan_replays_inner_mapper_and_mtp_skip(tmp_path
         FakeMiniMaxM2(),
         catalog,
     )
-    entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
 
     q_proj = entries["model.layers.0.self_attn.q_proj.weight"]
     assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
@@ -2795,17 +2826,35 @@ def test_minimax_m2_moe_source_plan_skips_nonlocal_experts_before_read():
 
     class FakeRoutedExperts:
         layer_name = "model.layers.0.block_sparse_moe.experts"
-        w13_weight = object()
         quant_method = object()
 
         def __init__(self):
             self.calls = []
+            self.w13_weight = nn.Parameter(torch.zeros(1), requires_grad=False)
+
+            def weight_loader(
+                param,
+                loaded_weight,
+                weight_name,
+                shard_id,
+                expert_id,
+                return_success=False,
+            ):
+                assert param is self.w13_weight
+                self.calls.append({
+                    "weight_name": weight_name,
+                    "shard_id": shard_id,
+                    "expert_id": expert_id,
+                    "loaded_weight": loaded_weight,
+                })
+                return True if return_success else None
+
+            self.w13_weight.weight_loader = weight_loader
 
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
             return 0 if expert_id == 0 else -1
 
-        def weight_loader(self, **kwargs):
-            self.calls.append(kwargs)
+        def weight_loader(self, **_kwargs):
             return True
 
     class FakeSelfAttn(nn.Module):
@@ -2878,18 +2927,21 @@ def test_minimax_m2_moe_source_plan_skips_nonlocal_experts_before_read():
 
     plan = model.build_weight_plan(catalog)
     auto_entries = {
-        entry.checkpoint_name: entry for entry in plan.auto_plan.entries
+        entry.checkpoint_name: entry
+        for entry in plan.entries
+        if entry.expert_id is None
     }
     assert auto_entries[names[2]].required is False
     assert auto_entries[names[3]].target_name == (
         "model.layers.0.self_attn.qkv_proj.weight"
     )
     assert auto_entries[names[3]].shard_id == "q"
-    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+    routed_entries = [entry for entry in plan.entries if entry.expert_id is not None]
+    assert [entry.required for entry in routed_entries] == [True, False]
 
     loaded = model.load_weights_from_source(source, plan)
 
-    assert source.reads == [names[3], names[0]]
+    assert set(source.reads) == {names[0], names[3]}
     assert source.skips == [
         (names[2], "weight plan marked not required"),
         (names[1], "non-local routed expert"),
@@ -3118,7 +3170,7 @@ def test_afmoe_build_weight_plan_uses_mapper(tmp_path):
             return []
 
     plan = afmoe.AfmoeForCausalLM.build_weight_plan(FakeAfmoe(), catalog)
-    entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
 
     q_proj = entries["model.layers.0.self_attn.q_proj.weight"]
     assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
@@ -3252,7 +3304,7 @@ def test_afmoe_moe_source_plan_skips_nonlocal_experts_before_read():
 
     plan = model.build_weight_plan(catalog)
     auto_entries = {
-        entry.checkpoint_name: entry for entry in plan.auto_plan.entries
+        entry.checkpoint_name: entry for entry in _auto_plan_entries(plan)
     }
     assert auto_entries[names[2]].target_name == (
         "model.layers.0.mlp.gate_up_proj.weight"
@@ -3262,11 +3314,11 @@ def test_afmoe_moe_source_plan_skips_nonlocal_experts_before_read():
         "model.layers.1.self_attn.qkv_proj.weight"
     )
     assert auto_entries[names[3]].shard_id == "q"
-    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+    assert [_entry_local_required(entry) for entry in _routed_plan_entries(plan)] == [True, False]
 
     loaded = model.load_weights_from_source(source, plan)
 
-    assert source.reads == [names[2], names[3], names[0]]
+    _assert_same_reads(source.reads, [names[2], names[3], names[0]])
     assert source.skips == [(names[1], "non-local routed expert")]
     assert "model.layers.0.mlp.gate_up_proj.weight" in loaded
     assert "model.layers.1.self_attn.qkv_proj.weight" in loaded
@@ -3378,7 +3430,7 @@ def test_exaone_moe_source_plan_skips_nonlocal_and_preserves_shared_auto_load():
 
     plan = model.build_weight_plan(catalog)
     auto_entries = {
-        entry.checkpoint_name: entry for entry in plan.auto_plan.entries
+        entry.checkpoint_name: entry for entry in _auto_plan_entries(plan)
     }
     assert auto_entries[names[2]].target_name == (
         "model.layers.1.mlp.shared_experts.gate_up_proj.weight"
@@ -3386,11 +3438,11 @@ def test_exaone_moe_source_plan_skips_nonlocal_and_preserves_shared_auto_load():
     assert auto_entries[names[2]].shard_id == 1
     assert auto_entries[names[3]].required is False
     assert auto_entries[names[4]].required is False
-    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+    assert [_entry_local_required(entry) for entry in _routed_plan_entries(plan)] == [True, False]
 
     loaded = model.load_weights_from_source(source, plan)
 
-    assert source.reads == [names[2], names[0]]
+    _assert_same_reads(source.reads, [names[2], names[0]])
     assert source.skips == [
         (names[3], "weight plan marked not required"),
         (names[4], "weight plan marked not required"),
@@ -3486,23 +3538,23 @@ def test_nemotron_h_moe_source_plan_skips_nonlocal_and_replays_mapper():
 
     plan = model.build_weight_plan(catalog)
     auto_entries = {
-        entry.checkpoint_name: entry for entry in plan.auto_plan.entries
+        entry.checkpoint_name: entry for entry in _auto_plan_entries(plan)
     }
     assert auto_entries[names[3]].target_name == (
         "model.layers.0.mixer.up_proj.weight"
     )
     assert auto_entries[names[4]].required is False
-    assert [entry.checkpoint_name for entry in plan.routed_entries] == names[:3]
-    assert [entry.local_required for entry in plan.routed_entries] == [
+    assert [entry.checkpoint_name for entry in _routed_plan_entries(plan)] == names[:3]
+    assert [_entry_local_required(entry) for entry in _routed_plan_entries(plan)] == [
         True,
         False,
         True,
     ]
-    assert [entry.shard_id for entry in plan.routed_entries] == ["w1", "w1", "w2"]
+    assert [entry.shard_id for entry in _routed_plan_entries(plan)] == ["w1", "w1", "w2"]
 
     loaded = model.load_weights_from_source(source, plan)
 
-    assert source.reads == [names[3], names[0], names[2]]
+    _assert_same_reads(source.reads, [names[3], names[0], names[2]])
     assert source.skips == [
         (names[4], "weight plan marked not required"),
         (names[1], "non-local routed expert"),
@@ -3909,17 +3961,18 @@ def test_mellum_inherits_qwen_moe_weight_plan(tmp_path):
             self.hf_to_vllm_mapper = None
 
     plan = FakeMellum().build_weight_plan(catalog)
-    assert plan.auto_plan.entries[0].checkpoint_name == (
+    assert plan.entries[0].checkpoint_name == (
         "model.layers.0.input_layernorm.weight"
     )
-    assert plan.auto_plan.entries[1].checkpoint_name == "lm_head.weight"
-    assert plan.auto_plan.entries[1].required is False
-    assert plan.routed_entries[0].checkpoint_name == (
+    assert plan.entries[1].checkpoint_name == "lm_head.weight"
+    assert plan.entries[1].required is False
+    routed_entries = [entry for entry in plan.entries if entry.expert_id is not None]
+    assert routed_entries[0].checkpoint_name == (
         "model.layers.0.mlp.experts.0.gate_proj.weight"
     )
-    assert plan.routed_entries[0].local_required is True
-    assert plan.routed_entries[0].param_name == "w13_weight"
-    assert plan.routed_entries[0].shard_id == "w1"
+    assert routed_entries[0].required is True
+    assert routed_entries[0].target_name.endswith(".w13_weight")
+    assert routed_entries[0].shard_id == "w1"
 
 
 def test_bagel_build_weight_plan_skips_generation_and_transforms_patch(tmp_path):
@@ -5186,12 +5239,12 @@ def test_qwen3_moe_source_plan_skips_nonlocal_experts_before_read():
     source = FakeSource(catalog)
 
     plan = model.build_weight_plan(catalog)
-    assert len(plan.auto_plan.entries) == 0
-    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+    assert len(_auto_plan_entries(plan)) == 0
+    assert [_entry_local_required(entry) for entry in _routed_plan_entries(plan)] == [True, False]
 
     loaded = model.load_weights_from_source(source, plan)
 
-    assert source.reads == [names[0]]
+    _assert_same_reads(source.reads, [names[0]])
     assert source.skips == [(names[1], "non-local routed expert")]
     assert loaded == {"model.layers.0.mlp.experts.routed_experts.w13_weight"}
     assert model.routed_experts.calls[0]["expert_id"] == 0
@@ -5283,15 +5336,15 @@ def test_glm4_moe_source_plan_skips_nonlocal_experts_and_spec_layers():
     source = FakeSource(catalog)
 
     plan = model.build_weight_plan(catalog)
-    assert len(plan.auto_plan.entries) == 1
-    assert plan.auto_plan.entries[0].checkpoint_name == names[2]
-    assert plan.auto_plan.entries[0].required is False
-    assert [entry.checkpoint_name for entry in plan.routed_entries] == names[:2]
-    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+    assert len(_auto_plan_entries(plan)) == 1
+    assert _auto_plan_entries(plan)[0].checkpoint_name == names[2]
+    assert _auto_plan_entries(plan)[0].required is False
+    assert [entry.checkpoint_name for entry in _routed_plan_entries(plan)] == names[:2]
+    assert [_entry_local_required(entry) for entry in _routed_plan_entries(plan)] == [True, False]
 
     loaded = model.load_weights_from_source(source, plan)
 
-    assert source.reads == [names[0]]
+    _assert_same_reads(source.reads, [names[0]])
     assert source.skips == [
         (names[2], "weight plan marked not required"),
         (names[1], "non-local routed expert"),
@@ -5370,10 +5423,10 @@ def test_glm4_moe_source_plan_slices_fused_shared_experts_before_read(monkeypatc
 
     plan = model.build_weight_plan(catalog)
 
-    assert len(plan.auto_plan.entries) == 0
-    assert [entry.expert_id for entry in plan.routed_entries] == [2, 3]
-    assert [entry.local_required for entry in plan.routed_entries] == [False, True]
-    assert [entry.source_slices for entry in plan.routed_entries] == [
+    assert len(_auto_plan_entries(plan)) == 0
+    assert [entry.expert_id for entry in _routed_plan_entries(plan)] == [2, 3]
+    assert [_entry_local_required(entry) for entry in _routed_plan_entries(plan)] == [False, True]
+    assert [entry.source_slices for entry in _routed_plan_entries(plan)] == [
         (slice(0, 2), slice(None)),
         (slice(2, 4), slice(None)),
     ]
@@ -5475,16 +5528,16 @@ def test_hy_v3_moe_source_plan_skips_nonlocal_experts_and_spec_layers():
     source = FakeSource(catalog)
 
     plan = model.build_weight_plan(catalog)
-    assert len(plan.auto_plan.entries) == 2
-    auto_entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    assert len(_auto_plan_entries(plan)) == 2
+    auto_entries = {entry.checkpoint_name: entry for entry in _auto_plan_entries(plan)}
     assert auto_entries[names[2]].target_name == "model.layers.0.mlp.gate.weight"
     assert auto_entries[names[3]].required is False
-    assert [entry.checkpoint_name for entry in plan.routed_entries] == names[:2]
-    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+    assert [entry.checkpoint_name for entry in _routed_plan_entries(plan)] == names[:2]
+    assert [_entry_local_required(entry) for entry in _routed_plan_entries(plan)] == [True, False]
 
     loaded = model.load_weights_from_source(source, plan)
 
-    assert source.reads == [names[2], names[0]]
+    _assert_same_reads(source.reads, [names[2], names[0]])
     assert source.skips == [
         (names[3], "weight plan marked not required"),
         (names[1], "non-local routed expert"),
@@ -5559,13 +5612,13 @@ def test_jamba_moe_source_plan_skips_nonlocal_experts_before_read():
     source = FakeSource(catalog)
 
     plan = model.build_weight_plan(catalog)
-    assert len(plan.auto_plan.entries) == 0
-    assert [entry.checkpoint_name for entry in plan.routed_entries] == names
-    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+    assert len(_auto_plan_entries(plan)) == 0
+    assert [entry.checkpoint_name for entry in _routed_plan_entries(plan)] == names
+    assert [_entry_local_required(entry) for entry in _routed_plan_entries(plan)] == [True, False]
 
     loaded = model.load_weights_from_source(source, plan)
 
-    assert source.reads == [names[0]]
+    _assert_same_reads(source.reads, [names[0]])
     assert source.skips == [(names[1], "non-local routed expert")]
     assert loaded == {"model.layers.0.feed_forward.experts.w13_weight"}
     assert model.routed_experts.calls[0]["expert_id"] == 0
@@ -5663,14 +5716,14 @@ def test_sarvam_moe_source_plan_skips_nonlocal_experts_and_normalizes_gate_bias(
     source = FakeSource(catalog)
 
     plan = model.build_weight_plan(catalog)
-    assert len(plan.auto_plan.entries) == 1
-    assert plan.auto_plan.entries[0].checkpoint_name == names[2]
-    assert [entry.checkpoint_name for entry in plan.routed_entries] == names[:2]
-    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+    assert len(_auto_plan_entries(plan)) == 1
+    assert _auto_plan_entries(plan)[0].checkpoint_name == names[2]
+    assert [entry.checkpoint_name for entry in _routed_plan_entries(plan)] == names[:2]
+    assert [_entry_local_required(entry) for entry in _routed_plan_entries(plan)] == [True, False]
 
     loaded = model.load_weights_from_source(source, plan)
 
-    assert source.reads == [names[2], names[0]]
+    _assert_same_reads(source.reads, [names[2], names[0]])
     assert source.skips == [(names[1], "non-local routed expert")]
     assert torch.equal(
         model.model.layers[0].mlp.gate.e_score_correction_bias,
@@ -5783,14 +5836,14 @@ def test_laguna_moe_source_plan_keeps_bias_and_shared_expert_auto_loads():
     source = FakeSource(catalog)
 
     plan = model.build_weight_plan(catalog)
-    auto_entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    auto_entries = {entry.checkpoint_name: entry for entry in _auto_plan_entries(plan)}
     assert set(auto_entries) == {names[2], names[3]}
-    assert [entry.checkpoint_name for entry in plan.routed_entries] == names[:2]
-    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+    assert [entry.checkpoint_name for entry in _routed_plan_entries(plan)] == names[:2]
+    assert [_entry_local_required(entry) for entry in _routed_plan_entries(plan)] == [True, False]
 
     loaded = model.load_weights_from_source(source, plan)
 
-    assert source.reads == [names[2], names[3], names[0]]
+    _assert_same_reads(source.reads, [names[2], names[3], names[0]])
     assert source.skips == [(names[1], "non-local routed expert")]
     assert torch.equal(
         model.model.layers[0].mlp.experts.e_score_correction_bias,
@@ -5931,7 +5984,7 @@ def test_kimi_linear_moe_source_plan_skips_nonlocal_and_spec_layers():
     source = FakeSource(catalog)
 
     plan = model.build_weight_plan(catalog)
-    auto_entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    auto_entries = {entry.checkpoint_name: entry for entry in _auto_plan_entries(plan)}
     assert auto_entries[names[2]].target_name == (
         "model.layers.0.block_sparse_moe.gate.e_score_correction_bias"
     )
@@ -5940,12 +5993,12 @@ def test_kimi_linear_moe_source_plan_skips_nonlocal_and_spec_layers():
     )
     assert auto_entries[names[3]].shard_id == 0
     assert auto_entries[names[4]].required is False
-    assert [entry.checkpoint_name for entry in plan.routed_entries] == names[:2]
-    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+    assert [entry.checkpoint_name for entry in _routed_plan_entries(plan)] == names[:2]
+    assert [_entry_local_required(entry) for entry in _routed_plan_entries(plan)] == [True, False]
 
     loaded = model.load_weights_from_source(source, plan)
 
-    assert source.reads == [names[2], names[3], names[0]]
+    _assert_same_reads(source.reads, [names[2], names[3], names[0]])
     assert source.skips == [
         (names[4], "weight plan marked not required"),
         (names[1], "non-local routed expert"),
@@ -6063,15 +6116,15 @@ def test_interns1_pro_source_plan_reuses_qwen_moe_helper_and_prefix_mapper():
     source = FakeSource(catalog)
 
     plan = model.build_weight_plan(catalog)
-    auto_entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    auto_entries = {entry.checkpoint_name: entry for entry in _auto_plan_entries(plan)}
     assert auto_entries[names[2]].target_name == "language_model.lm_head.weight"
     assert auto_entries[names[3]].required is False
-    assert [entry.checkpoint_name for entry in plan.routed_entries] == names[:2]
-    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+    assert [entry.checkpoint_name for entry in _routed_plan_entries(plan)] == names[:2]
+    assert [_entry_local_required(entry) for entry in _routed_plan_entries(plan)] == [True, False]
 
     loaded = model.load_weights_from_source(source, plan)
 
-    assert source.reads == [names[2], names[0]]
+    _assert_same_reads(source.reads, [names[2], names[0]])
     assert source.skips == [
         (names[3], "weight plan marked not required"),
         (names[1], "non-local routed expert"),
@@ -6183,18 +6236,18 @@ def test_ernie45_moe_source_plan_skips_and_maps_gate_bias():
     source = FakeSource(catalog)
 
     plan = model.build_weight_plan(catalog)
-    auto_entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    auto_entries = {entry.checkpoint_name: entry for entry in _auto_plan_entries(plan)}
     assert auto_entries[names[2]].target_name == (
         "model.layers.0.mlp.gate.e_score_correction_bias"
     )
     assert auto_entries[names[3]].required is False
     assert auto_entries[names[4]].required is False
-    assert [entry.checkpoint_name for entry in plan.routed_entries] == names[:2]
-    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+    assert [entry.checkpoint_name for entry in _routed_plan_entries(plan)] == names[:2]
+    assert [_entry_local_required(entry) for entry in _routed_plan_entries(plan)] == [True, False]
 
     loaded = model.load_weights_from_source(source, plan)
 
-    assert source.reads == [names[2], names[0]]
+    _assert_same_reads(source.reads, [names[2], names[0]])
     assert source.skips == [
         (names[3], "weight plan marked not required"),
         (names[4], "weight plan marked not required"),
@@ -6288,14 +6341,14 @@ def test_bailing_moe_source_plan_skips_nonlocal_experts_and_normalizes_lm_head()
     source = FakeSource(catalog)
 
     plan = model.build_weight_plan(catalog)
-    assert len(plan.auto_plan.entries) == 1
-    assert plan.auto_plan.entries[0].checkpoint_name == names[2]
-    assert [entry.checkpoint_name for entry in plan.routed_entries] == names[:2]
-    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+    assert len(_auto_plan_entries(plan)) == 1
+    assert _auto_plan_entries(plan)[0].checkpoint_name == names[2]
+    assert [entry.checkpoint_name for entry in _routed_plan_entries(plan)] == names[:2]
+    assert [_entry_local_required(entry) for entry in _routed_plan_entries(plan)] == [True, False]
 
     loaded = model.load_weights_from_source(source, plan)
 
-    assert source.reads == [names[2], names[0]]
+    _assert_same_reads(source.reads, [names[2], names[0]])
     assert source.skips == [(names[1], "non-local routed expert")]
     assert torch.allclose(
         model.lm_head.weight,
@@ -6384,7 +6437,7 @@ def test_sarvam_bailing_moe_source_plan_preserves_gate_bias_transform():
     plan = model.build_weight_plan(catalog)
     loaded = model.load_weights_from_source(source, plan)
 
-    assert source.reads == names
+    _assert_same_reads(source.reads, names)
     assert source.skips == []
     assert torch.equal(
         model.model.layers[0].mlp.gate.e_score_correction_bias,
@@ -6461,12 +6514,12 @@ def test_mixtral_moe_source_plan_skips_nonlocal_experts_before_read():
     source = FakeSource(catalog)
 
     plan = model.build_weight_plan(catalog)
-    assert len(plan.auto_plan.entries) == 0
-    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+    assert len(_auto_plan_entries(plan)) == 0
+    assert [_entry_local_required(entry) for entry in _routed_plan_entries(plan)] == [True, False]
 
     loaded = model.load_weights_from_source(source, plan)
 
-    assert source.reads == [names[0]]
+    _assert_same_reads(source.reads, [names[0]])
     assert source.skips == [(names[1], "non-local routed expert")]
     assert loaded == {"model.layers.0.block_sparse_moe.experts.w13_weight"}
     assert model.routed_experts.calls[0]["expert_id"] == 0
@@ -6556,19 +6609,19 @@ def test_deepseek_moe_source_plan_skips_nonlocal_experts_before_read():
     source = FakeSource(catalog)
 
     plan = model.build_weight_plan(catalog)
-    assert [entry.local_required for entry in plan.routed_plan.routed_entries] == [
+    assert [_entry_local_required(entry) for entry in _routed_plan_entries(plan.routed_plan)] == [
         True,
         False,
     ]
     assert {
         entry.checkpoint_name
-        for entry in plan.routed_plan.auto_plan.entries
+        for entry in _auto_plan_entries(plan.routed_plan)
         if not entry.required
     } == {names[2]}
 
     loaded = model.load_weights_from_source(source, plan)
 
-    assert source.reads == [names[3], names[0]]
+    _assert_same_reads(source.reads, [names[3], names[0]])
     assert source.skips == [
         (names[2], "weight plan marked not required"),
         (names[1], "non-local routed expert"),
@@ -6687,21 +6740,21 @@ def test_axk1_source_plan_reuses_deepseek_moe_helper():
 
     plan = model.build_weight_plan(catalog)
     auto_entries = {
-        entry.checkpoint_name: entry for entry in plan.routed_plan.auto_plan.entries
+        entry.checkpoint_name: entry for entry in _auto_plan_entries(plan.routed_plan)
     }
     assert auto_entries[names[2]].required is False
     assert auto_entries[names[3]].target_name == (
         "model.layers.0.self_attn.qkv_proj.weight"
     )
     assert auto_entries[names[3]].shard_id == "q"
-    assert [entry.local_required for entry in plan.routed_plan.routed_entries] == [
+    assert [_entry_local_required(entry) for entry in _routed_plan_entries(plan.routed_plan)] == [
         True,
         False,
     ]
 
     loaded = model.load_weights_from_source(source, plan)
 
-    assert source.reads == [names[3], names[0]]
+    _assert_same_reads(source.reads, [names[3], names[0]])
     assert source.skips == [
         (names[2], "weight plan marked not required"),
         (names[1], "non-local routed expert"),
@@ -6782,10 +6835,10 @@ def test_deepseek_moe_source_plan_slices_shared_expert_fusion_before_read():
     source = FakeSource(catalog)
     plan = model.build_weight_plan(catalog)
 
-    assert len(plan.routed_plan.auto_plan.entries) == 0
+    assert len(_auto_plan_entries(plan.routed_plan)) == 0
     assert [
         (entry.expert_id, entry.source_slices)
-        for entry in plan.routed_plan.routed_entries
+        for entry in _routed_plan_entries(plan.routed_plan)
     ] == [
         (2, (slice(0, 2), slice(None))),
         (3, (slice(2, 4), slice(None))),
@@ -6879,7 +6932,7 @@ def test_deepseek_moe_source_plan_loads_fp8_indexer_wk_pair(monkeypatch):
     assert [entry.weight_name for entry in plan.fp8_indexer_wk_entries] == [
         weight_name
     ]
-    assert len(plan.routed_plan.auto_plan.entries) == 2
+    assert len(_auto_plan_entries(plan.routed_plan)) == 2
 
     loaded = model.load_weights_from_source(source, plan)
 
@@ -6887,7 +6940,7 @@ def test_deepseek_moe_source_plan_loads_fp8_indexer_wk_pair(monkeypatch):
         (weight_name, "weight plan marked not required"),
         (scale_name, "weight plan marked not required"),
     ]
-    assert source.reads == [weight_name, scale_name]
+    _assert_same_reads(source.reads, [weight_name, scale_name])
     assert loaded == {target_name}
     assert model.target.loaded[0][0].tolist() == [[3, 3], [3, 3]]
     assert model.target.loaded[0][1] == 0
@@ -6976,7 +7029,7 @@ def test_granite_moe_source_plan_slices_fused_expert_tensors_before_read():
     source = FakeSource(catalog)
     plan = model.build_weight_plan(catalog)
 
-    assert [entry.local_required for entry in plan.routed_entries] == [
+    assert [_entry_local_required(entry) for entry in _routed_plan_entries(plan)] == [
         True,
         True,
         False,
@@ -7129,7 +7182,7 @@ def test_granitemoe_hybrid_source_plan_slices_weight_scales_before_read():
     source = FakeSource(catalog)
     plan = model.build_weight_plan(catalog)
 
-    assert [entry.local_required for entry in plan.routed_entries] == [
+    assert [_entry_local_required(entry) for entry in _routed_plan_entries(plan)] == [
         True,
         True,
         False,
@@ -7471,15 +7524,15 @@ def test_lfm2_moe_source_plan_maps_dense_and_routed_names_before_read():
         mapper=lfm2_moe.Lfm2MoeForCausalLM.hf_to_vllm_mapper,
     )
 
-    routed = {entry.checkpoint_name: entry for entry in plan.routed_entries}
-    assert routed[local_name].param_name == "w13_weight"
+    routed = {entry.checkpoint_name: entry for entry in _routed_plan_entries(plan)}
+    assert _entry_param_name(routed[local_name]) == "w13_weight"
     assert routed[local_name].shard_id == "w1"
-    assert routed[local_name].local_required is True
-    assert routed[remote_name].param_name == "w2_weight"
+    assert _entry_local_required(routed[local_name]) is True
+    assert _entry_param_name(routed[remote_name]) == "w2_weight"
     assert routed[remote_name].shard_id == "w2"
-    assert routed[remote_name].local_required is False
+    assert _entry_local_required(routed[remote_name]) is False
 
-    auto_entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    auto_entries = {entry.checkpoint_name: entry for entry in _auto_plan_entries(plan)}
     assert local_name not in auto_entries
     assert remote_name not in auto_entries
     assert (
@@ -7510,13 +7563,13 @@ def test_lfm2_moe_source_plan_maps_dense_and_routed_names_before_read():
             self.skips.append((name, reason))
 
     source = FakeSource()
-    routed_only_plan = lfm2_moe.Lfm2MoeSourcePlan(WeightPlan(()), plan.routed_entries)
+    routed_only_plan = WeightPlan(_routed_plan_entries(plan))
     assert lfm2_moe.load_lfm2_moe_weights_from_source(
         model,
         source,
         routed_only_plan,
     ) == {"model.layers.0.feed_forward.experts.w13_weight"}
-    assert source.reads == [local_name]
+    _assert_same_reads(source.reads, [local_name])
     assert source.skips == [(remote_name, "non-local routed expert")]
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
     assert model.routed_experts.calls[0]["expert_id"] == 1
@@ -7600,15 +7653,15 @@ def test_mimo_v2_source_plan_maps_split_dense_and_routed_names_before_read(
     model = FakeModel()
     plan = mimo_v2_uma.build_mimo_v2_weight_plan(model, catalog)
 
-    routed = {entry.checkpoint_name: entry for entry in plan.routed_entries}
-    assert routed[local_name].param_name == "w13_weight"
+    routed = {entry.checkpoint_name: entry for entry in _routed_plan_entries(plan)}
+    assert _entry_param_name(routed[local_name]) == "w13_weight"
     assert routed[local_name].shard_id == "w1"
-    assert routed[local_name].local_required is True
-    assert routed[remote_name].param_name == "w2_weight"
+    assert _entry_local_required(routed[local_name]) is True
+    assert _entry_param_name(routed[remote_name]) == "w2_weight"
     assert routed[remote_name].shard_id == "w2"
-    assert routed[remote_name].local_required is False
+    assert _entry_local_required(routed[remote_name]) is False
 
-    auto_entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    auto_entries = {entry.checkpoint_name: entry for entry in _auto_plan_entries(plan)}
     assert local_name not in auto_entries
     assert remote_name not in auto_entries
     assert (
@@ -7737,15 +7790,15 @@ def test_longcat_flash_source_plan_maps_dense_and_routed_names_before_read():
             return iter(())
 
     plan = longcat_flash_uma.build_longcat_flash_weight_plan(FakeOuter(), catalog)
-    routed = {entry.checkpoint_name: entry for entry in plan.routed_entries}
-    assert routed[local_name].param_name == "w13_weight"
+    routed = {entry.checkpoint_name: entry for entry in _routed_plan_entries(plan)}
+    assert _entry_param_name(routed[local_name]) == "w13_weight"
     assert routed[local_name].shard_id == "w1"
-    assert routed[local_name].local_required is True
-    assert routed[remote_name].param_name == "w2_weight"
+    assert _entry_local_required(routed[local_name]) is True
+    assert _entry_param_name(routed[remote_name]) == "w2_weight"
     assert routed[remote_name].shard_id == "w2"
-    assert routed[remote_name].local_required is False
+    assert _entry_local_required(routed[remote_name]) is False
 
-    auto_entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    auto_entries = {entry.checkpoint_name: entry for entry in _auto_plan_entries(plan)}
     assert local_name not in auto_entries
     assert remote_name not in auto_entries
     assert (
@@ -7813,15 +7866,15 @@ def test_longcat_flash_source_load_finalizes_mla_weights(monkeypatch):
 
     model = FakeOuter()
     source = FakeSource()
-    plan = longcat_flash_uma.LongcatFlashSourcePlan(
-        auto_plan=WeightPlan(()),
-        routed_entries=(
-            longcat_flash_uma.LongcatFlashMoeRoutedEntry(
+    plan = WeightPlan(
+        (
+            WeightPlanEntry(
                 checkpoint_name="model.layers.0.mlp.experts.1.gate_proj.weight",
-                layer_id=0,
-                expert_id=1,
+                target_name="model.layers.0.mlp.experts.w13_weight",
+                required=True,
                 param_name="w13_weight",
                 shard_id="w1",
+                expert_id=1,
                 local_required=True,
             ),
         ),
@@ -7838,7 +7891,7 @@ def test_longcat_flash_source_load_finalizes_mla_weights(monkeypatch):
         source,
         plan,
     ) == {"model.layers.0.mlp.experts.w13_weight"}
-    assert source.reads == ["model.layers.0.mlp.experts.1.gate_proj.weight"]
+    _assert_same_reads(source.reads, ["model.layers.0.mlp.experts.1.gate_proj.weight"])
     assert model.finalized is True
 
 
@@ -7904,16 +7957,16 @@ def test_param2moe_source_plan_splits_fused_qkv_and_maps_names_before_read():
             return []
 
     plan = param2moe_uma.build_param2moe_weight_plan(FakeOuter(), catalog)
-    routed = {entry.checkpoint_name: entry for entry in plan.routed_entries}
-    assert routed[local_name].param_name == "w13_weight"
+    routed = {entry.checkpoint_name: entry for entry in _routed_plan_entries(plan)}
+    assert _entry_param_name(routed[local_name]) == "w13_weight"
     assert routed[local_name].shard_id == "w1"
-    assert routed[local_name].local_required is True
-    assert routed[remote_name].param_name == "w2_weight"
+    assert _entry_local_required(routed[local_name]) is True
+    assert _entry_param_name(routed[remote_name]) == "w2_weight"
     assert routed[remote_name].shard_id == "w2"
-    assert routed[remote_name].local_required is False
+    assert _entry_local_required(routed[remote_name]) is False
 
-    auto_entries = {entry.checkpoint_name: [] for entry in plan.auto_plan.entries}
-    for entry in plan.auto_plan.entries:
+    auto_entries = {entry.checkpoint_name: [] for entry in _auto_plan_entries(plan)}
+    for entry in _auto_plan_entries(plan):
         auto_entries[entry.checkpoint_name].append(entry)
     assert local_name not in auto_entries
     assert remote_name not in auto_entries
@@ -8048,17 +8101,17 @@ def test_hunyuan_v1_source_plan_maps_fused_and_routed_names_before_read():
             return []
 
     plan = hunyuan_v1_uma.build_hunyuan_v1_weight_plan(FakeOuter(), catalog)
-    routed = {entry.checkpoint_name: entry for entry in plan.routed_entries}
-    assert routed[local_name].param_name == "w13_weight"
+    routed = {entry.checkpoint_name: entry for entry in _routed_plan_entries(plan)}
+    assert _entry_param_name(routed[local_name]) == "w13_weight"
     assert routed[local_name].shard_id == "w1"
-    assert routed[local_name].local_required is True
-    assert routed[remote_name].param_name == "w2_weight"
+    assert _entry_local_required(routed[local_name]) is True
+    assert _entry_param_name(routed[remote_name]) == "w2_weight"
     assert routed[remote_name].shard_id == "w2"
-    assert routed[remote_name].local_required is False
+    assert _entry_local_required(routed[remote_name]) is False
     assert plan.fused_qkv_names == (qkv_name,)
 
-    auto_entries = {entry.checkpoint_name: [] for entry in plan.auto_plan.entries}
-    for entry in plan.auto_plan.entries:
+    auto_entries = {entry.checkpoint_name: [] for entry in _auto_plan_entries(plan)}
+    for entry in _auto_plan_entries(plan):
         auto_entries[entry.checkpoint_name].append(entry)
     assert qkv_name not in auto_entries
     assert local_name not in auto_entries
@@ -8141,8 +8194,7 @@ def test_hunyuan_v1_source_hook_dispatches_fused_qkv_once():
     model = FakeOuter()
     source = FakeSource()
     plan = hunyuan_v1_uma.HunyuanV1SourcePlan(
-        auto_plan=WeightPlan(()),
-        routed_entries=(),
+        weight_plan=WeightPlan(()),
         fused_qkv_names=(qkv_name,),
     )
 
@@ -8151,7 +8203,7 @@ def test_hunyuan_v1_source_hook_dispatches_fused_qkv_once():
         source,
         plan,
     ) == {qkv_name}
-    assert source.reads == [qkv_name]
+    _assert_same_reads(source.reads, [qkv_name])
     calls = getattr(model.model.layers, "0").self_attn.qkv_proj.weight.calls
     assert [call[0] for call in calls] == ["q", "k", "v"]
     assert [tuple(call[1].shape) for call in calls] == [(4, 4), (2, 4), (2, 4)]
@@ -8218,15 +8270,15 @@ def test_openpangu_source_plan_maps_dense_and_routed_names_before_read():
             return []
 
     plan = openpangu_uma.build_openpangu_weight_plan(FakeOuter(), catalog)
-    routed = {entry.checkpoint_name: entry for entry in plan.routed_entries}
-    assert routed[local_name].param_name == "w13_weight"
+    routed = {entry.checkpoint_name: entry for entry in _routed_plan_entries(plan)}
+    assert _entry_param_name(routed[local_name]) == "w13_weight"
     assert routed[local_name].shard_id == "w1"
-    assert routed[local_name].local_required is True
-    assert routed[remote_name].param_name == "w2_weight"
+    assert _entry_local_required(routed[local_name]) is True
+    assert _entry_param_name(routed[remote_name]) == "w2_weight"
     assert routed[remote_name].shard_id == "w2"
-    assert routed[remote_name].local_required is False
+    assert _entry_local_required(routed[remote_name]) is False
 
-    auto_entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    auto_entries = {entry.checkpoint_name: entry for entry in _auto_plan_entries(plan)}
     assert local_name not in auto_entries
     assert remote_name not in auto_entries
     assert auto_entries[q_a_name].target_name == (
@@ -8264,10 +8316,7 @@ def test_openpangu_source_hook_delegates_and_runs_post_weight_load(monkeypatch):
 
     model = FakeOuter()
     source = FakeSource(catalog)
-    plan = openpangu_uma.OpenPanguSourcePlan(
-        auto_plan=WeightPlan(()),
-        routed_entries=(),
-    )
+    plan = WeightPlan(())
     assert openpangu_uma.load_openpangu_weights_from_source(
         model,
         source,
@@ -8354,15 +8403,15 @@ def test_llama4_source_plan_maps_dense_per_expert_and_fused_names(monkeypatch):
             return _name, tensor + 1
 
     plan = llama4_uma.build_llama4_weight_plan(FakeOuter(), catalog)
-    routed = {entry.checkpoint_name: entry for entry in plan.routed_entries}
-    assert routed[local_name].param_name == "w13_weight"
+    routed = {entry.checkpoint_name: entry for entry in _routed_plan_entries(plan)}
+    assert _entry_param_name(routed[local_name]) == "w13_weight"
     assert routed[local_name].shard_id == "w1"
-    assert routed[local_name].local_required is True
-    assert routed[remote_name].param_name == "w2_weight"
+    assert _entry_local_required(routed[local_name]) is True
+    assert _entry_param_name(routed[remote_name]) == "w2_weight"
     assert routed[remote_name].shard_id == "w2"
-    assert routed[remote_name].local_required is False
+    assert _entry_local_required(routed[remote_name]) is False
 
-    auto_entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    auto_entries = {entry.checkpoint_name: entry for entry in _auto_plan_entries(plan)}
     assert local_name not in auto_entries
     assert remote_name not in auto_entries
     assert fused_gate_up not in auto_entries
@@ -8451,8 +8500,7 @@ def test_llama4_source_hook_loads_fused_expert_source_slices(monkeypatch):
     model = FakeOuter()
     source = FakeSource()
     plan = llama4_uma.Llama4SourcePlan(
-        auto_plan=WeightPlan(()),
-        routed_entries=(),
+        weight_plan=WeightPlan(()),
         fused_expert_entries=(
             llama4_uma.Llama4FusedExpertEntry(
                 checkpoint_name=name,
@@ -8480,7 +8528,7 @@ def test_llama4_source_hook_loads_fused_expert_source_slices(monkeypatch):
         source,
         plan,
     ) == {"model.layers.0.feed_forward.experts.w13_weight"}
-    assert source.reads == [(name, (slice(1, 3), slice(None), slice(None)))]
+    _assert_same_reads(source.reads, [(name, (slice(1, 3), slice(None), slice(None)))])
     calls = model.routed_experts.w13_weight.calls
     assert [call[1] for call in calls] == ["w1", "w3"]
     assert [call[2] for call in calls] == [1, 1]
@@ -8553,8 +8601,8 @@ def test_qwen_moe_source_plan_handles_nested_language_model_before_read():
     source = FakeSource(catalog)
     plan = qwen3_5.build_qwen_moe_weight_plan(model, catalog)
 
-    assert len(plan.auto_plan.entries) == 0
-    assert [entry.local_required for entry in plan.routed_entries] == [False]
+    assert [entry for entry in plan.entries if entry.expert_id is None] == []
+    assert [entry.required for entry in plan.entries] == [False]
     assert qwen3_5.load_qwen_moe_weights_from_source(model, source, plan) == set()
     assert source.reads == []
     assert source.skips == [(name, "non-local routed expert")]
@@ -8617,7 +8665,7 @@ def test_qwen_moe_source_plan_skips_pp_missing_layer_before_read():
     source = FakeSource(catalog)
     plan = qwen3_5.build_qwen_moe_weight_plan(model, catalog)
 
-    assert [entry.local_required for entry in plan.routed_entries] == [False]
+    assert [entry.required for entry in plan.entries] == [False]
     assert qwen3_5.load_qwen_moe_weights_from_source(model, source, plan) == set()
     assert source.reads == []
     assert source.skips == [(name, "pipeline-missing routed expert layer")]

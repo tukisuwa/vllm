@@ -12,12 +12,12 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 )
 from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
+    WeightPlan,
 )
 
 from .routed_moe_uma import (
     RoutedExpertsResolution,
     RoutedMoeEntry,
-    RoutedMoeSourcePlan,
     build_routed_moe_weight_plan,
     load_routed_moe_weights_from_source,
 )
@@ -25,7 +25,7 @@ from .utils import PPMissingLayer, WeightsMapper
 
 
 HyV3MoeRoutedEntry = RoutedMoeEntry
-HyV3MoeSourcePlan = RoutedMoeSourcePlan
+HyV3MoeSourcePlan = WeightPlan
 
 
 class _HyV3SourceMapper:

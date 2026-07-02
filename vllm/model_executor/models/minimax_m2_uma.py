@@ -17,14 +17,13 @@ from vllm.model_executor.model_loader.weight_plan import (
 
 from .routed_moe_uma import (
     RoutedExpertsResolution,
-    RoutedMoeSourcePlan,
     build_routed_moe_weight_plan,
     load_routed_moe_weights_from_source,
 )
 from .utils import PPMissingLayer, WeightsMapper
 
 
-MiniMaxM2MoeSourcePlan = RoutedMoeSourcePlan
+MiniMaxM2MoeSourcePlan = WeightPlan
 
 
 def _parse_minimax_m2_routed_expert_name(
@@ -121,12 +120,12 @@ def build_minimax_m2_moe_weight_plan(
     )
 
     entries = []
-    for entry in plan.auto_plan:
-        if entry.checkpoint_name.startswith("model."):
+    for entry in plan:
+        if entry.expert_id is None and entry.checkpoint_name.startswith("model."):
             entries.append(replace(entry, target_name=f"model.{entry.target_name}"))
         else:
             entries.append(entry)
-    return MiniMaxM2MoeSourcePlan(WeightPlan(tuple(entries)), plan.routed_entries)
+    return WeightPlan(tuple(entries))
 
 
 def load_minimax_m2_moe_weights_from_source(

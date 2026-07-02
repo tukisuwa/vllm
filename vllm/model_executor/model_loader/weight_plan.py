@@ -534,6 +534,9 @@ def resolve_weight_plan_source_hooks(
 def _resolve_attr(root: object, path: str) -> object:
     current = root
     for part in path.split("."):
+        if isinstance(current, (list, tuple)) and part.isdigit():
+            current = current[int(part)]
+            continue
         if not hasattr(current, part):
             raise RuntimeError(f"Cannot resolve weight plan target {path!r}")
         current = getattr(current, part)

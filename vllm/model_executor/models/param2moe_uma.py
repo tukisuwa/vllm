@@ -20,7 +20,6 @@ from vllm.model_executor.models.utils import WeightsMapper
 from .routed_moe_uma import (
     RoutedExpertsResolution,
     RoutedMoeEntry,
-    RoutedMoeSourcePlan,
     build_routed_moe_weight_plan,
     load_routed_moe_weights_from_source,
 )
@@ -28,7 +27,7 @@ from .utils import PPMissingLayer
 
 
 Param2MoeRoutedEntry = RoutedMoeEntry
-Param2MoeSourcePlan = RoutedMoeSourcePlan
+Param2MoeSourcePlan = WeightPlan
 
 
 def _zero_mean_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -203,14 +202,11 @@ def build_param2moe_weight_plan(
         name_transform=_param2moe_name_transform,
         skip_prefixes=(["lm_head."] if model.tie_word_embeddings else None),
     )
-    auto_entries = [
-        entry for entry in plan.auto_plan.entries
+    entries = [
+        entry for entry in plan.entries
         if entry.checkpoint_name not in qkv_names
     ]
-    return Param2MoeSourcePlan(
-        auto_plan=WeightPlan(tuple(auto_entries) + tuple(qkv_entries)),
-        routed_entries=plan.routed_entries,
-    )
+    return WeightPlan(tuple(entries) + tuple(qkv_entries))
 
 
 def load_param2moe_weights_from_source(

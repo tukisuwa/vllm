@@ -26,7 +26,6 @@ from vllm.model_executor.models.utils import WeightsMapper
 from .routed_moe_uma import (
     RoutedExpertsResolution,
     RoutedMoeEntry,
-    RoutedMoeSourcePlan,
     build_routed_moe_weight_plan,
     load_routed_moe_weights_from_source,
 )
@@ -186,7 +185,7 @@ def _apply_attention_sink_slices(
 def build_mimo_v2_weight_plan(
     model: nn.Module,
     catalog: TensorCatalog,
-) -> RoutedMoeSourcePlan:
+) -> WeightPlan:
     _reject_unsupported_fp8_qkv(catalog)
     plan = build_routed_moe_weight_plan(
         model,
@@ -199,10 +198,7 @@ def build_mimo_v2_weight_plan(
         mapper=_mimo_v2_weight_mapper(),
         name_transform=_mimo_v2_name_transform,
     )
-    return RoutedMoeSourcePlan(
-        auto_plan=_apply_attention_sink_slices(catalog, plan.auto_plan),
-        routed_entries=plan.routed_entries,
-    )
+    return _apply_attention_sink_slices(catalog, plan)
 
 
 def build_mimo_v2_flash_weight_plan(
@@ -220,7 +216,7 @@ def build_mimo_v2_flash_weight_plan(
 def load_mimo_v2_weights_from_source(
     model: nn.Module,
     source: ODirectSafetensorsWeightSource,
-    plan: RoutedMoeSourcePlan,
+    plan: WeightPlan,
 ) -> set[str]:
     return load_routed_moe_weights_from_source(
         model,

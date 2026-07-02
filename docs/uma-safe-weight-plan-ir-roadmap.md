@@ -749,22 +749,18 @@ Working stance until an upstream RFC exists:
 
 For this branch, the next useful work is, in priority order (items completed
 on 2026-07-03: the loaded-set completeness check, the load-side routed-plan
-fold, moving TP slice inference into plan resolution, and Phase 2.5 stage 1
-read-window reuse — see Implementation Notes):
+fold, moving TP slice inference into plan resolution, Phase 2.5 read-window
+reuse and read scheduling, and build-side routed-plan unification — see
+Implementation Notes):
 
-1. Phase 2.5 stage 2: `ReadSchedulePlan` — order plan entries by
-   (file, offset) where semantics allow, coalesce nearby ranges, and report
-   expected read amplification in the plan summary before execution (this
-   also removes the residual second pass over expert regions from routed
-   entries being appended after the auto plan);
-2. finish routed-plan unification on the build side so model hooks return a
-   plain `WeightPlan` instead of `RoutedMoeSourcePlan`;
-3. replace `transform` callables with named registry ops that declare their
+1. remove the temporary `RoutedMoeSourcePlan` compatibility class and helper
+   once downstream call sites have been audited;
+2. replace `transform` callables with named registry ops that declare their
    staging factor;
-4. move symlink/path validation into `TensorCatalog` construction;
-5. begin `parse_name` spec-ification to stop further `*_uma.py` growth
+3. move symlink/path validation into `TensorCatalog` construction;
+4. begin `parse_name` spec-ification to stop further `*_uma.py` growth
    (Phase 3);
-6. keep adding a short design note in each future model hook explaining which
+5. keep adding a short design note in each future model hook explaining which
    generic spec pattern it should eventually become.
 
 This lets the branch keep solving the immediate UMA safety problem while moving
@@ -1042,3 +1038,33 @@ depend on incidental auto-plan catalog ordering.  Phase 2.5 is therefore closed
 for the current branch: expected read amplification is reported before
 execution and actual-vs-expected drift is now a standing load-log regression
 signal.
+
+### 2026-07-03 build-side routed-plan unification
+
+`build_routed_moe_weight_plan()` now returns a plain `WeightPlan`.  Routed MoE
+entries are folded during plan construction, not between build and load, so
+`WeightPlanExecutor` again sees the declared `build_weight_plan(catalog) ->
+WeightPlan` contract for pass-through MoE families.
+
+The model-family hooks that used to expose `RoutedMoeSourcePlan` as their
+source plan type now alias their source plan to `WeightPlan`.  The post-process
+families that rewrote `auto_plan` / `routed_entries` between build and load
+were migrated to operate on first-class `WeightPlanEntry` records:
+
+- HunYuan v1 keeps only fused-qkv side entries outside the common plan;
+- Llama4 keeps only fused expert source-slice entries outside the common plan;
+- MiniMax M2, MiMo v2, Param2MoE, Granite MoE, LongCat Flash, and OpenPangu
+  now filter or annotate `WeightPlan.entries` directly.
+
+Local routed entries carry `shard_id`, `expert_id`, and `weight_name` on the
+plan entry; non-local routed entries are ordinary skipped entries with the same
+routed metadata and `skip_reason="non-local routed expert"`.  The executor also
+accepts routed expert wrappers where the custom loader lives on the parent
+expert module rather than the parameter object, preserving the routed loader
+call convention after unification.
+
+The old `RoutedMoeSourcePlan` class and
+`routed_moe_source_plan_to_weight_plan()` helper remain as a short-lived
+compatibility layer for audited downstream callers and focused unit tests.  They
+are no longer returned by current build hooks; deleting that compatibility layer
+is now a small follow-up rather than a blocker for Phase 3.

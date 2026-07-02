@@ -18,12 +18,12 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 )
 from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
+    WeightPlan,
 )
 
 from .routed_moe_uma import (
     RoutedMoeEntry,
     RoutedExpertsResolution,
-    RoutedMoeSourcePlan,
     build_routed_moe_weight_plan,
     load_routed_moe_weights_from_source,
     routed_entry_requires_local_read,
@@ -40,7 +40,7 @@ class DeepseekFp8IndexerWkEntry:
 
 @dataclass(frozen=True)
 class DeepseekMoeSourcePlan:
-    routed_plan: RoutedMoeSourcePlan
+    routed_plan: WeightPlan
     fp8_indexer_wk_entries: tuple[DeepseekFp8IndexerWkEntry, ...] = ()
 
 

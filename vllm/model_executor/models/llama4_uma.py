@@ -11,6 +11,7 @@ from torch import nn
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
     _call_weight_loader,
+    execute_weight_plan,
     _resolve_attr,
 )
 from vllm.model_executor.model_loader.weight_plan import (
@@ -23,9 +24,7 @@ from .llama4 import Llama4MoE
 from .routed_moe_uma import (
     RoutedExpertsResolution,
     RoutedMoeEntry,
-    RoutedMoeSourcePlan,
     build_routed_moe_weight_plan,
-    load_routed_moe_weights_from_source,
 )
 from .utils import PPMissingLayer
 
@@ -46,8 +45,7 @@ class Llama4FusedExpertEntry:
 
 @dataclass(frozen=True)
 class Llama4SourcePlan:
-    auto_plan: WeightPlan
-    routed_entries: tuple[Llama4RoutedEntry, ...]
+    weight_plan: WeightPlan
     fused_expert_entries: tuple[Llama4FusedExpertEntry, ...]
 
 
@@ -252,7 +250,7 @@ def build_llama4_weight_plan(
     catalog: TensorCatalog,
 ) -> Llama4SourcePlan:
     fused_entries, fused_names = _collect_fused_expert_entries(model, catalog)
-    routed_plan = build_routed_moe_weight_plan(
+    weight_plan = build_routed_moe_weight_plan(
         model,
         catalog,
         family_name="Llama4",
@@ -265,14 +263,13 @@ def build_llama4_weight_plan(
         skip_prefixes=(["lm_head."] if model.config.tie_word_embeddings else None),
         skip_predicate=lambda name: name in fused_names,
     )
-    auto_entries = [
+    entries = [
         entry
-        for entry in routed_plan.auto_plan.entries
+        for entry in weight_plan.entries
         if entry.checkpoint_name not in fused_names
     ]
     return Llama4SourcePlan(
-        auto_plan=WeightPlan(tuple(auto_entries)),
-        routed_entries=routed_plan.routed_entries,
+        weight_plan=WeightPlan(tuple(entries)),
         fused_expert_entries=tuple(fused_entries),
     )
 
@@ -314,6 +311,7 @@ def _dispatch_fused_expert_entry(
             "shard_id": entry.shard_id,
             "expert_id": entry.expert_id,
         },
+        entry_name=entry.checkpoint_name,
     )
     return entry.target_name
 
@@ -341,12 +339,6 @@ def load_llama4_weights_from_source(
     source: ODirectSafetensorsWeightSource,
     plan: Llama4SourcePlan,
 ) -> set[str]:
-    loaded = load_routed_moe_weights_from_source(
-        model,
-        source,
-        RoutedMoeSourcePlan(plan.auto_plan, plan.routed_entries),
-        family_name="Llama4",
-        get_routed_experts=_get_routed_experts_for_layer,
-    )
+    loaded = execute_weight_plan(model, source, plan.weight_plan)
     loaded.update(_load_fused_expert_entries(model, source, plan.fused_expert_entries))
     return loaded

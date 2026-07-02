@@ -86,7 +86,7 @@ def build_routed_moe_weight_plan(
     skip_predicate: Callable[[str], bool] | None = None,
     ignore_unexpected_suffixes: list[str] | None = None,
     extra_routed_entries: list[RoutedMoeEntry] | None = None,
-) -> RoutedMoeSourcePlan:
+) -> WeightPlan:
     routed_entries: list[RoutedMoeEntry] = []
     for name in catalog.names():
         parsed = parse_name(name)
@@ -140,15 +140,27 @@ def build_routed_moe_weight_plan(
     auto_plan = WeightPlan(
         tuple(entry for entry in auto_plan if entry.checkpoint_name not in routed_names)
     )
-    return RoutedMoeSourcePlan(auto_plan, tuple(routed_entries))
+    return routed_moe_entries_to_weight_plan(
+        model,
+        auto_plan,
+        tuple(routed_entries),
+        family_name=family_name,
+        get_routed_experts=lambda m, layer_id: resolve_routed_experts(
+            m,
+            layer_id,
+        ).routed_experts,
+        require_registered_params=False,
+    )
 
 
-def routed_moe_source_plan_to_weight_plan(
+def routed_moe_entries_to_weight_plan(
     model: nn.Module,
-    plan: RoutedMoeSourcePlan,
+    auto_plan: WeightPlan,
+    routed_entries: tuple[RoutedMoeEntry, ...],
     *,
     family_name: str,
     get_routed_experts: Callable[[nn.Module, int], Any | None],
+    require_registered_params: bool = True,
 ) -> WeightPlan:
     """Fold routed entries into one executable `WeightPlan`.
 
@@ -158,14 +170,18 @@ def routed_moe_source_plan_to_weight_plan(
     """
 
     param_names: dict[int, str] | None = None
-    entries: list[WeightPlanEntry] = list(plan.auto_plan.entries)
-    for entry in plan.routed_entries:
+    entries: list[WeightPlanEntry] = list(auto_plan.entries)
+    for entry in routed_entries:
         if not entry.local_required:
             entries.append(
                 WeightPlanEntry(
                     checkpoint_name=entry.checkpoint_name,
                     target_name=entry.checkpoint_name,
                     required=False,
+                    shard_id=entry.shard_id,
+                    expert_id=entry.expert_id,
+                    weight_name=entry.param_name,
+                    source_slices=entry.source_slices,
                     skip_reason=entry.skip_reason or "non-local routed expert",
                 )
             )
@@ -182,16 +198,21 @@ def routed_moe_source_plan_to_weight_plan(
                 f"{entry.param_name!r} does not exist for {entry.checkpoint_name}"
             )
         if param_names is None:
-            param_names = {
-                id(param): name for name, param in model.named_parameters()
-            }
+            named_parameters = getattr(model, "named_parameters", None)
+            param_names = (
+                {id(param): name for name, param in named_parameters()}
+                if callable(named_parameters)
+                else {}
+            )
         target_name = param_names.get(id(getattr(routed_experts, entry.param_name)))
         if target_name is None:
-            raise RuntimeError(
-                f"{family_name} routed expert parameter {entry.param_name!r} "
-                f"for {entry.checkpoint_name} is not a registered model "
-                "parameter"
-            )
+            if require_registered_params:
+                raise RuntimeError(
+                    f"{family_name} routed expert parameter {entry.param_name!r} "
+                    f"for {entry.checkpoint_name} is not a registered model "
+                    "parameter"
+                )
+            target_name = f"{routed_experts.layer_name}.{entry.param_name}"
         entries.append(
             WeightPlanEntry(
                 checkpoint_name=entry.checkpoint_name,
@@ -205,10 +226,28 @@ def routed_moe_source_plan_to_weight_plan(
     return WeightPlan(tuple(entries))
 
 
+def routed_moe_source_plan_to_weight_plan(
+    model: nn.Module,
+    plan: RoutedMoeSourcePlan | WeightPlan,
+    *,
+    family_name: str,
+    get_routed_experts: Callable[[nn.Module, int], Any | None],
+) -> WeightPlan:
+    if isinstance(plan, WeightPlan):
+        return plan
+    return routed_moe_entries_to_weight_plan(
+        model,
+        plan.auto_plan,
+        plan.routed_entries,
+        family_name=family_name,
+        get_routed_experts=get_routed_experts,
+    )
+
+
 def load_routed_moe_weights_from_source(
     model: nn.Module,
     source: ODirectSafetensorsWeightSource,
-    plan: RoutedMoeSourcePlan,
+    plan: RoutedMoeSourcePlan | WeightPlan,
     *,
     family_name: str,
     get_routed_experts: Callable[[nn.Module, int], Any | None],

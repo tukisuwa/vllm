@@ -11,6 +11,7 @@ from torch import nn
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
     _call_weight_loader,
+    execute_weight_plan,
     _resolve_attr,
 )
 from vllm.model_executor.model_loader.weight_plan import (
@@ -24,9 +25,7 @@ from .hunyuan_v1 import _get_cla_factor, _is_moe
 from .routed_moe_uma import (
     RoutedExpertsResolution,
     RoutedMoeEntry,
-    RoutedMoeSourcePlan,
     build_routed_moe_weight_plan,
-    load_routed_moe_weights_from_source,
 )
 from .utils import PPMissingLayer
 
@@ -35,8 +34,7 @@ HunyuanV1RoutedEntry = RoutedMoeEntry
 
 @dataclass(frozen=True)
 class HunyuanV1SourcePlan:
-    auto_plan: WeightPlan
-    routed_entries: tuple[HunyuanV1RoutedEntry, ...]
+    weight_plan: WeightPlan
     fused_qkv_names: tuple[str, ...]
 
 
@@ -246,7 +244,7 @@ def build_hunyuan_v1_weight_plan(
         catalog,
     )
     skip_prefixes = ["lm_head."] if model.config.tie_word_embeddings else None
-    routed_plan = build_routed_moe_weight_plan(
+    weight_plan = build_routed_moe_weight_plan(
         model,
         catalog,
         family_name="HunYuan",
@@ -264,14 +262,13 @@ def build_hunyuan_v1_weight_plan(
             or _is_cross_layer_q_proj(model, name)
         ),
     )
-    auto_entries = [
+    entries = [
         entry
-        for entry in routed_plan.auto_plan.entries
+        for entry in weight_plan.entries
         if entry.checkpoint_name not in skip_auto
     ]
     return HunyuanV1SourcePlan(
-        auto_plan=WeightPlan(tuple(auto_entries) + tuple(fused_entries)),
-        routed_entries=routed_plan.routed_entries,
+        weight_plan=WeightPlan(tuple(entries) + tuple(fused_entries)),
         fused_qkv_names=fused_qkv_names,
     )
 
@@ -300,6 +297,7 @@ def _load_fused_qkv(
             shard,
             source_is_sharded=False,
             kwargs={"shard_id": shard_id},
+            entry_name=checkpoint_name,
         )
     return target_name
 
@@ -309,13 +307,7 @@ def load_hunyuan_v1_weights_from_source(
     source: ODirectSafetensorsWeightSource,
     plan: HunyuanV1SourcePlan,
 ) -> set[str]:
-    loaded = load_routed_moe_weights_from_source(
-        model,
-        source,
-        RoutedMoeSourcePlan(plan.auto_plan, plan.routed_entries),
-        family_name="HunYuan",
-        get_routed_experts=_get_routed_experts_for_layer,
-    )
+    loaded = execute_weight_plan(model, source, plan.weight_plan)
     for checkpoint_name in plan.fused_qkv_names:
         loaded.add(_load_fused_qkv(model, source, checkpoint_name))
     return loaded

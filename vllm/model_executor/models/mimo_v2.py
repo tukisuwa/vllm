@@ -66,7 +66,6 @@ from .mimo_v2_uma import (
     build_mimo_v2_weight_plan,
     load_mimo_v2_flash_weights_from_source,
     load_mimo_v2_weights_from_source,
-    RoutedMoeSourcePlan,
 )
 from .utils import (
     AutoWeightsLoader,
@@ -916,12 +915,12 @@ class MiMoV2ForCausalLM(MiMoV2FlashForCausalLM):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-    def build_weight_plan(self, catalog: TensorCatalog) -> RoutedMoeSourcePlan:
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
         return build_mimo_v2_weight_plan(self, catalog)
 
     def load_weights_from_source(
         self,
         source: ODirectSafetensorsWeightSource,
-        plan: RoutedMoeSourcePlan,
+        plan: WeightPlan,
     ) -> set[str]:
         return load_mimo_v2_weights_from_source(self, source, plan)

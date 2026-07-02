@@ -19,7 +19,9 @@ from vllm.model_executor.model_loader.weight_plan import (
 from vllm.model_executor.models.routed_moe_uma import (
     RoutedMoeEntry,
     RoutedMoeSourcePlan,
+    build_routed_moe_weight_plan,
     routed_moe_source_plan_to_weight_plan,
+    RoutedExpertsResolution,
 )
 
 
@@ -132,6 +134,32 @@ def test_routed_plan_folds_into_single_weight_plan_and_executes():
     ]
     assert model.experts.seen == [("experts.w13_weight", "w1", 0)]
     assert torch.equal(model.experts.w13_weight.data, tensor)
+
+
+def test_build_routed_moe_weight_plan_returns_weight_plan():
+    model = _Model()
+    plan = build_routed_moe_weight_plan(
+        model,
+        _catalog(),
+        family_name="Test",
+        parse_name=lambda name: (
+            (0, 0, "gate", "weight")
+            if name.endswith("experts.0.gate.weight")
+            else (0, 1, "gate", "weight")
+            if name.endswith("experts.1.gate.weight")
+            else None
+        ),
+        map_projection=lambda _proj, suffix: (f"w13_{suffix}", "w1"),
+        resolve_routed_experts=lambda _model, _layer_id: RoutedExpertsResolution(
+            model.experts
+        ),
+        auto_skip_substr=".experts.",
+    )
+
+    assert isinstance(plan, WeightPlan)
+    assert [entry.required for entry in plan.entries] == [True, True]
+    assert [entry.expert_id for entry in plan.entries] == [0, 1]
+    assert plan.entries[0].target_name == "experts.w13_weight"
 
 
 def test_refused_local_expert_fails_closed():
