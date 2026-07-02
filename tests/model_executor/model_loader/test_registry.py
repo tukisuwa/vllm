@@ -663,6 +663,84 @@ def test_uma_odirect_execute_weight_plan_reads_full_and_slice(tmp_path, monkeypa
     assert model.slice_param.loaded[0][1] == {"shard_id": "rows"}
 
 
+def test_uma_odirect_execute_weight_plan_infers_output_tp_slice(
+    tmp_path, monkeypatch
+):
+    metadata = {
+        "rows": {"dtype": "F32", "shape": [4, 3], "data_offsets": [0, 48]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 48)
+    calls = []
+
+    class FakeODirectFile:
+        window_size = 64 * 1024 * 1024
+
+        def __init__(self, *_args):
+            self.direct_reads = 0
+            self.window_loads = 0
+            self.window_hits = 0
+            self.bytes_read = 0
+            self.bytes_copied = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback):
+            pass
+
+        def read_record_into_tensor(self, tensor, offset, size, gate=None):
+            calls.append((offset, size, tuple(tensor.shape)))
+            self.direct_reads += 1
+            self.bytes_read += size
+            self.bytes_copied += size
+            tensor.fill_(9)
+            if gate is not None:
+                gate(size)
+
+    class FakeParam:
+        output_dim = 0
+        tp_rank = 1
+        tp_size = 2
+
+        def __init__(self):
+            self.data = torch.empty(2, 3)
+            self.loaded = []
+
+        def weight_loader(self, param, tensor, **kwargs):
+            assert param is self
+            assert getattr(self, "is_sharded_weight", False) is True
+            self.loaded.append((tensor.clone(), kwargs))
+
+    class FakeModel:
+        def __init__(self):
+            self.param = FakeParam()
+
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(load_format="uma_odirect_safetensors")
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.uma_odirect_safetensors_loader."
+        "_ODirectFile",
+        FakeODirectFile,
+    )
+    source = ODirectSafetensorsWeightSource(loader, str(tmp_path))
+    model = FakeModel()
+    plan = WeightPlan((WeightPlanEntry("rows", "param"),))
+
+    loaded = execute_weight_plan(model, source, plan)
+
+    rows_record = source.catalog.get("rows")
+    assert loaded == {"param"}
+    assert calls == [(rows_record.offset + 24, 24, (2, 3))]
+    assert not hasattr(model.param, "is_sharded_weight")
+    assert model.param.loaded[0][0].tolist() == [
+        [9.0, 9.0, 9.0],
+        [9.0, 9.0, 9.0],
+    ]
+
+
 def test_uma_odirect_execute_weight_plan_skips_not_required(tmp_path, monkeypatch):
     metadata = {"a": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
     path = tmp_path / "model.safetensors"

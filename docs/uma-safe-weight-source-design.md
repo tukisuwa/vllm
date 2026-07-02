@@ -381,14 +381,18 @@ Target behavior:
 - plan maps gate/up into gate_up placement before read: implemented for Llama
 - plan includes AutoWeightsLoader-compatible quant cache-scale mapper and
   ignored suffix handling for Qwen3 and Llama
-- plan can read only local TP shard where possible: not implemented yet
+- plan can read only local TP shard where possible: implemented for simple
+  output-dimension row shards where the source slice is contiguous; fused
+  q/k/v, gate/up, packed, and input-dimension shards still fall back to full
+  tensor reads
 
 Current limitations:
 
 - The first Qwen3 hook still reads each required checkpoint tensor as a CPU
   tensor, then delegates to existing parameter `weight_loader`.
 - It proves model-side planning and skip/map decisions before payload read, but
-  does not yet perform TP-local source slicing for fused/parallel parameters.
+  only performs conservative TP-local source slicing for simple contiguous
+  output-dimension shards.
 - Qwen3 MoE now has a first model-side source hook, but other MoE families and
   full removal of the older compatibility optimization remain Phase 4/5 work.
 

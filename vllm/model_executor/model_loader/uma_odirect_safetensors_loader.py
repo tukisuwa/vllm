@@ -215,6 +215,7 @@ class WeightPlanEntry:
     target_name: str
     required: bool = True
     source_slices: tuple[slice | int, ...] | None = None
+    source_is_sharded: bool = False
     shard_id: str | int | None = None
     expert_id: int | None = None
     weight_name: str | None = None
@@ -340,6 +341,76 @@ def _resolve_attr(root: object, path: str) -> object:
     return current
 
 
+def _infer_output_dim_source_slice(
+    param: object,
+    record: TensorMeta,
+) -> tuple[slice | int, ...] | None:
+    """Infer a safe source-side TP row slice for simple output-sharded params."""
+
+    output_dim = getattr(param, "output_dim", None)
+    if output_dim != 0:
+        return None
+    if getattr(param, "is_sharded_weight", False):
+        return None
+    if getattr(param, "use_bitsandbytes_4bit", False):
+        return None
+    if getattr(param, "packed_dim", None) == output_dim:
+        return None
+
+    param_data = getattr(param, "data", None)
+    if param_data is None:
+        return None
+    param_shape = list(param_data.shape)
+    if len(record.shape) != len(param_shape) or not param_shape:
+        return None
+
+    tp_rank = getattr(param, "tp_rank", None)
+    tp_size = getattr(param, "tp_size", None)
+    if not isinstance(tp_rank, int) or not isinstance(tp_size, int):
+        return None
+    if tp_size <= 1 or tp_rank < 0 or tp_rank >= tp_size:
+        return None
+
+    shard_size = param_shape[output_dim]
+    if shard_size <= 0:
+        return None
+    if record.shape[output_dim] != shard_size * tp_size:
+        return None
+    for dim, (source_size, target_size) in enumerate(zip(record.shape, param_shape)):
+        if dim == output_dim:
+            continue
+        if source_size != target_size:
+            return None
+
+    start = tp_rank * shard_size
+    return (slice(start, start + shard_size), *([slice(None)] * (len(param_shape) - 1)))
+
+
+def _call_weight_loader(
+    weight_loader: Callable,
+    param: object,
+    tensor: torch.Tensor,
+    *,
+    source_is_sharded: bool,
+    kwargs: dict[str, object],
+) -> None:
+    had_attr = hasattr(param, "is_sharded_weight")
+    old_value = getattr(param, "is_sharded_weight", None)
+    if source_is_sharded:
+        setattr(param, "is_sharded_weight", True)
+    try:
+        weight_loader(param, tensor, **kwargs)
+    finally:
+        if source_is_sharded:
+            if had_attr:
+                setattr(param, "is_sharded_weight", old_value)
+            else:
+                try:
+                    delattr(param, "is_sharded_weight")
+                except AttributeError:
+                    pass
+
+
 def execute_weight_plan(
     model: nn.Module,
     source: "ODirectSafetensorsWeightSource",
@@ -361,10 +432,19 @@ def execute_weight_plan(
                 continue
             raise
 
-        if entry.source_slices is None:
+        source_slices = entry.source_slices
+        source_is_sharded = entry.source_is_sharded
+        if source_slices is None and entry.shard_id is None:
+            source_slices = _infer_output_dim_source_slice(
+                param,
+                source.catalog.get(entry.checkpoint_name),
+            )
+            source_is_sharded = source_slices is not None
+
+        if source_slices is None:
             tensor = source.read_full_cpu(entry.checkpoint_name)
         else:
-            tensor = source.read_slice_cpu(entry.checkpoint_name, entry.source_slices)
+            tensor = source.read_slice_cpu(entry.checkpoint_name, source_slices)
 
         weight_loader = getattr(param, "weight_loader", None)
         if not callable(weight_loader):
@@ -379,7 +459,13 @@ def execute_weight_plan(
             kwargs["expert_id"] = entry.expert_id
         if entry.weight_name is not None:
             kwargs["weight_name"] = entry.weight_name
-        weight_loader(param, tensor, **kwargs)
+        _call_weight_loader(
+            weight_loader,
+            param,
+            tensor,
+            source_is_sharded=source_is_sharded,
+            kwargs=kwargs,
+        )
         loaded.add(entry.target_name)
     return loaded
 
