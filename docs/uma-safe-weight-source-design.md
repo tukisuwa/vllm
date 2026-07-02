@@ -505,7 +505,7 @@ Expected current behavior:
 | --- | --- | --- |
 | Dense safetensors | Should work if normal vLLM load works | Phase 3 |
 | Sharded dense safetensors | Should work if no duplicate names | Phase 3 |
-| Qwen routed MoE | Works; deprecated loader-side direct path remains | Phase 4 model hook |
+| Qwen routed MoE | Base path should work if normal vLLM load works | Phase 4 model hook; loader-side direct path removed |
 | Mixtral routed MoE | Base path should work if normal vLLM load works | Phase 5 initial model hook |
 | DeepSeek V2/V3 routed MoE | Base path should work if normal vLLM load works | Conservative Phase 5 hook; shared-expert fusion and FP8 indexer WK fusion rejected |
 | Granite MoE / Granite MoE Shared | Base path should work if normal vLLM load works | Phase 5 initial model hook |
