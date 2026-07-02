@@ -44,6 +44,7 @@ from vllm.model_executor.models import (
     ernie45_moe,
     ernie45_moe_uma,
     exaone,
+    exaone_moe,
     exaone4,
     falcon,
     falcon_h1,
@@ -3155,6 +3156,132 @@ def test_afmoe_moe_source_plan_skips_nonlocal_experts_before_read():
     assert "model.layers.1.mlp.experts.w13_weight" in loaded
     assert model.model.layers[1].self_attn.qkv_calls[0]["shard_id"] == "q"
     assert model.model.layers[0].mlp.gate_up_calls[0]["shard_id"] == 0
+    assert model.routed_experts.calls[0]["expert_id"] == 0
+    assert model.routed_experts.calls[0]["shard_id"] == "w1"
+
+
+def test_exaone_moe_source_plan_skips_nonlocal_and_preserves_shared_auto_load():
+    names = [
+        "model.layers.1.mlp.experts.0.gate_proj.weight",
+        "model.layers.1.mlp.experts.1.gate_proj.weight",
+        "model.layers.1.mlp.shared_experts.up_proj.weight",
+        "lm_head.weight",
+        "mtp.layers.0.self_attn.q_proj.weight",
+    ]
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", names[0], torch.float32, [1], 0, 4),
+            TensorMeta("model.safetensors", names[1], torch.float32, [1], 4, 4),
+            TensorMeta("model.safetensors", names[2], torch.float32, [1, 1], 8, 4),
+            TensorMeta("model.safetensors", names[3], torch.float32, [1], 12, 4),
+            TensorMeta("model.safetensors", names[4], torch.float32, [1], 16, 4),
+        ]
+    )
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.1.mlp.experts"
+        w13_weight = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 0 else -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeSharedExperts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = nn.Linear(1, 2, bias=False)
+            nn.init.zeros_(self.gate_up_proj.weight)
+            self.shared_calls = []
+
+            def weight_loader(param, loaded_weight, shard_id):
+                self.shared_calls.append(
+                    {
+                        "param": param,
+                        "loaded_weight": loaded_weight,
+                        "shard_id": shard_id,
+                    }
+                )
+                param.data.narrow(0, shard_id, 1).copy_(loaded_weight)
+
+            self.gate_up_proj.weight.weight_loader = weight_loader
+
+    class FakeMLP(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.experts = routed_experts
+            self.shared_experts = FakeSharedExperts()
+
+    class FakeLayer(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.mlp = FakeMLP(routed_experts)
+
+    class FakeInnerModel(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.layers = nn.ModuleList([
+                FakeLayer(routed_experts),
+                FakeLayer(routed_experts),
+            ])
+
+    class FakeConfig:
+        tie_word_embeddings = True
+
+    class FakeExaoneMoe(exaone_moe.ExaoneMoeForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = FakeConfig()
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            if name == names[2]:
+                return torch.tensor([[5.0]])
+            return torch.ones(1)
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    model = FakeExaoneMoe()
+    source = FakeSource(catalog)
+
+    plan = model.build_weight_plan(catalog)
+    auto_entries = {
+        entry.checkpoint_name: entry for entry in plan.auto_plan.entries
+    }
+    assert auto_entries[names[2]].target_name == (
+        "model.layers.1.mlp.shared_experts.gate_up_proj.weight"
+    )
+    assert auto_entries[names[2]].shard_id == 1
+    assert auto_entries[names[3]].required is False
+    assert auto_entries[names[4]].required is False
+    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+
+    loaded = model.load_weights_from_source(source, plan)
+
+    assert source.reads == [names[2], names[0]]
+    assert source.skips == [
+        (names[3], "weight plan marked not required"),
+        (names[4], "weight plan marked not required"),
+        (names[1], "non-local routed expert"),
+    ]
+    assert "model.layers.1.mlp.shared_experts.gate_up_proj.weight" in loaded
+    assert "model.layers.1.mlp.experts.w13_weight" in loaded
+    assert model.model.layers[1].mlp.shared_experts.shared_calls[0]["shard_id"] == 1
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 

@@ -592,10 +592,11 @@ def build_auto_weight_plan_for_module(
     skip_prefixes: list[str] | None = None,
     skip_substrs: list[str] | None = None,
     skip_predicate: Callable[[str], bool] | None = None,
+    ignore_unexpected_suffixes: list[str] | None = None,
 ) -> WeightPlan:
     """Build an AutoWeightsLoader-like plan for a real vLLM module."""
 
-    ignore_unexpected_suffixes = [".bias"]
+    merged_ignore_unexpected_suffixes = [".bias", *(ignore_unexpected_suffixes or [])]
     modules = (module, *module.children())
     iterator = (m.quant_config for m in modules if hasattr(m, "quant_config"))
     if quant_config := next(iterator, None):
@@ -606,7 +607,9 @@ def build_auto_weight_plan_for_module(
                 if mapper is not None
                 else cache_scale_mapper
             )
-        ignore_unexpected_suffixes.extend(quant_config._ignore_unexpected_suffixes)
+        merged_ignore_unexpected_suffixes.extend(
+            quant_config._ignore_unexpected_suffixes
+        )
 
     return build_auto_weight_plan_from_catalog(
         catalog,
@@ -615,7 +618,7 @@ def build_auto_weight_plan_for_module(
         skip_prefixes=skip_prefixes,
         skip_substrs=skip_substrs,
         skip_predicate=skip_predicate,
-        ignore_unexpected_suffixes=ignore_unexpected_suffixes,
+        ignore_unexpected_suffixes=merged_ignore_unexpected_suffixes,
     )
 
 

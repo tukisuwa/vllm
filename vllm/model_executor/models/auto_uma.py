@@ -29,6 +29,7 @@ def build_auto_uma_weight_plan(
     skip_prefixes: list[str] | None = None,
     skip_substrs: list[str] | None = None,
     skip_predicate: Callable[[str], bool] | None = None,
+    ignore_unexpected_suffixes: list[str] | None = None,
 ) -> WeightPlan:
     return build_auto_weight_plan_for_module(
         model,
@@ -38,6 +39,7 @@ def build_auto_uma_weight_plan(
         skip_prefixes=skip_prefixes,
         skip_substrs=skip_substrs,
         skip_predicate=skip_predicate,
+        ignore_unexpected_suffixes=ignore_unexpected_suffixes,
     )
 
 

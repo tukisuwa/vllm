@@ -41,10 +41,19 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.sequence import IntermediateTensors
 
 from .exaone4 import Exaone4Attention as ExaoneMoeAttention
 from .exaone4 import Exaone4GatedMLP as ExaoneMoeGatedMLP
+from .exaone_moe_uma import (
+    ExaoneMoeSourcePlan,
+    build_exaone_moe_weight_plan,
+    load_exaone_moe_weights_from_source,
+)
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
@@ -442,3 +451,32 @@ class ExaoneMoeForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             ],
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> ExaoneMoeSourcePlan:
+        return build_exaone_moe_weight_plan(
+            self,
+            catalog,
+            mapper=self.hf_to_vllm_mapper,
+            skip_prefixes=(
+                ["lm_head.", "mtp."] if self.config.tie_word_embeddings else ["mtp."]
+            ),
+            ignore_unexpected_suffixes=[
+                ".bias",
+                "_bias",
+                ".k_scale",
+                "_k_scale",
+                ".v_scale",
+                "_v_scale",
+                ".weight_scale",
+                "_weight_scale",
+                ".input_scale",
+                "_input_scale",
+            ],
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: ExaoneMoeSourcePlan,
+    ) -> set[str]:
+        return load_exaone_moe_weights_from_source(self, source, plan)

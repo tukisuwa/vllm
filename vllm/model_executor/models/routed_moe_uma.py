@@ -81,6 +81,7 @@ def build_routed_moe_weight_plan(
     skip_prefixes: list[str] | None = None,
     skip_substrs: list[str] | None = None,
     skip_predicate: Callable[[str], bool] | None = None,
+    ignore_unexpected_suffixes: list[str] | None = None,
     extra_routed_entries: list[RoutedMoeEntry] | None = None,
 ) -> RoutedMoeSourcePlan:
     routed_entries: list[RoutedMoeEntry] = []
@@ -130,6 +131,7 @@ def build_routed_moe_weight_plan(
         skip_prefixes=skip_prefixes,
         skip_substrs=auto_skip_substrs,
         skip_predicate=skip_predicate,
+        ignore_unexpected_suffixes=ignore_unexpected_suffixes,
     )
     routed_names = {entry.checkpoint_name for entry in routed_entries}
     auto_plan = WeightPlan(
