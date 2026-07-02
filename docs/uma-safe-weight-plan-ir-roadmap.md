@@ -61,6 +61,60 @@ This is not just a DGX Spark performance issue.  It is an architectural
 pressure: if each new loader path has to rediscover model placement rules, each
 loader path will grow its own mapping tables and special cases.
 
+## Root Cause: Loader as Semantic Dispatcher
+
+The deeper issue is not simply that an I/O decision point happens too late.  The
+problem is that loader implementations can become semantic dispatchers.
+
+An I/O loader should primarily decide:
+
+- which file or object to read from;
+- which byte range or tensor payload to read;
+- which staging buffer or target device receives the bytes;
+- which I/O strategy, scheduling policy, and safety gates apply;
+- which execution order is safe for memory and throughput.
+
+In practice, loader paths often accumulate responsibilities that belong to a
+semantic planning layer:
+
+- checkpoint name to vLLM internal name resolution;
+- fused QKV or gate/up split and merge rules;
+- tensor-parallel shard axis and shard offset selection;
+- pipeline-rank missing layer handling;
+- expert-parallel global expert to local expert routing;
+- quantization payload, scale, zero, and side-state attachment;
+- tied embedding and vocabulary padding policy;
+- model-family specific exceptions;
+- pre-sharded versus logical full-tensor checkpoint handling.
+
+Those jobs are necessary, but they should not live in the same layer as file
+I/O.  Once a loader owns semantic dispatch, every new load format risks
+rebuilding the same semantic tables.  A new fast path then becomes a parallel
+model-loading architecture rather than an executor for the same model plan.
+
+This is why small operational fixes do not fully solve the problem.  Smaller
+O_DIRECT windows, coalesced reads, or per-worker state-dict loading can reduce
+symptoms, but they still operate downstream of a missing planning phase unless
+the semantics are resolved before payload reads.
+
+The intended ordering is:
+
+```text
+read checkpoint manifest/header only
+build model weight schema
+resolve checkpoint names to logical weights
+resolve TP/PP/EP rank-local placement
+resolve quantization and expert relationships
+build LoadPlan / PlacementPlan
+schedule byte ranges
+execute I/O
+```
+
+In other words, tensor treatment must be decided before tensor payload is read.
+For UMA systems this is a safety requirement.  For vLLM as a whole it is the
+only way to prevent each load format from growing its own model-specific
+dispatcher.
+
 ## Existing Improvement Vectors
 
 Several upstream-facing ideas move in the same direction, but none is enough by
@@ -120,6 +174,49 @@ This separates responsibilities:
 - executor knows how to safely read bytes and place tensors;
 - load formats become executor implementations rather than independent loading
   architectures.
+
+More explicitly, the design should split the current fat-loader behavior into
+separate stages:
+
+```text
+CheckpointReader
+  - reads manifests, headers, indexes, and tensor metadata
+  - does not read tensor payload by default
+
+ModelWeightSchema
+  - declares expected logical weights, runtime parameter names, shapes, fusion
+    groups, quant roles, and optional/tied weights
+
+NameResolver
+  - maps checkpoint names to logical weight IDs
+  - handles architecture-specific naming differences without doing I/O
+
+ShardingPlanner
+  - maps logical weights to TP/PP/EP rank-local source and target slices
+
+QuantPlanner
+  - resolves weight/scale/zero/quant-state relationships and attachment points
+
+ExpertPlanner
+  - maps global experts to local experts and source ranges
+
+LoadPlanner
+  - combines the above into an executable PlacementPlan
+
+ReadScheduler
+  - groups nearby byte ranges, chooses read order, caps staging bytes, and
+    controls reuse/release points
+
+LoadExecutor
+  - executes the schedule using an I/O strategy
+  - does not know model-family semantics
+```
+
+The current prototype has pieces of this split, but not the full separation.
+`TensorCatalog` is close to `CheckpointReader`, `WeightPlan` is close to
+`PlacementPlan`, and `ODirectSafetensorsWeightSource` is close to a
+LoadExecutor.  The missing parts are first-class semantic planning and a
+model-independent read scheduler.
 
 ## Proposed IR Layers
 
@@ -219,6 +316,29 @@ UMA-specific executor requirements:
 
 Non-UMA executors may choose faster or more permissive behavior while using the
 same plan.
+
+### 5. ReadSchedulePlan
+
+Executor-facing schedule derived from a `PlacementPlan`.
+
+This is where small-tensor read amplification should be solved.  The executor
+should not blindly process one logical tensor at a time if many required
+tensors are adjacent in the same safetensors file.
+
+Responsibilities:
+
+- sort required payload ranges by file and offset when semantic ordering allows;
+- coalesce nearby ranges while respecting a maximum staging-buffer size;
+- preserve explicit ordering for entries with side effects or shared
+  source-tensor reuse;
+- expose expected read amplification before execution;
+- gate before and after group reads;
+- release staging buffers as soon as all group entries are dispatched.
+
+This keeps range coalescing model-independent.  It also avoids treating
+`window_size` tuning as the main solution.  Window tuning is an executor knob;
+read scheduling is the architectural layer that prevents repeated large reads
+for many small tensors.
 
 ## What This Means for the Current Branch
 
