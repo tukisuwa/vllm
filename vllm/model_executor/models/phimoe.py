@@ -50,9 +50,18 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsLoRA, SupportsPP
+from .mixtral_uma import (
+    MixtralMoeSourcePlan,
+    build_mixtral_moe_weight_plan,
+    load_mixtral_moe_weights_from_source,
+)
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -581,6 +590,26 @@ class PhiMoEForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> MixtralMoeSourcePlan:
+        return build_mixtral_moe_weight_plan(
+            self,
+            catalog,
+            family_name="PhiMoE",
+            mapper=self.hf_to_vllm_mapper,
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: MixtralMoeSourcePlan,
+    ) -> set[str]:
+        return load_mixtral_moe_weights_from_source(
+            self,
+            source,
+            plan,
+            family_name="PhiMoE",
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

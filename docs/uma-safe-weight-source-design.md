@@ -476,6 +476,12 @@ Add model-side plans only where needed:
   experts before payload read and delegates placement to existing FusedMoE
   `weight_loader`. This now uses the shared routed-MoE helper rather than a
   second copy of the Qwen-specific plan executor.
+- PhiMoE: uses the same Mixtral-style routed-MoE hook for
+  `block_sparse_moe.experts.<expert>.w{1,2,3}.*` tensors, preserving the
+  model's existing HF-to-vLLM mapper and FusedMoE placement path.
+- OLMoE and Cohere2 MoE: use the Qwen-style routed-MoE helper for
+  `mlp.experts.<expert>.{gate,up,down}_proj.*` tensors. Cohere2 keeps the
+  existing `lm_head` skip behavior in the model hook.
 - DeepSeek V2/V3 style MoE
   - initial conservative model-side hook implemented for routed
     `mlp.experts.<expert>.{gate,up,down}_proj.*` tensors and common packed
@@ -508,8 +514,8 @@ Expected current behavior:
 | --- | --- | --- |
 | Dense safetensors | Should work if normal vLLM load works | Phase 3 |
 | Sharded dense safetensors | Should work if no duplicate names | Phase 3 |
-| Qwen2/Qwen3 routed MoE | Base path should work if normal vLLM load works | Phase 4 model hook; loader-side direct path removed |
-| Mixtral routed MoE | Base path should work if normal vLLM load works | Phase 5 initial model hook |
+| Qwen2/Qwen3 / OLMoE / Cohere2 routed MoE | Base path should work if normal vLLM load works | Phase 4/5 model hook for `mlp.experts` gate/up/down tensors; loader-side direct path removed |
+| Mixtral / PhiMoE routed MoE | Base path should work if normal vLLM load works | Phase 5 initial model hook for `block_sparse_moe.experts` w1/w2/w3 tensors |
 | DeepSeek V2/V3 routed MoE | Base path should work if normal vLLM load works | Conservative Phase 5 hook; shared-expert fusion and FP8 indexer WK fusion rejected |
 | Granite MoE / Granite MoE Shared | Base path should work if normal vLLM load works | Phase 5 initial model hook |
 | Granite MoE Hybrid | Base path should work if normal vLLM load works | Phase 5 initial hook, including fused expert `weight_scale` and `A_log` mapping |

@@ -95,6 +95,7 @@ def build_mixtral_moe_weight_plan(
     model: nn.Module,
     catalog: TensorCatalog,
     *,
+    family_name: str = "Mixtral MoE",
     mapper: object | None = None,
     skip_prefixes: list[str] | None = None,
     skip_substrs: list[str] | None = None,
@@ -102,7 +103,7 @@ def build_mixtral_moe_weight_plan(
     return build_routed_moe_weight_plan(
         model,
         catalog,
-        family_name="Mixtral MoE",
+        family_name=family_name,
         parse_name=_parse_mixtral_routed_expert_name,
         map_projection=_routed_param_for_projection,
         resolve_routed_experts=_resolve_routed_experts_for_layer,
@@ -117,11 +118,13 @@ def load_mixtral_moe_weights_from_source(
     model: nn.Module,
     source: ODirectSafetensorsWeightSource,
     plan: MixtralMoeSourcePlan,
+    *,
+    family_name: str = "Mixtral MoE",
 ) -> set[str]:
     return load_routed_moe_weights_from_source(
         model,
         source,
         plan,
-        family_name="Mixtral MoE",
+        family_name=family_name,
         get_routed_experts=_get_routed_experts_for_layer,
     )

@@ -26,12 +26,15 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     execute_weight_plan,
 )
 from vllm.model_executor.models import (
+    cohere2_moe,
     deepseek_v2,
     granitemoe,
     granitemoehybrid,
     granitemoeshared,
     llama,
     mixtral,
+    olmoe,
+    phimoe,
     qwen2_moe,
     qwen3,
     qwen3_5,
@@ -2233,6 +2236,53 @@ def test_qwen_moe_source_hook_delegates_to_shared_helper(
     assert calls[1] == ("load", model, source, "plan")
 
 
+@pytest.mark.parametrize(
+    "model_cls, module, family_name, skip_prefixes",
+    [
+        (olmoe.OlmoeForCausalLM, olmoe, "OLMoE", None),
+        (
+            cohere2_moe.Cohere2MoeForCausalLM,
+            cohere2_moe,
+            "Cohere2 MoE",
+            ["lm_head."],
+        ),
+    ],
+)
+def test_mlp_experts_moe_source_hook_passes_family_options(
+    monkeypatch, model_cls, module, family_name, skip_prefixes
+):
+    calls = []
+
+    def fake_build(model, catalog, **kwargs):
+        calls.append(("build", model, catalog, kwargs))
+        return "plan"
+
+    def fake_load(model, source, plan, **kwargs):
+        calls.append(("load", model, source, plan, kwargs))
+        return {"loaded"}
+
+    monkeypatch.setattr(module, "build_qwen_moe_weight_plan", fake_build)
+    monkeypatch.setattr(module, "load_qwen_moe_weights_from_source", fake_load)
+
+    class FakeModel(model_cls):
+        config = type("FakeConfig", (), {"tie_word_embeddings": False})()
+
+        def __init__(self):
+            nn.Module.__init__(self)
+
+    model = FakeModel()
+    catalog = object()
+    source = object()
+
+    assert model.build_weight_plan(catalog) == "plan"
+    assert model.load_weights_from_source(source, "plan") == {"loaded"}
+    assert calls[0][3]["family_name"] == family_name
+    assert calls[0][3]["mapper"] is model_cls.hf_to_vllm_mapper
+    assert calls[0][3].get("skip_prefixes") == skip_prefixes
+    assert calls[1] == ("load", model, source, "plan",
+                        {"family_name": family_name})
+
+
 def test_qwen2_moe_source_hook_passes_hf_mapper_and_tie_skip(monkeypatch):
     calls = []
 
@@ -2264,6 +2314,36 @@ def test_qwen2_moe_source_hook_passes_hf_mapper_and_tie_skip(monkeypatch):
     assert calls[0][3]["mapper"] is qwen2_moe.Qwen2MoeForCausalLM.hf_to_vllm_mapper
     assert calls[0][3]["skip_prefixes"] == ["lm_head."]
     assert calls[1] == ("load", model, source, "plan")
+
+
+def test_phimoe_source_hook_passes_mixtral_family_options(monkeypatch):
+    calls = []
+
+    def fake_build(model, catalog, **kwargs):
+        calls.append(("build", model, catalog, kwargs))
+        return "plan"
+
+    def fake_load(model, source, plan, **kwargs):
+        calls.append(("load", model, source, plan, kwargs))
+        return {"loaded"}
+
+    monkeypatch.setattr(phimoe, "build_mixtral_moe_weight_plan", fake_build)
+    monkeypatch.setattr(phimoe, "load_mixtral_moe_weights_from_source", fake_load)
+
+    class FakePhiMoE(phimoe.PhiMoEForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+
+    model = FakePhiMoE()
+    catalog = object()
+    source = object()
+
+    assert model.build_weight_plan(catalog) == "plan"
+    assert model.load_weights_from_source(source, "plan") == {"loaded"}
+    assert calls[0][3]["family_name"] == "PhiMoE"
+    assert calls[0][3]["mapper"] is phimoe.PhiMoEForCausalLM.hf_to_vllm_mapper
+    assert calls[1] == ("load", model, source, "plan",
+                        {"family_name": "PhiMoE"})
 
 
 def test_qwen_moe_source_plan_handles_nested_language_model_before_read():

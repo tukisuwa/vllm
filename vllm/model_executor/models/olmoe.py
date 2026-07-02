@@ -48,9 +48,18 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsLoRA, SupportsPP
+from .qwen_moe_uma import (
+    QwenMoeSourcePlan,
+    build_qwen_moe_weight_plan,
+    load_qwen_moe_weights_from_source,
+)
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -401,6 +410,26 @@ class OlmoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> QwenMoeSourcePlan:
+        return build_qwen_moe_weight_plan(
+            self,
+            catalog,
+            family_name="OLMoE",
+            mapper=self.hf_to_vllm_mapper,
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: QwenMoeSourcePlan,
+    ) -> set[str]:
+        return load_qwen_moe_weights_from_source(
+            self,
+            source,
+            plan,
+            family_name="OLMoE",
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

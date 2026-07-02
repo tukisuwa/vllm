@@ -29,6 +29,10 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.model_executor.model_loader.weight_utils import (
     row_parallel_weight_loader,
 )
@@ -38,6 +42,11 @@ from vllm.sequence import IntermediateTensors
 
 from .commandr import LayerNorm
 from .interfaces import SupportsPP, SupportsQuant
+from .qwen_moe_uma import (
+    QwenMoeSourcePlan,
+    build_qwen_moe_weight_plan,
+    load_qwen_moe_weights_from_source,
+)
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -528,6 +537,27 @@ class Cohere2MoeForCausalLM(nn.Module, SupportsPP, SupportsQuant):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.model.embed_tokens, hidden_states)
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> QwenMoeSourcePlan:
+        return build_qwen_moe_weight_plan(
+            self,
+            catalog,
+            family_name="Cohere2 MoE",
+            mapper=self.hf_to_vllm_mapper,
+            skip_prefixes=["lm_head."],
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: QwenMoeSourcePlan,
+    ) -> set[str]:
+        return load_qwen_moe_weights_from_source(
+            self,
+            source,
+            plan,
+            family_name="Cohere2 MoE",
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_prefixes=["lm_head."])
