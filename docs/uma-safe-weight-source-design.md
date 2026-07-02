@@ -473,6 +473,15 @@ Add model-side plans only where needed:
   `weight_loader`. This now uses the shared routed-MoE helper rather than a
   second copy of the Qwen-specific plan executor.
 - DeepSeek V2/V3 style MoE
+  - initial conservative model-side hook implemented for routed
+    `mlp.experts.<expert>.{gate,up,down}_proj.*` tensors and common packed
+    dense mappings
+  - skips non-local routed experts before payload read through the shared
+    routed-MoE helper
+  - skips speculative layers and absent per-layer indexer weights before
+    payload read
+  - deliberately rejects shared-expert fusion and FP8 indexer WK fusion until
+    those transforms are represented in WeightPlan
 - Granite MoE variants
 
 Each model family should implement its own plan builder instead of adding

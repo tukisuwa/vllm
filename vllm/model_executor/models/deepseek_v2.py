@@ -84,6 +84,10 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     extract_layer_index,
@@ -105,6 +109,11 @@ from .interfaces import (
     SupportsLoRA,
     SupportsPP,
 )
+from .deepseek_uma import (
+    build_deepseek_moe_weight_plan,
+    load_deepseek_moe_weights_from_source,
+)
+from .routed_moe_uma import RoutedMoeSourcePlan
 from .utils import (
     PPMissingLayer,
     get_pp_missing_layer_names,
@@ -1866,6 +1875,26 @@ class DeepseekV2ForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> RoutedMoeSourcePlan:
+        skip_prefixes = ["lm_head."] if self.config.tie_word_embeddings else None
+
+        def skip_predicate(name: str) -> bool:
+            return get_spec_layer_idx_from_weight_name(self.config, name) is not None
+
+        return build_deepseek_moe_weight_plan(
+            self,
+            catalog,
+            skip_prefixes=skip_prefixes,
+            skip_predicate=skip_predicate,
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: RoutedMoeSourcePlan,
+    ) -> set[str]:
+        return load_deepseek_moe_weights_from_source(self, source, plan)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales

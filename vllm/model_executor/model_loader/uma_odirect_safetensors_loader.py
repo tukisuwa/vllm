@@ -18,6 +18,7 @@ from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 logger = init_logger(__name__)
 
@@ -664,9 +665,16 @@ def execute_weight_plan(
 
         weight_loader = getattr(param, "weight_loader", None)
         if not callable(weight_loader):
-            raise RuntimeError(
-                f"Weight plan target {entry.target_name!r} has no weight_loader"
-            )
+            if (
+                entry.shard_id is not None
+                or entry.expert_id is not None
+                or entry.weight_name is not None
+            ):
+                raise RuntimeError(
+                    f"Weight plan target {entry.target_name!r} requires loader "
+                    "metadata but has no custom weight_loader"
+                )
+            weight_loader = default_weight_loader
 
         source_slices = entry.source_slices
         source_is_sharded = entry.source_is_sharded

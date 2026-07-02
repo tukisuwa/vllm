@@ -28,6 +28,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     execute_weight_plan,
 )
 from vllm.model_executor.models import (
+    deepseek_v2,
     llama,
     mixtral,
     qwen3,
@@ -1737,6 +1738,130 @@ def test_mixtral_moe_source_plan_skips_nonlocal_experts_before_read():
     assert loaded == {"model.layers.0.block_sparse_moe.experts.w13_weight"}
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
+
+
+def test_deepseek_moe_source_plan_skips_nonlocal_experts_before_read():
+    names = [
+        "model.layers.0.mlp.experts.0.gate_proj.weight",
+        "model.layers.0.mlp.experts.1.gate_proj.weight",
+        "model.layers.4.self_attn.indexer.wq.weight",
+        "model.layers.2.input_layernorm.weight",
+    ]
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", names[0], torch.float32, [1], 0, 4),
+            TensorMeta("model.safetensors", names[1], torch.float32, [1], 4, 4),
+            TensorMeta("model.safetensors", names[2], torch.float32, [1], 8, 4),
+            TensorMeta("model.safetensors", names[3], torch.float32, [1], 12, 4),
+        ]
+    )
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.mlp.experts"
+        w13_weight = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 0 else -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeMLP:
+        def __init__(self, routed_experts=None):
+            self.experts = routed_experts
+
+    class FakeLayer(nn.Module):
+        def __init__(self, routed_experts=None):
+            super().__init__()
+            self.mlp = FakeMLP(routed_experts)
+            self.input_layernorm = nn.LayerNorm(1)
+
+    class FakeInnerModel(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.layers = nn.ModuleList([
+                FakeLayer(routed_experts),
+                FakeLayer(),
+                FakeLayer(),
+                FakeLayer(),
+                FakeLayer(),
+            ])
+
+    class FakeConfig:
+        tie_word_embeddings = False
+        num_hidden_layers = 3
+        num_nextn_predict_layers = 1
+
+    class FakeDeepseek(deepseek_v2.DeepseekV2ForCausalLM):
+        use_mha = True
+
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = FakeConfig()
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            return torch.ones(1)
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    model = FakeDeepseek()
+    source = FakeSource(catalog)
+
+    plan = model.build_weight_plan(catalog)
+    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+    assert {
+        entry.checkpoint_name
+        for entry in plan.auto_plan.entries
+        if not entry.required
+    } == {names[2]}
+
+    loaded = model.load_weights_from_source(source, plan)
+
+    assert source.reads == [names[3], names[0]]
+    assert source.skips == [
+        (names[2], "weight plan marked not required"),
+        (names[1], "non-local routed expert"),
+    ]
+    assert "model.layers.2.input_layernorm.weight" in loaded
+    assert "model.layers.0.mlp.experts.w13_weight" in loaded
+    assert model.routed_experts.calls[0]["expert_id"] == 0
+    assert model.routed_experts.calls[0]["shard_id"] == "w1"
+
+
+def test_deepseek_moe_source_plan_rejects_shared_expert_fusion():
+    name = "model.layers.0.mlp.shared_experts.gate_proj.weight"
+    catalog = TensorCatalog(
+        [TensorMeta("model.safetensors", name, torch.float32, [1], 0, 4)]
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = False
+        num_nextn_predict_layers = 0
+
+    class FakeDeepseek(deepseek_v2.DeepseekV2ForCausalLM):
+        use_mha = True
+        config = FakeConfig()
+
+        def __init__(self):
+            nn.Module.__init__(self)
+
+    with pytest.raises(RuntimeError, match="shared_experts"):
+        FakeDeepseek().build_weight_plan(catalog)
 
 
 @pytest.mark.parametrize(

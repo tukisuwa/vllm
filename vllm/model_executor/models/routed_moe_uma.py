@@ -76,6 +76,7 @@ def build_routed_moe_weight_plan(
     mapper: object | None = None,
     skip_prefixes: list[str] | None = None,
     skip_substrs: list[str] | None = None,
+    skip_predicate: Callable[[str], bool] | None = None,
 ) -> RoutedMoeSourcePlan:
     routed_entries: list[RoutedMoeEntry] = []
     for name in catalog.names():
@@ -120,6 +121,7 @@ def build_routed_moe_weight_plan(
         mapper=mapper,
         skip_prefixes=skip_prefixes,
         skip_substrs=auto_skip_substrs,
+        skip_predicate=skip_predicate,
     )
     routed_names = {entry.checkpoint_name for entry in routed_entries}
     auto_plan = WeightPlan(
