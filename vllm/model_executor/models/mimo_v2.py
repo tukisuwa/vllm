@@ -48,12 +48,24 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+    WeightPlan,
+)
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .interfaces import MixtureOfExperts, SupportsPP
+from .mimo_v2_uma import (
+    build_mimo_v2_flash_weight_plan,
+    build_mimo_v2_weight_plan,
+    load_mimo_v2_flash_weights_from_source,
+    load_mimo_v2_weights_from_source,
+    RoutedMoeSourcePlan,
+)
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -885,9 +897,29 @@ class MiMoV2FlashForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
 
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
+        return build_mimo_v2_flash_weight_plan(self, catalog)
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: WeightPlan,
+    ) -> set[str]:
+        return load_mimo_v2_flash_weights_from_source(self, source, plan)
+
 
 class MiMoV2ForCausalLM(MiMoV2FlashForCausalLM):
     packed_modules_mapping = {
         "qkv_proj": ["qkv_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> RoutedMoeSourcePlan:
+        return build_mimo_v2_weight_plan(self, catalog)
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: RoutedMoeSourcePlan,
+    ) -> set[str]:
+        return load_mimo_v2_weights_from_source(self, source, plan)

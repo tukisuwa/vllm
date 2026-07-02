@@ -85,6 +85,7 @@ from vllm.model_executor.models import (
     minicpm_eagle,
     minimax_m2,
     mistral3,
+    mimo_v2_uma,
     nemotron_h,
     mixtral,
     mistral,
@@ -7407,6 +7408,137 @@ def test_lfm2_moe_source_plan_maps_dense_and_routed_names_before_read():
     assert source.skips == [(remote_name, "non-local routed expert")]
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
     assert model.routed_experts.calls[0]["expert_id"] == 1
+
+
+def test_mimo_v2_source_plan_maps_split_dense_and_routed_names_before_read(
+    monkeypatch,
+):
+    monkeypatch.setattr(mimo_v2_uma, "get_tensor_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(mimo_v2_uma, "get_tensor_model_parallel_world_size", lambda: 2)
+
+    local_name = "model.layers.0.mlp.experts.1.gate_proj.weight"
+    remote_name = "model.layers.0.mlp.experts.2.down_proj.weight"
+    sink_name = "model.layers.0.self_attn.attention_sink_bias"
+    catalog = TensorCatalog([
+        TensorMeta("model.safetensors", local_name, torch.float32, [1], 0, 4),
+        TensorMeta("model.safetensors", remote_name, torch.float32, [1], 4, 4),
+        TensorMeta(
+            "model.safetensors",
+            "model.layers.0.mlp.gate_proj.weight",
+            torch.float32,
+            [1],
+            8,
+            4,
+        ),
+        TensorMeta(
+            "model.safetensors",
+            "model.layers.0.self_attn.q_proj.weight",
+            torch.float32,
+            [1],
+            12,
+            4,
+        ),
+        TensorMeta("model.safetensors", sink_name, torch.float32, [8], 16, 32),
+        TensorMeta(
+            "model.safetensors",
+            "model.layers.0.rotary_emb.inv_freq",
+            torch.float32,
+            [1],
+            48,
+            4,
+        ),
+    ])
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.mlp.experts"
+        w13_weight = object()
+        w2_weight = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 1 else -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeMLP:
+        def __init__(self, experts):
+            self.experts = experts
+
+    class FakeLayer:
+        def __init__(self, experts):
+            self.mlp = FakeMLP(experts)
+
+    class FakeInnerModel:
+        def __init__(self, experts):
+            self.layers = [FakeLayer(experts)]
+
+    class FakeModel:
+        def __init__(self):
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+        def children(self):
+            return []
+
+    model = FakeModel()
+    plan = mimo_v2_uma.build_mimo_v2_weight_plan(model, catalog)
+
+    routed = {entry.checkpoint_name: entry for entry in plan.routed_entries}
+    assert routed[local_name].param_name == "w13_weight"
+    assert routed[local_name].shard_id == "w1"
+    assert routed[local_name].local_required is True
+    assert routed[remote_name].param_name == "w2_weight"
+    assert routed[remote_name].shard_id == "w2"
+    assert routed[remote_name].local_required is False
+
+    auto_entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    assert local_name not in auto_entries
+    assert remote_name not in auto_entries
+    assert (
+        auto_entries["model.layers.0.mlp.gate_proj.weight"].target_name
+        == "model.layers.0.mlp.gate_up_proj.weight"
+    )
+    assert auto_entries["model.layers.0.mlp.gate_proj.weight"].shard_id == 0
+    assert (
+        auto_entries["model.layers.0.self_attn.q_proj.weight"].target_name
+        == "model.layers.0.self_attn.qkv_proj.weight"
+    )
+    assert auto_entries["model.layers.0.self_attn.q_proj.weight"].shard_id == "q"
+    assert auto_entries[sink_name].source_slices == (slice(4, 8),)
+    assert auto_entries["model.layers.0.rotary_emb.inv_freq"].required is False
+
+
+def test_mimo_v2_source_plan_rejects_fp8_fused_qkv():
+    catalog = TensorCatalog([
+        TensorMeta(
+            "model.safetensors",
+            "model.layers.0.self_attn.qkv_proj.weight",
+            torch.float8_e4m3fn,
+            [1],
+            0,
+            1,
+        ),
+        TensorMeta(
+            "model.safetensors",
+            "model.layers.0.self_attn.qkv_proj.weight_scale_inv",
+            torch.float32,
+            [1],
+            1,
+            4,
+        ),
+    ])
+
+    class FakeModel:
+        def children(self):
+            return []
+
+    with pytest.raises(RuntimeError, match="fused FP8 qkv_proj"):
+        mimo_v2_uma.build_mimo_v2_weight_plan(FakeModel(), catalog)
 
 
 def test_qwen_moe_source_plan_handles_nested_language_model_before_read():
