@@ -656,6 +656,12 @@ Add model-side plans only where needed:
   - skips non-local routed experts before payload read
   - preserves Bailing `norm_head` normalization and tied `lm_head` skip
   - Sarvam's Bailing-derived MoE keeps its gate-bias zero-mean normalization
+- Laguna MoE
+  - initial hook implemented for standard
+    `mlp.experts.<expert>.{gate,up,down}_proj.*` tensors
+  - skips non-local routed experts before payload read
+  - keeps router correction bias and shared expert tensors on the normal
+    WeightSource auto plan
 
 Each model family should implement its own plan builder instead of adding
 loader-side conditionals.
@@ -681,6 +687,7 @@ Expected current behavior:
 | Sarvam MLA MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts and gate-bias normalization |
 | Ernie 4.5 MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts, `moe_statics` bias remap, and MTP skip |
 | Bailing / Sarvam Bailing-style MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts and model-specific normalization |
+| Laguna MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts while preserving bias/shared-expert auto loads |
 | Other routed MoE | Base path should work if normal vLLM load works | Not yet implemented |
 | Non-safetensors | Not supported | Not supported |
 | Remote HF path | Not supported by UMA-safe loader | Not supported |

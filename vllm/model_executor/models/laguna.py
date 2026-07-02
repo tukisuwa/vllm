@@ -38,9 +38,18 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
+)
+from vllm.model_executor.models.laguna_uma import (
+    LagunaMoeSourcePlan,
+    build_laguna_moe_weight_plan,
+    load_laguna_moe_weights_from_source,
 )
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
@@ -882,6 +891,16 @@ class LagunaForCausalLM(nn.Module, SupportsPP, SupportsLoRA, SupportsEagle3):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> LagunaMoeSourcePlan:
+        return build_laguna_moe_weight_plan(self, catalog)
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: LagunaMoeSourcePlan,
+    ) -> set[str]:
+        return load_laguna_moe_weights_from_source(self, source, plan)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
