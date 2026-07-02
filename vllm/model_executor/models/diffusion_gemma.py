@@ -17,6 +17,7 @@ via Gemma4MultimodalEmbedder.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -35,7 +36,18 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
 )
-from vllm.model_executor.models.gemma4 import Gemma4Model
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+    WeightPlan,
+)
+from vllm.model_executor.models.gemma4 import (
+    Gemma4Model,
+    _gemma4_k_eq_v_layer_indices,
+    _gemma4_layer_index_from_name,
+    _gemma4_normalize_checkpoint_name,
+    _gemma4_weight_mapper,
+)
 from vllm.model_executor.models.gemma4_mm import (
     Gemma4DummyInputsBuilder,
     Gemma4ForConditionalGeneration,
@@ -57,6 +69,7 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.penalties import use_penalty
 from vllm.v1.worker.gpu.states import RequestState
 
+from .auto_uma import build_auto_uma_weight_plan, load_auto_uma_weights_from_source
 from .interfaces import (
     SupportsMultiModal,
     SupportsPP,
@@ -64,6 +77,48 @@ from .interfaces import (
 )
 
 logger = init_logger(__name__)
+
+
+def _diffusion_gemma_name_transform_factory():
+    seen_weights: set[str] = set()
+
+    def transform(name: str):
+        if "self_conditioning" in name:
+            sc_name = name.split("self_conditioning.", 1)[1]
+            return "self_conditioning." + sc_name, None
+
+        if name.startswith("model.encoder.vision_tower."):
+            return name[len("model.encoder.") :], None
+
+        if name.startswith("model.encoder.embed_vision."):
+            return name[len("model.encoder.") :], None
+
+        if "embed_vision.embedding." in name:
+            return None
+
+        if name.startswith("model.encoder.language_model."):
+            name = name.replace("model.encoder.language_model.", "model.", 1)
+        elif name.startswith("model.decoder."):
+            name = name.replace("model.decoder.", "model.", 1)
+        name = _gemma4_normalize_checkpoint_name(name)
+
+        if name in seen_weights:
+            return None
+        seen_weights.add(name)
+        return name, None
+
+    return transform
+
+
+class _DiffusionGemmaWeightsMapper:
+
+    def __init__(self, base_mapper: WeightsMapper):
+        self.mapper = _gemma4_weight_mapper(base_mapper)
+
+    def _map_name_with_shard(self, name: str):
+        if name.startswith("self_conditioning."):
+            return name, None
+        return self.mapper._map_name_with_shard(name)
 
 
 class DiffusionGemmaSelfConditioning(nn.Module):
@@ -442,6 +497,47 @@ class DiffusionGemmaForConditionalGeneration(
         self.config = self.model.config
         try:
             Gemma4ForCausalLM.load_weights(self, _remap_weights())
+        finally:
+            self.config = saved_config
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
+        saved_config = self.config
+        self.config = self.model.config
+        try:
+            plan = build_auto_uma_weight_plan(
+                self,
+                catalog,
+                mapper=_DiffusionGemmaWeightsMapper(self.hf_to_vllm_mapper),
+                name_transform=_diffusion_gemma_name_transform_factory(),
+            )
+            k_eq_v_layers = _gemma4_k_eq_v_layer_indices(self.model.config)
+            if not k_eq_v_layers:
+                return plan
+
+            entries = list(plan.entries)
+            for entry in plan.entries:
+                if (
+                    not entry.required
+                    or entry.shard_id != "k"
+                    or "self_attn.qkv_proj" not in entry.target_name
+                ):
+                    continue
+                layer_idx = _gemma4_layer_index_from_name(entry.target_name)
+                if layer_idx in k_eq_v_layers:
+                    entries.append(replace(entry, shard_id="v"))
+            return WeightPlan(tuple(entries))
+        finally:
+            self.config = saved_config
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: WeightPlan,
+    ) -> set[str]:
+        saved_config = self.config
+        self.config = self.model.config
+        try:
+            return load_auto_uma_weights_from_source(self, source, plan)
         finally:
             self.config = saved_config
 

@@ -42,6 +42,7 @@ from vllm.model_executor.models import (
     deepseek_uma,
     bloom,
     deepseek_v2,
+    diffusion_gemma,
     ernie45_moe,
     ernie45_moe_uma,
     exaone,
@@ -3873,6 +3874,106 @@ def test_bagel_build_weight_plan_skips_generation_and_transforms_patch(tmp_path)
     assert transformed[0, :, 0, 0].tolist() == [0.0, 1.0, 2.0]
     assert entries["moe_gen.experts.0.w1.weight"].required is False
     assert entries["vit_pos_embed.pos_embed.weight"].required is False
+
+
+def test_diffusion_gemma_build_weight_plan_remaps_and_skips_duplicates(tmp_path):
+    metadata = {
+        "model.encoder.language_model.layers.0.input_layernorm.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [0, 4],
+        },
+        "model.decoder.layers.0.input_layernorm.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "model.decoder.self_conditioning.gate_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [8, 12],
+        },
+        "model.encoder.vision_tower.embeddings.patch_embedding.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [12, 16],
+        },
+        "model.encoder.embed_vision.proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [16, 20],
+        },
+        "model.encoder.language_model.layers.0.self_attn.k_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [20, 24],
+        },
+        "embed_vision.embedding.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [24, 28],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 28)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeModelConfig:
+        tie_word_embeddings = False
+        attention_k_eq_v = True
+        layer_types = ["full_attention"]
+
+    class FakeModelInner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = FakeModelConfig()
+            self.layers = nn.ModuleList([nn.Module()])
+            self.layers[0].input_layernorm = nn.LayerNorm(1)
+
+    class FakeDiffusionGemma(diffusion_gemma.DiffusionGemmaForConditionalGeneration):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = object()
+            self.model = FakeModelInner()
+            self.self_conditioning = nn.Module()
+            self.self_conditioning.gate_proj = nn.Linear(1, 1, bias=False)
+            self.vision_tower = nn.Module()
+            self.vision_tower.embeddings = nn.Module()
+            self.vision_tower.embeddings.patch_embedding = nn.Linear(1, 1, bias=False)
+            self.embed_vision = nn.Module()
+            self.embed_vision.proj = nn.Linear(1, 1, bias=False)
+
+    plan = FakeDiffusionGemma().build_weight_plan(catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    encoder_entry = entries[
+        "model.encoder.language_model.layers.0.input_layernorm.weight"
+    ]
+    assert encoder_entry.target_name == "model.layers.0.input_layernorm.weight"
+    assert entries["model.decoder.layers.0.input_layernorm.weight"].required is False
+    assert entries[
+        "model.decoder.self_conditioning.gate_proj.weight"
+    ].target_name == "self_conditioning.gate_proj.weight"
+    assert entries[
+        "model.encoder.vision_tower.embeddings.patch_embedding.weight"
+    ].target_name == "vision_tower.embeddings.patch_embedding.weight"
+    assert entries[
+        "model.encoder.embed_vision.proj.weight"
+    ].target_name == "embed_vision.proj.weight"
+    assert entries["embed_vision.embedding.weight"].required is False
+    qkv_entries = [
+        entry
+        for entry in plan.entries
+        if entry.checkpoint_name
+        == "model.encoder.language_model.layers.0.self_attn.k_proj.weight"
+    ]
+    assert [(entry.target_name, entry.shard_id) for entry in qkv_entries] == [
+        ("model.layers.0.self_attn.qkv_proj.weight", "k"),
+        ("model.layers.0.self_attn.qkv_proj.weight", "v"),
+    ]
 
 
 @pytest.mark.parametrize(

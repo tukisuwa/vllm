@@ -716,7 +716,7 @@ Expected current behavior:
 
 | Model type | Base `uma_odirect_safetensors` | Direct plan path |
 | --- | --- | --- |
-| Dense safetensors | Should work if normal vLLM load works | Phase 3 hooks for Qwen2/Qwen3/Llama/Gemma/Gemma2/Gemma3/InternLM2/Phi/Starcoder2/Falcon/FalconH1/Mistral/GPTBigCode/OPT/BLOOM/GPT-J/MPT/Orion/Step1/Apertus/StableLM/Solar/GPT-NeoX/Persimmon/Granite/Jais2/EXAONE4/Plamo3/Arcee/SeedOss/HyperCLOVAX/LFM2/MiMo/OLMo/OLMo2/Nemotron/EXAONE/Cohere/TeleChat2/Zamba2/Ouro/Mamba/Mamba2/HrmText/ChatGLM/DeciLM/Mistral3/GLM4/BAGEL AutoWeightsLoader models |
+| Dense safetensors | Should work if normal vLLM load works | Phase 3 hooks for Qwen2/Qwen3/Llama/Gemma/Gemma2/Gemma3/InternLM2/Phi/Starcoder2/Falcon/FalconH1/Mistral/GPTBigCode/OPT/BLOOM/GPT-J/MPT/Orion/Step1/Apertus/StableLM/Solar/GPT-NeoX/Persimmon/Granite/Jais2/EXAONE4/Plamo3/Arcee/SeedOss/HyperCLOVAX/LFM2/MiMo/OLMo/OLMo2/Nemotron/EXAONE/Cohere/TeleChat2/Zamba2/Ouro/Mamba/Mamba2/HrmText/ChatGLM/DeciLM/Mistral3/GLM4/BAGEL/DiffusionGemma AutoWeightsLoader models |
 | Sharded dense safetensors | Should work if no duplicate names | Phase 3 |
 | Qwen2/Qwen3 / Mellum / OLMoE / Cohere2 routed MoE | Base path should work if normal vLLM load works | Phase 4/5 model hook for `mlp.experts` gate/up/down tensors; loader-side direct path removed |
 | Mixtral / PhiMoE routed MoE | Base path should work if normal vLLM load works | Phase 5 initial model hook for `block_sparse_moe.experts` w1/w2/w3 tensors |
