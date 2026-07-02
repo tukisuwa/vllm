@@ -64,6 +64,7 @@ from vllm.model_executor.models import (
     granitemoe,
     granitemoehybrid,
     granitemoeshared,
+    hunyuan_v1_uma,
     hy_v3,
     hy_v3_uma,
     hyperclovax,
@@ -7874,6 +7875,179 @@ def test_param2moe_source_hook_delegates_to_helper(monkeypatch):
         ("build", model, catalog),
         ("load", model, source, "plan"),
     ]
+
+
+def test_hunyuan_v1_source_plan_maps_fused_and_routed_names_before_read():
+    qkv_name = "model.layers.0.self_attn.qkv_proj.weight"
+    gate_and_up_name = "model.layers.0.mlp.shared_mlp.gate_and_up_proj.weight"
+    local_name = "model.layers.0.mlp.experts.1.gate_proj.weight"
+    remote_name = "model.layers.0.mlp.experts.2.down_proj.weight"
+    bias_name = "model.layers.0.mlp.shared_mlp.gate_proj_bias"
+    catalog = TensorCatalog([
+        TensorMeta("model.safetensors", qkv_name, torch.float32, [8, 4], 0, 128),
+        TensorMeta(
+            "model.safetensors",
+            gate_and_up_name,
+            torch.float32,
+            [4, 1],
+            128,
+            16,
+        ),
+        TensorMeta("model.safetensors", local_name, torch.float32, [1], 144, 4),
+        TensorMeta("model.safetensors", remote_name, torch.float32, [1], 148, 4),
+        TensorMeta("model.safetensors", bias_name, torch.float32, [1], 152, 4),
+    ])
+
+    class FakeConfig:
+        num_attention_heads = 2
+        num_key_value_heads = 1
+        head_dim = 2
+        hidden_size = 4
+        tie_word_embeddings = False
+        num_experts = 4
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.mlp.experts"
+        w13_weight = object()
+        w2_weight = object()
+        quant_method = object()
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 1 else -1
+
+        def weight_loader(self, **_kwargs):
+            return True
+
+    class FakeMLP:
+        def __init__(self, experts):
+            self.experts = experts
+
+    class FakeLayer:
+        def __init__(self, experts):
+            self.mlp = FakeMLP(experts)
+
+    class FakeInnerModel:
+        def __init__(self, experts):
+            self.layers = [FakeLayer(experts)]
+
+    class FakeOuter:
+        config = FakeConfig()
+
+        def __init__(self):
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+        def children(self):
+            return []
+
+    plan = hunyuan_v1_uma.build_hunyuan_v1_weight_plan(FakeOuter(), catalog)
+    routed = {entry.checkpoint_name: entry for entry in plan.routed_entries}
+    assert routed[local_name].param_name == "w13_weight"
+    assert routed[local_name].shard_id == "w1"
+    assert routed[local_name].local_required is True
+    assert routed[remote_name].param_name == "w2_weight"
+    assert routed[remote_name].shard_id == "w2"
+    assert routed[remote_name].local_required is False
+    assert plan.fused_qkv_names == (qkv_name,)
+
+    auto_entries = {entry.checkpoint_name: [] for entry in plan.auto_plan.entries}
+    for entry in plan.auto_plan.entries:
+        auto_entries[entry.checkpoint_name].append(entry)
+    assert qkv_name not in auto_entries
+    assert local_name not in auto_entries
+    assert remote_name not in auto_entries
+
+    gate_entries = auto_entries[gate_and_up_name]
+    assert [(entry.target_name, entry.shard_id, entry.source_slices)
+            for entry in gate_entries] == [
+        (
+            "model.layers.0.mlp.shared_mlp.gate_up_proj.weight",
+            1,
+            (slice(0, 2), slice(None)),
+        ),
+        (
+            "model.layers.0.mlp.shared_mlp.gate_up_proj.weight",
+            0,
+            (slice(2, 4), slice(None)),
+        ),
+    ]
+    bias_entry = auto_entries[bias_name][0]
+    assert (
+        bias_entry.target_name
+        == "model.layers.0.mlp.shared_mlp.gate_up_proj.bias"
+    )
+    assert bias_entry.shard_id == 0
+
+
+def test_hunyuan_v1_source_hook_dispatches_fused_qkv_once():
+    qkv_name = "model.layers.0.self_attn.qkv_proj.weight"
+    catalog = TensorCatalog([
+        TensorMeta("model.safetensors", qkv_name, torch.float32, [8, 4], 0, 128),
+    ])
+
+    class FakeConfig:
+        num_attention_heads = 2
+        num_key_value_heads = 1
+        head_dim = 2
+        hidden_size = 4
+        tie_word_embeddings = False
+        num_experts = 1
+
+    class FakeParam:
+        def __init__(self):
+            self.calls = []
+
+        def weight_loader(self, param, tensor, shard_id):
+            assert param is self
+            self.calls.append((shard_id, tensor.clone()))
+
+    class FakeAttention:
+        def __init__(self):
+            self.qkv_proj = type("FakeQKV", (), {"weight": FakeParam()})()
+
+    class FakeLayer:
+        def __init__(self):
+            self.self_attn = FakeAttention()
+
+    class FakeInnerModel:
+        def __init__(self):
+            self.layers = type("FakeLayers", (), {"0": FakeLayer()})()
+
+    class FakeOuter:
+        config = FakeConfig()
+
+        def __init__(self):
+            self.model = FakeInnerModel()
+
+    class FakeSource:
+        def __init__(self):
+            self.catalog = catalog
+            self.reads = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            return torch.arange(32, dtype=torch.float32).reshape(8, 4)
+
+        def skip(self, *_args):
+            raise AssertionError("unexpected skip")
+
+    model = FakeOuter()
+    source = FakeSource()
+    plan = hunyuan_v1_uma.HunyuanV1SourcePlan(
+        auto_plan=WeightPlan(()),
+        routed_entries=(),
+        fused_qkv_names=(qkv_name,),
+    )
+
+    assert hunyuan_v1_uma.load_hunyuan_v1_weights_from_source(
+        model,
+        source,
+        plan,
+    ) == {qkv_name}
+    assert source.reads == [qkv_name]
+    calls = getattr(model.model.layers, "0").self_attn.qkv_proj.weight.calls
+    assert [call[0] for call in calls] == ["q", "k", "v"]
+    assert [tuple(call[1].shape) for call in calls] == [(4, 4), (2, 4), (2, 4)]
 
 
 def test_qwen_moe_source_plan_handles_nested_language_model_before_read():

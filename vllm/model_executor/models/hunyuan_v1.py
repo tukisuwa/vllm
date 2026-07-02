@@ -982,6 +982,16 @@ class HunyuanV1ModelBase(
         )
         return loader.load_weights(weights)
 
+    def build_weight_plan(self, catalog):
+        from .hunyuan_v1_uma import build_hunyuan_v1_weight_plan
+
+        return build_hunyuan_v1_weight_plan(self, catalog)
+
+    def load_weights_from_source(self, source, plan) -> set[str]:
+        from .hunyuan_v1_uma import load_hunyuan_v1_weights_from_source
+
+        return load_hunyuan_v1_weights_from_source(self, source, plan)
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 

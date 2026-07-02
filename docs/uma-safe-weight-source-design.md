@@ -744,6 +744,7 @@ Expected current behavior:
 | MiMoV2 MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for split q/k/v and routed experts; Pro-format fused FP8 `qkv_proj` currently fails closed |
 | Longcat Flash MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for routed experts, dual dense MLP stacking, fused MLA q/kv-a stacking, and MLA post-load cache/scaling finalization |
 | Param2MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for fused QKV source slices, shared/dense gate-up stacking, expert-bias normalization, and routed experts |
+| HunYuan v1 Dense/MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for routed experts, `gate_and_up_proj` source slices, split q/k/v stacking, and fused `qkv_proj` one-read dispatch; fused qkv still uses a local full-QKV staging tensor |
 | Other routed MoE | Base path should work if normal vLLM load works | Not yet implemented |
 | Non-safetensors | Not supported | Not supported |
 | Remote HF path | Not supported by UMA-safe loader | Not supported |
