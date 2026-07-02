@@ -48,8 +48,14 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+    WeightPlan,
+)
 from vllm.sequence import IntermediateTensors
 
+from .auto_uma import build_auto_uma_weight_plan, load_auto_uma_weights_from_source
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
@@ -421,3 +427,17 @@ class SolarForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
+        return build_auto_uma_weight_plan(
+            self,
+            catalog,
+            mapper=self.hf_to_vllm_mapper,
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: WeightPlan,
+    ) -> set[str]:
+        return load_auto_uma_weights_from_source(self, source, plan)

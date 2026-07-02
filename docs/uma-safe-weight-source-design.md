@@ -415,6 +415,9 @@ Status: started with `Qwen2ForCausalLM`, `Qwen3ForCausalLM`,
 `Gemma3ForCausalLM`, `InternLM2ForCausalLM`, `PhiForCausalLM`,
 `Starcoder2ForCausalLM`, `FalconForCausalLM`, `MistralForCausalLM`,
 `GPTBigCodeForCausalLM`, `OPTForCausalLM`, `BloomForCausalLM`,
+`GPTJForCausalLM`, `MPTForCausalLM`, `OrionForCausalLM`,
+`Step1ForCausalLM`, `ApertusForCausalLM`, `StablelmForCausalLM`,
+`SolarForCausalLM`, `GPTNeoXForCausalLM`, `PersimmonForCausalLM`,
 `OlmoForCausalLM`, `Olmo2ForCausalLM`, `NemotronForCausalLM`,
 `ExaoneForCausalLM`, and `CohereForCausalLM`.
 
@@ -552,7 +555,7 @@ Expected current behavior:
 
 | Model type | Base `uma_odirect_safetensors` | Direct plan path |
 | --- | --- | --- |
-| Dense safetensors | Should work if normal vLLM load works | Phase 3 hooks for Qwen2/Qwen3/Llama/Gemma/Gemma2/Gemma3/InternLM2/Phi/Starcoder2/Falcon/Mistral/GPTBigCode/OPT/BLOOM/GPT-J/MPT/Orion/Step1/Apertus/OLMo/OLMo2/Nemotron/EXAONE/Cohere-style AutoWeightsLoader models |
+| Dense safetensors | Should work if normal vLLM load works | Phase 3 hooks for Qwen2/Qwen3/Llama/Gemma/Gemma2/Gemma3/InternLM2/Phi/Starcoder2/Falcon/Mistral/GPTBigCode/OPT/BLOOM/GPT-J/MPT/Orion/Step1/Apertus/StableLM/Solar/GPT-NeoX/Persimmon/OLMo/OLMo2/Nemotron/EXAONE/Cohere-style AutoWeightsLoader models |
 | Sharded dense safetensors | Should work if no duplicate names | Phase 3 |
 | Qwen2/Qwen3 / OLMoE / Cohere2 routed MoE | Base path should work if normal vLLM load works | Phase 4/5 model hook for `mlp.experts` gate/up/down tensors; loader-side direct path removed |
 | Mixtral / PhiMoE routed MoE | Base path should work if normal vLLM load works | Phase 5 initial model hook for `block_sparse_moe.experts` w1/w2/w3 tensors |

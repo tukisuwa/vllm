@@ -39,6 +39,7 @@ from vllm.model_executor.models import (
     gemma3,
     gpt_bigcode,
     gpt_j,
+    gpt_neox,
     granitemoe,
     granitemoehybrid,
     granitemoeshared,
@@ -53,6 +54,7 @@ from vllm.model_executor.models import (
     orion,
     opt,
     olmoe,
+    persimmon,
     phimoe,
     phi,
     qwen2,
@@ -61,6 +63,8 @@ from vllm.model_executor.models import (
     qwen3_5,
     qwen3_moe,
     qwen3_next,
+    solar,
+    stablelm,
     step1,
     starcoder2,
 )
@@ -2644,6 +2648,18 @@ def test_bloom_build_weight_plan_adds_transformer_prefix_and_tie_skip(tmp_path):
             "model.layers.0.self_attn.qkv_proj.weight",
             "v",
         ),
+        (
+            stablelm.StablelmForCausalLM,
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.0.mlp.gate_up_proj.weight",
+            0,
+        ),
+        (
+            solar.SolarForCausalLM,
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.qkv_proj.weight",
+            "k",
+        ),
     ],
 )
 def test_more_dense_compat_hooks_apply_mapper(
@@ -2676,8 +2692,15 @@ def test_more_dense_compat_hooks_apply_mapper(
     assert entry.shard_id == expected_shard
 
 
-def test_mpt_build_weight_plan_uses_plain_auto_mapping(tmp_path):
-    name = "transformer.blocks.0.ffn.up_proj.weight"
+@pytest.mark.parametrize(
+    "model_cls, name",
+    [
+        (mpt.MPTForCausalLM, "transformer.blocks.0.ffn.up_proj.weight"),
+        (gpt_neox.GPTNeoXForCausalLM, "gpt_neox.layers.0.mlp.dense_h_to_4h.weight"),
+        (persimmon.PersimmonForCausalLM, "model.layers.0.mlp.dense_h_to_4h.weight"),
+    ],
+)
+def test_plain_dense_build_weight_plan_uses_auto_mapping(tmp_path, model_cls, name):
     metadata = {
         name: {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
     }
@@ -2688,11 +2711,11 @@ def test_mpt_build_weight_plan_uses_plain_auto_mapping(tmp_path):
         metadata_limit_bytes=1024 * 1024,
     )
 
-    class FakeMPT:
+    class FakeModel:
         def children(self):
             return []
 
-    plan = mpt.MPTForCausalLM.build_weight_plan(FakeMPT(), catalog)
+    plan = model_cls.build_weight_plan(FakeModel(), catalog)
 
     assert plan.entries[0].checkpoint_name == name
     assert plan.entries[0].target_name == name
@@ -2746,6 +2769,10 @@ def test_apertus_build_weight_plan_skips_tied_lm_head(tmp_path):
         (orion.OrionForCausalLM, orion),
         (step1.Step1ForCausalLM, step1),
         (apertus.ApertusForCausalLM, apertus),
+        (stablelm.StablelmForCausalLM, stablelm),
+        (solar.SolarForCausalLM, solar),
+        (gpt_neox.GPTNeoXForCausalLM, gpt_neox),
+        (persimmon.PersimmonForCausalLM, persimmon),
     ],
 )
 def test_more_dense_compat_load_weights_from_source_delegates_to_executor(
