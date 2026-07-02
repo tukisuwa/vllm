@@ -586,6 +586,9 @@ Model audit:
 - prints total payload bytes, per-file payload bytes, largest tensors, dtype
   distribution, and coarse tensor-name classes such as per-expert MoE,
   Granite fused expert tensors, QKV, embeddings, and shared experts
+- prints local `config.json` architectures when present, plus UMA hints for
+  implemented direct-plan families such as DeepSeek V2/V3, shared experts,
+  DeepSeek FP8 indexer WK pairs, and Granite fused experts
 - should be run before adding a model to the compatibility list
 
 Runtime tests:

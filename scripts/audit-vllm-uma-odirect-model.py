@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import json
 import os
 from collections import Counter
 from pathlib import Path
@@ -41,9 +42,29 @@ def _find_safetensors(model_dir: Path) -> list[str]:
     return files
 
 
+def _read_architectures(model_dir: Path) -> list[str]:
+    config_path = model_dir / "config.json"
+    if not config_path.exists() or os.path.islink(config_path):
+        return []
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    architectures = data.get("architectures")
+    if not isinstance(architectures, list):
+        return []
+    return [item for item in architectures if isinstance(item, str)]
+
+
 def _classify_name(name: str) -> str:
     if ".mlp.experts." in name:
         return "per_expert_moe"
+    if ".indexer.wk." in name and "weight_scale_inv" in name:
+        return "deepseek_fp8_indexer_wk_scale"
+    if ".indexer.wk." in name:
+        return "deepseek_indexer_wk"
+    if ".indexer." in name:
+        return "deepseek_indexer"
     if ".block_sparse_moe.input_linear." in name:
         return "granite_input_linear"
     if ".block_sparse_moe.output_linear." in name:
@@ -88,6 +109,42 @@ def _print_top(records: list[TensorMeta], *, top_n: int, pattern: str | None) ->
         )
 
 
+def _print_uma_hints(
+    architectures: list[str],
+    class_counts: Counter[str],
+) -> None:
+    arch_text = ",".join(architectures) if architectures else "unknown"
+    print(f"uma_hint architectures={arch_text}")
+    if any("DeepseekV2" in arch or "DeepseekV3" in arch for arch in architectures):
+        print("uma_hint direct_plan=deepseek_v2_v3 status=implemented")
+    if class_counts["per_expert_moe"]:
+        print(
+            "uma_hint moe=per_expert"
+            f" tensors={class_counts['per_expert_moe']}"
+            " note=model hook should skip non-local experts before payload reads"
+        )
+    if class_counts["shared_experts"]:
+        print(
+            "uma_hint moe=shared_experts"
+            f" tensors={class_counts['shared_experts']}"
+            " note=DeepSeek fusion path should use source slices"
+        )
+    if class_counts["deepseek_indexer_wk"] or class_counts["deepseek_fp8_indexer_wk_scale"]:
+        print(
+            "uma_hint deepseek_indexer_wk"
+            f" weights={class_counts['deepseek_indexer_wk']}"
+            f" scales={class_counts['deepseek_fp8_indexer_wk_scale']}"
+            " note=FP8 WK requires weight/scale pairing before fused load"
+        )
+    if class_counts["granite_input_linear"] or class_counts["granite_output_linear"]:
+        print(
+            "uma_hint granite_fused_experts"
+            f" input_linear={class_counts['granite_input_linear']}"
+            f" output_linear={class_counts['granite_output_linear']}"
+            " note=model hook should read local expert slices only"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -128,6 +185,7 @@ def main() -> None:
         metadata_limit_bytes=args.metadata_limit_mib * 1024 * 1024,
     )
     records = list(catalog.records())
+    architectures = _read_architectures(model_dir)
     class_counts: Counter[str] = Counter()
     class_bytes: Counter[str] = Counter()
     dtype_counts: Counter[str] = Counter()
@@ -144,6 +202,8 @@ def main() -> None:
         file_bytes[record.file_path] += record.size
 
     print(f"model_dir={model_dir}")
+    if architectures:
+        print(f"architectures={','.join(architectures)}")
     print(
         f"files={len(files)} tensors={len(records)} "
         f"payload={_format_gib(catalog.total_bytes())}"
@@ -164,6 +224,7 @@ def main() -> None:
             f" tensors={count}"
             f" payload={_format_gib(dtype_bytes[dtype])}"
         )
+    _print_uma_hints(architectures, class_counts)
     if args.top:
         _print_top(records, top_n=args.top, pattern=args.pattern)
 
