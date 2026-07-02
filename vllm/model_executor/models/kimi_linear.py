@@ -41,6 +41,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -49,6 +53,11 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from .interfaces import HasInnerState, IsHybrid, MixtureOfExperts, SupportsPP
+from .kimi_linear_uma import (
+    KimiLinearMoeSourcePlan,
+    build_kimi_linear_moe_weight_plan,
+    load_kimi_linear_moe_weights_from_source,
+)
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -636,6 +645,16 @@ class KimiLinearForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> KimiLinearMoeSourcePlan:
+        return build_kimi_linear_moe_weight_plan(self, catalog)
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: KimiLinearMoeSourcePlan,
+    ) -> set[str]:
+        return load_kimi_linear_moe_weights_from_source(self, source, plan)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(

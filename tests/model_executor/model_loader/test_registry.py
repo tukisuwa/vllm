@@ -69,6 +69,7 @@ from vllm.model_executor.models import (
     jamba_uma,
     laguna,
     lfm2,
+    kimi_linear,
     llama,
     mamba,
     mamba2,
@@ -4642,6 +4643,166 @@ def test_laguna_moe_source_plan_keeps_bias_and_shared_expert_auto_loads():
         "model.layers.0.mlp.experts.e_score_correction_bias",
         "model.layers.0.mlp.shared_expert.gate_proj.weight",
         "model.layers.0.mlp.experts.w13_weight",
+    }
+    assert model.routed_experts.calls[0]["expert_id"] == 0
+    assert model.routed_experts.calls[0]["shard_id"] == "w1"
+
+
+def test_kimi_linear_moe_source_plan_skips_nonlocal_and_spec_layers():
+    names = [
+        "model.layers.0.block_sparse_moe.experts.0.w1.weight",
+        "model.layers.0.block_sparse_moe.experts.1.w1.weight",
+        "model.layers.0.block_sparse_moe.gate.e_score_correction_bias",
+        "model.layers.0.block_sparse_moe.shared_experts.gate_proj.weight",
+        "model.layers.2.block_sparse_moe.shared_experts.gate_proj.weight",
+    ]
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", names[0], torch.float32, [1], 0, 4),
+            TensorMeta("model.safetensors", names[1], torch.float32, [1], 4, 4),
+            TensorMeta("model.safetensors", names[2], torch.float32, [2], 8, 8),
+            TensorMeta("model.safetensors", names[3], torch.float32, [1, 1], 16, 4),
+            TensorMeta("model.safetensors", names[4], torch.float32, [1, 1], 20, 4),
+        ]
+    )
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.block_sparse_moe.experts"
+        w13_weight = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 0 else -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeGate(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.e_score_correction_bias = nn.Parameter(torch.zeros(2))
+
+    class FakeSharedExperts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = nn.Linear(1, 2, bias=False)
+            nn.init.zeros_(self.gate_up_proj.weight)
+            self.shared_calls = []
+
+            def weight_loader(param, loaded_weight, shard_id):
+                self.shared_calls.append(
+                    {
+                        "param": param,
+                        "loaded_weight": loaded_weight,
+                        "shard_id": shard_id,
+                    }
+                )
+                param.data.narrow(0, shard_id, 1).copy_(loaded_weight)
+
+            self.gate_up_proj.weight.weight_loader = weight_loader
+
+    class FakeMoE(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.experts = routed_experts
+            self.gate = FakeGate()
+            self.shared_experts = FakeSharedExperts()
+
+    class FakeLayer(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.block_sparse_moe = FakeMoE(routed_experts)
+
+    class FakeLayers:
+        def __init__(self, routed_experts):
+            self._layers = [FakeLayer(routed_experts)]
+
+        def __len__(self):
+            return len(self._layers)
+
+        def __getitem__(self, idx):
+            return self._layers[idx]
+
+        def __getattr__(self, name):
+            if name.isdigit():
+                return self._layers[int(name)]
+            raise AttributeError(name)
+
+    class FakeInnerModel(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.layers = FakeLayers(routed_experts)
+
+    class FakeConfig:
+        tie_word_embeddings = False
+        num_hidden_layers = 2
+        num_nextn_predict_layers = 1
+
+    class FakeKimiLinear(kimi_linear.KimiLinearForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = FakeConfig()
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            if name == names[2]:
+                return torch.tensor([2.0, 4.0])
+            if name == names[3]:
+                return torch.tensor([[5.0]])
+            return torch.ones(1)
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    model = FakeKimiLinear()
+    source = FakeSource(catalog)
+
+    plan = model.build_weight_plan(catalog)
+    auto_entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    assert auto_entries[names[2]].target_name == (
+        "model.layers.0.block_sparse_moe.gate.e_score_correction_bias"
+    )
+    assert auto_entries[names[3]].target_name == (
+        "model.layers.0.block_sparse_moe.shared_experts.gate_up_proj.weight"
+    )
+    assert auto_entries[names[3]].shard_id == 0
+    assert auto_entries[names[4]].required is False
+    assert [entry.checkpoint_name for entry in plan.routed_entries] == names[:2]
+    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+
+    loaded = model.load_weights_from_source(source, plan)
+
+    assert source.reads == [names[2], names[3], names[0]]
+    assert source.skips == [
+        (names[4], "weight plan marked not required"),
+        (names[1], "non-local routed expert"),
+    ]
+    moe_layer = model.model.layers[0].block_sparse_moe
+    assert torch.equal(
+        moe_layer.gate.e_score_correction_bias,
+        torch.tensor([2.0, 4.0]),
+    )
+    assert moe_layer.shared_experts.shared_calls[0]["shard_id"] == 0
+    assert torch.equal(
+        moe_layer.shared_experts.gate_up_proj.weight,
+        torch.tensor([[5.0], [0.0]]),
+    )
+    assert loaded == {
+        "model.layers.0.block_sparse_moe.gate.e_score_correction_bias",
+        "model.layers.0.block_sparse_moe.shared_experts.gate_up_proj.weight",
+        "model.layers.0.block_sparse_moe.experts.w13_weight",
     }
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"

@@ -662,6 +662,13 @@ Add model-side plans only where needed:
   - skips non-local routed experts before payload read
   - keeps router correction bias and shared expert tensors on the normal
     WeightSource auto plan
+- Kimi Linear MoE
+  - initial hook implemented for
+    `block_sparse_moe.experts.<expert>.w{1,2,3}.*` tensors
+  - skips non-local routed experts and speculative next-token layers before
+    payload read
+  - keeps shared expert `gate_proj` / `up_proj` stacking and router correction
+    bias on the model-side WeightSource plan
 
 Each model family should implement its own plan builder instead of adding
 loader-side conditionals.
@@ -688,6 +695,7 @@ Expected current behavior:
 | Ernie 4.5 MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts, `moe_statics` bias remap, and MTP skip |
 | Bailing / Sarvam Bailing-style MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts and model-specific normalization |
 | Laguna MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts while preserving bias/shared-expert auto loads |
+| Kimi Linear MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for `block_sparse_moe` routed experts, spec-layer skip, and shared-expert stacking |
 | Other routed MoE | Base path should work if normal vLLM load works | Not yet implemented |
 | Non-safetensors | Not supported | Not supported |
 | Remote HF path | Not supported by UMA-safe loader | Not supported |
