@@ -44,6 +44,7 @@ from vllm.model_executor.models import (
     gemma,
     gemma2,
     gemma3,
+    gemma4,
     glm4,
     glm4_moe,
     gpt_bigcode,
@@ -3069,6 +3070,105 @@ def test_gemma_dense_hooks_use_mapper_and_tie_skip(tmp_path, model_cls):
     up_proj = entries["model.layers.0.mlp.up_proj.weight"]
     assert up_proj.target_name == "model.layers.0.mlp.gate_up_proj.weight"
     assert up_proj.shard_id == 1
+
+
+def test_gemma4_build_weight_plan_slices_packed_moe_and_k_eq_v(tmp_path):
+    metadata = {
+        "model.language_model.layers.0.moe.gate_up_proj.weight": {
+            "dtype": "F32",
+            "shape": [2, 4, 3],
+            "data_offsets": [0, 96],
+        },
+        "model.language_model.layers.0.moe.down_proj.weight": {
+            "dtype": "F32",
+            "shape": [2, 3, 2],
+            "data_offsets": [96, 144],
+        },
+        "model.language_model.layers.1.self_attn.k_proj.weight": {
+            "dtype": "F32",
+            "shape": [2, 2],
+            "data_offsets": [144, 160],
+        },
+        "lm_head.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [160, 164],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 164)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+        attention_k_eq_v = True
+        layer_types = ["sliding_attention", "full_attention"]
+        num_experts = 2
+
+    class FakeGemma4:
+        config = FakeConfig()
+        hf_to_vllm_mapper = gemma4.Gemma4ForCausalLM.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+        def named_parameters(self):
+            return []
+
+    plan = gemma4.Gemma4ForCausalLM.build_weight_plan(FakeGemma4(), catalog)
+
+    assert all(
+        entry.checkpoint_name
+        != "model.language_model.layers.0.moe.gate_up_proj.weight"
+        or entry.required
+        for entry in plan
+    )
+    gate_entries = [
+        entry
+        for entry in plan
+        if entry.checkpoint_name
+        == "model.language_model.layers.0.moe.gate_up_proj.weight"
+    ]
+    assert len(gate_entries) == 4
+    first_gate = gate_entries[0]
+    assert first_gate.target_name == (
+        "model.layers.0.moe.experts.routed_experts.w13_weight"
+    )
+    assert first_gate.shard_id == "w1"
+    assert first_gate.expert_id == 0
+    assert first_gate.source_slices == (0, slice(0, 2), slice(None))
+    first_up = gate_entries[1]
+    assert first_up.shard_id == "w3"
+    assert first_up.source_slices == (0, slice(2, 4), slice(None))
+
+    down_entries = [
+        entry
+        for entry in plan
+        if entry.checkpoint_name
+        == "model.language_model.layers.0.moe.down_proj.weight"
+    ]
+    assert len(down_entries) == 2
+    assert down_entries[0].target_name == (
+        "model.layers.0.moe.experts.routed_experts.w2_weight"
+    )
+    assert down_entries[0].shard_id == "w2"
+    assert down_entries[0].source_slices == (0, slice(None), slice(None))
+
+    k_eq_v_entries = [
+        entry
+        for entry in plan
+        if entry.checkpoint_name
+        == "model.language_model.layers.1.self_attn.k_proj.weight"
+    ]
+    assert {entry.shard_id for entry in k_eq_v_entries} == {"k", "v"}
+    assert any(
+        entry.target_name == "model.layers.1.self_attn.qkv_proj.weight"
+        for entry in k_eq_v_entries
+    )
+    assert next(entry for entry in plan if entry.checkpoint_name == "lm_head.weight").required is False
 
 
 @pytest.mark.parametrize(

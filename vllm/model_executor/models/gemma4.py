@@ -61,11 +61,18 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+    WeightPlan,
+    WeightPlanEntry,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import KVSharingFastPrefillMetadata
 
+from .auto_uma import build_auto_uma_weight_plan, load_auto_uma_weights_from_source
 from .interfaces import (
     EagleModelMixin,
     MixtureOfExperts,
@@ -87,6 +94,190 @@ logger = init_logger(__name__)
 
 def _remap_gemma4_expert_weight_name(name: str) -> str:
     return re.sub(r"(?<!\.moe)\.experts\.(\d+)\.", r".moe.experts.\1.", name)
+
+
+def _gemma4_normalize_checkpoint_name(name: str) -> str:
+    name = name.replace("language_model.", "")
+    name = name.replace(".router.per_expert_scale", ".moe.per_expert_scale")
+    if ".experts.gate_up_proj" in name:
+        name = name.replace(".experts.gate_up_proj", ".moe.gate_up_proj")
+    elif ".experts.down_proj" in name:
+        name = name.replace(".experts.down_proj", ".moe.down_proj")
+    return _remap_gemma4_expert_weight_name(name)
+
+
+def _gemma4_name_transform(
+    name: str,
+) -> tuple[str, None]:
+    return _gemma4_normalize_checkpoint_name(name), None
+
+
+def _gemma4_weight_mapper(base_mapper: WeightsMapper) -> WeightsMapper:
+    return base_mapper | WeightsMapper(
+        orig_to_new_stacked={
+            ".q_proj": (".qkv_proj", "q"),
+            ".k_proj": (".qkv_proj", "k"),
+            ".v_proj": (".qkv_proj", "v"),
+            ".gate_proj": (".gate_up_proj", 0),
+            ".up_proj": (".gate_up_proj", 1),
+        }
+    )
+
+
+def _gemma4_k_eq_v_layer_indices(config: object) -> set[int]:
+    if not getattr(config, "attention_k_eq_v", False):
+        return set()
+    return {
+        idx
+        for idx, layer_type in enumerate(getattr(config, "layer_types", []))
+        if layer_type == "full_attention"
+    }
+
+
+def _gemma4_layer_index_from_name(name: str) -> int | None:
+    match = re.search(r"layers\.(\d+)\.", name)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _gemma4_is_packed_moe_name(name: str) -> bool:
+    return "moe.gate_up_proj" in name or "moe.down_proj" in name
+
+
+def _gemma4_make_expert_mapping(model: nn.Module) -> list[tuple[str, str, int, str]]:
+    num_experts = getattr(model.config, "num_experts", None) or 0
+    dot_mapping = fused_moe_make_expert_params_mapping(
+        model,
+        ckpt_gate_proj_name="gate_proj",
+        ckpt_down_proj_name="down_proj",
+        ckpt_up_proj_name="up_proj",
+        num_experts=num_experts,
+    )
+    underscore_mapping = [
+        (
+            f"{param_name}weight_",
+            f"{weight_name.rstrip('.')}_",
+            expert_id,
+            shard_id,
+        )
+        for param_name, weight_name, expert_id, shard_id in dot_mapping
+    ]
+    return dot_mapping + underscore_mapping
+
+
+def _gemma4_expert_plan_entry(
+    *,
+    checkpoint_name: str,
+    normalized_name: str,
+    source_slices: tuple[slice | int, ...] | None,
+    expert_mapping: list[tuple[str, str, int, str]],
+) -> WeightPlanEntry | None:
+    for param_name, weight_name, expert_id, shard_id in expert_mapping:
+        weight_name_base = weight_name.rstrip(".")
+        if weight_name in normalized_name:
+            target_name = normalized_name.replace(weight_name, param_name)
+        elif normalized_name.endswith(weight_name_base):
+            target_name = normalized_name.replace(
+                weight_name_base, param_name.rstrip("_") + "_weight"
+            )
+        else:
+            continue
+        return WeightPlanEntry(
+            checkpoint_name=checkpoint_name,
+            target_name=target_name,
+            source_slices=source_slices,
+            shard_id=shard_id,
+            expert_id=expert_id,
+            weight_name=target_name,
+        )
+    return None
+
+
+def _gemma4_moe_plan_entries(
+    model: nn.Module,
+    catalog: TensorCatalog,
+) -> tuple[list[WeightPlanEntry], set[str]]:
+    entries: list[WeightPlanEntry] = []
+    moe_names: set[str] = set()
+    expert_mapping = _gemma4_make_expert_mapping(model)
+    for checkpoint_name in catalog.names():
+        normalized_name = _gemma4_normalize_checkpoint_name(checkpoint_name)
+        record = catalog.get(checkpoint_name)
+        if not _gemma4_is_packed_moe_name(normalized_name):
+            if re.search(
+                r"\.moe\.experts\.\d+\.(gate|up|down)_proj",
+                normalized_name,
+            ) is None:
+                continue
+            entry = _gemma4_expert_plan_entry(
+                checkpoint_name=checkpoint_name,
+                normalized_name=normalized_name,
+                source_slices=None,
+                expert_mapping=expert_mapping,
+            )
+            if entry is None:
+                raise RuntimeError(
+                    "Gemma4 UMA plan could not map per-expert MoE tensor "
+                    f"{checkpoint_name!r} as {normalized_name!r}"
+                )
+            entries.append(entry)
+            moe_names.add(checkpoint_name)
+            continue
+        if len(record.shape) != 3:
+            continue
+        moe_names.add(checkpoint_name)
+        num_experts = record.shape[0]
+        if "moe.gate_up_proj" in normalized_name:
+            intermediate_size = record.shape[1] // 2
+            for expert_id in range(num_experts):
+                base = normalized_name.replace("moe.", f"moe.experts.{expert_id}.")
+                gate_name = base.replace("gate_up_proj", "gate_proj")
+                up_name = base.replace("gate_up_proj", "up_proj")
+                for expert_name, slices in (
+                    (
+                        gate_name,
+                        (expert_id, slice(0, intermediate_size), slice(None)),
+                    ),
+                    (
+                        up_name,
+                        (
+                            expert_id,
+                            slice(intermediate_size, intermediate_size * 2),
+                            slice(None),
+                        ),
+                    ),
+                ):
+                    entry = _gemma4_expert_plan_entry(
+                        checkpoint_name=checkpoint_name,
+                        normalized_name=expert_name,
+                        source_slices=slices,
+                        expert_mapping=expert_mapping,
+                    )
+                    if entry is None:
+                        raise RuntimeError(
+                            "Gemma4 UMA plan could not map packed MoE tensor "
+                            f"{checkpoint_name!r} as {expert_name!r}"
+                        )
+                    entries.append(entry)
+        elif "moe.down_proj" in normalized_name:
+            for expert_id in range(num_experts):
+                expert_name = normalized_name.replace(
+                    "moe.", f"moe.experts.{expert_id}."
+                )
+                entry = _gemma4_expert_plan_entry(
+                    checkpoint_name=checkpoint_name,
+                    normalized_name=expert_name,
+                    source_slices=(expert_id, slice(None), slice(None)),
+                    expert_mapping=expert_mapping,
+                )
+                if entry is None:
+                    raise RuntimeError(
+                        "Gemma4 UMA plan could not map packed MoE tensor "
+                        f"{checkpoint_name!r} as {expert_name!r}"
+                    )
+                entries.append(entry)
+    return entries, moe_names
 
 
 @triton.jit
@@ -1713,3 +1904,66 @@ class Gemma4ForCausalLM(
 
         loader = AutoWeightsLoader(self, skip_substrs=skip)
         return loader.load_weights(_weight_iterator())
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
+        skip = [
+            "audio_tower.",
+            "vision_tower.",
+            "embed_audio.",
+            "embed_vision.",
+        ]
+        if self.config.tie_word_embeddings:
+            skip.append("lm_head.")
+
+        moe_entries, moe_names = _gemma4_moe_plan_entries(
+            self,
+            catalog,
+        )
+        plan = build_auto_uma_weight_plan(
+            self,
+            catalog,
+            mapper=_gemma4_weight_mapper(self.hf_to_vllm_mapper),
+            name_transform=_gemma4_name_transform,
+            skip_substrs=skip,
+        )
+        entries = [
+            entry for entry in plan if entry.checkpoint_name not in moe_names
+        ]
+
+        map_name_with_shard = _gemma4_weight_mapper(
+            self.hf_to_vllm_mapper
+        )._map_name_with_shard
+        k_eq_v_layers = _gemma4_k_eq_v_layer_indices(self.config)
+        if k_eq_v_layers:
+            for checkpoint_name in catalog.names():
+                normalized_name = _gemma4_normalize_checkpoint_name(checkpoint_name)
+                if "self_attn.k_proj" not in normalized_name:
+                    continue
+                layer_idx = _gemma4_layer_index_from_name(normalized_name)
+                if layer_idx not in k_eq_v_layers:
+                    continue
+                mapped = map_name_with_shard(
+                    normalized_name.replace("k_proj", "v_proj")
+                )
+                if mapped is None:
+                    raise RuntimeError(
+                        "Gemma4 UMA plan could not map k_eq_v duplicate for "
+                        f"{checkpoint_name!r}"
+                    )
+                target_name, shard_id = mapped
+                entries.append(
+                    WeightPlanEntry(
+                        checkpoint_name=checkpoint_name,
+                        target_name=target_name,
+                        shard_id=shard_id,
+                    )
+                )
+
+        return WeightPlan(tuple(entries) + tuple(moe_entries))
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: WeightPlan,
+    ) -> set[str]:
+        return load_auto_uma_weights_from_source(self, source, plan)
