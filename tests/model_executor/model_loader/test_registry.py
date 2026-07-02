@@ -75,6 +75,7 @@ from vllm.model_executor.models import (
     jamba_uma,
     laguna,
     lfm2,
+    lfm2_moe,
     kimi_linear,
     llama,
     mamba,
@@ -7247,6 +7248,165 @@ def test_phimoe_source_hook_passes_mixtral_family_options(monkeypatch):
     assert calls[0][3]["mapper"] is phimoe.PhiMoEForCausalLM.hf_to_vllm_mapper
     assert calls[1] == ("load", model, source, "plan",
                         {"family_name": "PhiMoE"})
+
+
+def test_lfm2_moe_source_hook_delegates_to_shared_helper(monkeypatch):
+    calls = []
+
+    def fake_build(model, catalog, **kwargs):
+        calls.append(("build", model, catalog, kwargs))
+        return "plan"
+
+    def fake_load(model, source, plan):
+        calls.append(("load", model, source, plan))
+        return {"loaded"}
+
+    monkeypatch.setattr(lfm2_moe, "build_lfm2_moe_weight_plan", fake_build)
+    monkeypatch.setattr(lfm2_moe, "load_lfm2_moe_weights_from_source", fake_load)
+
+    class FakeConfig:
+        tie_word_embeddings = True
+
+    class FakeLfm2Moe(lfm2_moe.Lfm2MoeForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = FakeConfig()
+
+    model = FakeLfm2Moe()
+    catalog = object()
+    source = object()
+
+    assert model.build_weight_plan(catalog) == "plan"
+    assert model.load_weights_from_source(source, "plan") == {"loaded"}
+    assert calls[0][3]["mapper"] is lfm2_moe.Lfm2MoeForCausalLM.hf_to_vllm_mapper
+    assert calls[0][3]["skip_prefixes"] == ["lm_head."]
+    assert calls[1] == ("load", model, source, "plan")
+
+
+def test_lfm2_moe_source_plan_maps_dense_and_routed_names_before_read():
+    local_name = "model.layers.0.feed_forward.experts.1.w1.weight"
+    remote_name = "model.layers.0.feed_forward.experts.2.w2.weight"
+    catalog = TensorCatalog([
+        TensorMeta("model.safetensors", local_name, torch.float32, [1], 0, 4),
+        TensorMeta("model.safetensors", remote_name, torch.float32, [1], 4, 4),
+        TensorMeta(
+            "model.safetensors",
+            "model.layers.0.feed_forward.w1.weight",
+            torch.float32,
+            [1],
+            8,
+            4,
+        ),
+        TensorMeta(
+            "model.safetensors",
+            "model.layers.0.feed_forward.expert_bias",
+            torch.float32,
+            [1],
+            12,
+            4,
+        ),
+        TensorMeta(
+            "model.safetensors",
+            "model.layers.0.conv.weight",
+            torch.float32,
+            [1],
+            16,
+            4,
+        ),
+    ])
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.feed_forward.experts"
+        w13_weight = object()
+        w2_weight = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 1 else -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeFeedForward:
+        def __init__(self, experts):
+            self.experts = experts
+
+    class FakeLayer:
+        def __init__(self, experts):
+            self.feed_forward = FakeFeedForward(experts)
+
+    class FakeInnerModel:
+        def __init__(self, experts):
+            self.layers = [FakeLayer(experts)]
+
+    class FakeModel:
+        def __init__(self):
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+        def children(self):
+            return []
+
+    model = FakeModel()
+    plan = lfm2_moe.build_lfm2_moe_weight_plan(
+        model,
+        catalog,
+        mapper=lfm2_moe.Lfm2MoeForCausalLM.hf_to_vllm_mapper,
+    )
+
+    routed = {entry.checkpoint_name: entry for entry in plan.routed_entries}
+    assert routed[local_name].param_name == "w13_weight"
+    assert routed[local_name].shard_id == "w1"
+    assert routed[local_name].local_required is True
+    assert routed[remote_name].param_name == "w2_weight"
+    assert routed[remote_name].shard_id == "w2"
+    assert routed[remote_name].local_required is False
+
+    auto_entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    assert local_name not in auto_entries
+    assert remote_name not in auto_entries
+    assert (
+        auto_entries["model.layers.0.feed_forward.w1.weight"].target_name
+        == "model.layers.0.feed_forward.w13.weight"
+    )
+    assert auto_entries["model.layers.0.feed_forward.w1.weight"].shard_id == 0
+    assert (
+        auto_entries["model.layers.0.feed_forward.expert_bias"].target_name
+        == "model.layers.0.feed_forward.gate.e_score_correction_bias"
+    )
+    assert (
+        auto_entries["model.layers.0.conv.weight"].target_name
+        == "model.layers.0.short_conv.weight"
+    )
+
+    class FakeSource:
+        def __init__(self):
+            self.catalog = catalog
+            self.reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            return torch.ones(1)
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    source = FakeSource()
+    routed_only_plan = lfm2_moe.Lfm2MoeSourcePlan(WeightPlan(()), plan.routed_entries)
+    assert lfm2_moe.load_lfm2_moe_weights_from_source(
+        model,
+        source,
+        routed_only_plan,
+    ) == {"model.layers.0.feed_forward.experts.w13_weight"}
+    assert source.reads == [local_name]
+    assert source.skips == [(remote_name, "non-local routed expert")]
+    assert model.routed_experts.calls[0]["shard_id"] == "w1"
+    assert model.routed_experts.calls[0]["expert_id"] == 1
 
 
 def test_qwen_moe_source_plan_handles_nested_language_model_before_read():

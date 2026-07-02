@@ -44,6 +44,10 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_moe_expert_param_name,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.lfm2_moe import Lfm2MoeConfig
 
@@ -64,6 +68,11 @@ from .utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+)
+from .lfm2_moe_uma import (
+    Lfm2MoeSourcePlan,
+    build_lfm2_moe_weight_plan,
+    load_lfm2_moe_weights_from_source,
 )
 
 
@@ -766,3 +775,18 @@ class Lfm2MoeForCausalLM(
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> Lfm2MoeSourcePlan:
+        return build_lfm2_moe_weight_plan(
+            self,
+            catalog,
+            mapper=self.hf_to_vllm_mapper,
+            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: Lfm2MoeSourcePlan,
+    ) -> set[str]:
+        return load_lfm2_moe_weights_from_source(self, source, plan)

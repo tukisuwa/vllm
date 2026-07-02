@@ -740,6 +740,7 @@ Expected current behavior:
 | EXAONE MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts, shared-expert mapper replay, and lm_head/MTP skips |
 | Nemotron-H MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for non-gated `mixer.experts` up/down tensors and MTP skip |
 | MiniCPM / EagleMiniCPM MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for TP-local `mlp.experts` w1/w2/w3 source slices into `ws` / `w2s` |
+| LFM2 MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for `feed_forward.experts` w1/w2/w3 tensors, dense qkv/w13 stacking, conv remap, and non-local expert skip |
 | Other routed MoE | Base path should work if normal vLLM load works | Not yet implemented |
 | Non-safetensors | Not supported | Not supported |
 | Remote HF path | Not supported by UMA-safe loader | Not supported |
