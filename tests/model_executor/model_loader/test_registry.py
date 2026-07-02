@@ -26,6 +26,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     build_auto_weight_plan_from_catalog,
     execute_weight_plan,
 )
+from vllm.model_executor.models import qwen3
 
 
 @register_model_loader("custom_load_format")
@@ -679,6 +680,27 @@ def test_uma_odirect_execute_weight_plan_skips_not_required(tmp_path, monkeypatc
     assert source.stats_snapshot()["tensors_skipped"] == 1
 
 
+def test_uma_odirect_execute_weight_plan_skips_absent_not_required(
+    tmp_path, monkeypatch
+):
+    metadata = {"a": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 4)
+
+    class FakeModel:
+        pass
+
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(load_format="uma_odirect_safetensors")
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
+    source = ODirectSafetensorsWeightSource(loader, str(tmp_path))
+    plan = WeightPlan((WeightPlanEntry("missing", "missing", required=False),))
+
+    assert execute_weight_plan(FakeModel(), source, plan) == set()
+    assert source.stats_snapshot()["tensors_skipped"] == 1
+
+
 def test_uma_odirect_build_auto_weight_plan_from_catalog(tmp_path):
     metadata = {
         "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
@@ -723,6 +745,57 @@ def test_uma_odirect_build_auto_weight_plan_from_catalog(tmp_path):
     assert q_proj.required is True
     assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
     assert q_proj.shard_id == "q"
+
+
+def test_qwen3_build_weight_plan_uses_catalog_mapper_and_tie_skip(tmp_path):
+    metadata = {
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "model.layers.0.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 8)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+
+    class FakeQwen3:
+        config = FakeConfig()
+        hf_to_vllm_mapper = qwen3.Qwen3ForCausalLM.hf_to_vllm_mapper
+
+    plan = qwen3.Qwen3ForCausalLM.build_weight_plan(FakeQwen3(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["lm_head.weight"].required is False
+    q_proj = entries["model.layers.0.self_attn.q_proj.weight"]
+    assert q_proj.required is True
+    assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
+    assert q_proj.shard_id == "q"
+
+
+def test_qwen3_load_weights_from_source_delegates_to_executor(monkeypatch):
+    calls = []
+
+    def fake_execute(model, source, plan):
+        calls.append((model, source, plan))
+        return {"loaded"}
+
+    monkeypatch.setattr(qwen3, "execute_weight_plan", fake_execute)
+    model = object()
+    source = object()
+    plan = WeightPlan(())
+
+    loaded = qwen3.Qwen3ForCausalLM.load_weights_from_source(model, source, plan)
+
+    assert loaded == {"loaded"}
+    assert calls == [(model, source, plan)]
 
 
 def test_uma_odirect_model_source_hook_requires_both_methods(tmp_path, monkeypatch):

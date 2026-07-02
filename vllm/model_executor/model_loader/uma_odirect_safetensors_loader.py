@@ -621,8 +621,15 @@ class ODirectSafetensorsWeightSource:
         return tensor
 
     def skip(self, name: str, reason: str) -> None:
-        record = self.catalog.get(name)
         self._stats.tensors_skipped += 1
+        if not self.catalog.has(name):
+            logger.debug(
+                "uma_odirect_safetensors skipping absent tensor %s reason=%s",
+                name,
+                reason,
+            )
+            return
+        record = self.catalog.get(name)
         logger.debug(
             "uma_odirect_safetensors skipping tensor %s bytes=%s reason=%s",
             name,

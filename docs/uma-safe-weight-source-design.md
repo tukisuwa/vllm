@@ -353,6 +353,8 @@ Remaining:
 
 ### Phase 3: Dense model prototype
 
+Status: started with `Qwen3ForCausalLM`.
+
 Start with Llama/Qwen dense, not MoE.
 
 Why:
@@ -363,10 +365,20 @@ Why:
 
 Target behavior:
 
-- plan skips tied `lm_head`
-- plan skips rotary/cache tensors
-- plan maps q/k/v into qkv placement before read
-- plan can read only local TP shard where possible
+- plan skips tied `lm_head`: implemented for Qwen3
+- plan skips rotary/cache tensors: implemented through shared auto-plan helper
+- plan maps q/k/v into qkv placement before read: implemented through
+  `hf_to_vllm_mapper` and `shard_id`
+- plan can read only local TP shard where possible: not implemented yet
+
+Current limitations:
+
+- The first Qwen3 hook still reads each required checkpoint tensor as a CPU
+  tensor, then delegates to existing parameter `weight_loader`.
+- It proves model-side planning and skip/map decisions before payload read, but
+  does not yet perform TP-local source slicing for fused/parallel parameters.
+- MoE direct loading is still handled by the older compatibility optimization;
+  it should be moved to model-side planning in Phase 4.
 
 ### Phase 4: Qwen MoE prototype
 
