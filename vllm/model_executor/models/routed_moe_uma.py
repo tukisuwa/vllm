@@ -32,6 +32,7 @@ class RoutedMoeEntry:
     shard_id: str
     local_required: bool
     skip_reason: str | None = None
+    source_slices: tuple[slice | int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -157,7 +158,13 @@ def load_routed_moe_weights_from_source(
                 f"{family_name} UMA plan target parameter "
                 f"{entry.param_name!r} does not exist for {entry.checkpoint_name}"
             )
-        tensor = source.read_full_cpu(entry.checkpoint_name)
+        if entry.source_slices is None:
+            tensor = source.read_full_cpu(entry.checkpoint_name)
+        else:
+            tensor = source.read_slice_cpu(
+                entry.checkpoint_name,
+                entry.source_slices,
+            )
         weight_name = f"{routed_experts.layer_name}.{entry.param_name}"
         success = routed_experts.weight_loader(
             param=getattr(routed_experts, entry.param_name),

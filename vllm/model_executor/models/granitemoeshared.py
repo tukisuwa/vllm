@@ -28,9 +28,18 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.sequence import IntermediateTensors
 
 from .granitemoe import GraniteMoeAttention, GraniteMoeModel, GraniteMoeMoE
+from .granitemoe_uma import (
+    GraniteMoeSourcePlan,
+    build_granite_moe_weight_plan,
+    load_granite_moe_weights_from_source,
+)
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import AutoWeightsLoader, make_layers, maybe_prefix
 
@@ -307,6 +316,23 @@ class GraniteMoeSharedForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> GraniteMoeSourcePlan:
+        skip_prefixes = ["lm_head."] if self.config.tie_word_embeddings else None
+        return build_granite_moe_weight_plan(
+            self,
+            catalog,
+            num_experts=self.config.num_local_experts,
+            routed_prefix="routed_experts_",
+            skip_prefixes=skip_prefixes,
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: GraniteMoeSourcePlan,
+    ) -> set[str]:
+        return load_granite_moe_weights_from_source(self, source, plan)
 
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device

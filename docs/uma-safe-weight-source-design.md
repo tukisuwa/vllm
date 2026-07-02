@@ -483,6 +483,15 @@ Add model-side plans only where needed:
   - deliberately rejects shared-expert fusion and FP8 indexer WK fusion until
     those transforms are represented in WeightPlan
 - Granite MoE variants
+  - initial hook implemented for GraniteMoe and GraniteMoeShared checkpoint
+    tensors that store all experts in `input_linear` / `output_linear`
+  - reads expert-local `w1`, `w3`, and `w2` slices from those fused source
+    tensors instead of materializing the full source tensor and splitting in
+    Python
+  - skips non-local expert slices before payload read when the FusedMoE expert
+    map exposes locality
+  - GraniteMoeHybrid remains separate because its Mamba/attention split and
+    additional quantized expert naming need a separate audit
 
 Each model family should implement its own plan builder instead of adding
 loader-side conditionals.
@@ -498,7 +507,8 @@ Expected current behavior:
 | Qwen routed MoE | Works; deprecated loader-side direct path remains | Phase 4 model hook |
 | Mixtral routed MoE | Base path should work if normal vLLM load works | Phase 5 initial model hook |
 | DeepSeek V2/V3 routed MoE | Base path should work if normal vLLM load works | Conservative Phase 5 hook; shared-expert fusion and FP8 indexer WK fusion rejected |
-| Other non-Qwen routed MoE | Base path should work if normal vLLM load works | Not yet implemented |
+| Granite MoE / Granite MoE Shared | Base path should work if normal vLLM load works | Phase 5 initial model hook |
+| Other routed MoE | Base path should work if normal vLLM load works | Not yet implemented |
 | Non-safetensors | Not supported | Not supported |
 | Remote HF path | Not supported by UMA-safe loader | Not supported |
 | mmap/eager/prefetch | Rejected | Rejected |
