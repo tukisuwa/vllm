@@ -443,8 +443,6 @@ def execute_weight_plan(
             tensor = source.read_full_cpu(entry.checkpoint_name)
         else:
             tensor = source.read_slice_cpu(entry.checkpoint_name, source_slices)
-        if entry.transform is not None:
-            tensor = entry.transform(tensor)
         if entry.transform_ops:
             tensor = apply_transform_ops(entry.transform_ops, tensor)
 

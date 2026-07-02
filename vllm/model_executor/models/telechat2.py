@@ -150,7 +150,7 @@ def _telechat2_uma_weight_plan(
                 WeightPlanEntry(
                     entry.checkpoint_name,
                     entry.target_name.replace("query", "qkv_proj", 1),
-                    transform=entry.transform,
+                    transform_ops=entry.transform_ops,
                     shard_id="q",
                     ignore_missing=entry.ignore_missing,
                 )

@@ -14,6 +14,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 )
 from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
+    TransformOp,
     WeightPlan,
     WeightPlanEntry,
     build_auto_weight_plan_for_module,
@@ -73,7 +74,7 @@ def build_routed_moe_weight_plan(
     auto_skip_substr: str,
     mapper: object | None = None,
     name_transform: (
-        Callable[[str], tuple[str, Callable[[Any], Any] | None] | None] | None
+        Callable[[str], tuple[str, tuple[TransformOp, ...] | None] | None] | None
     ) = None,
     skip_prefixes: list[str] | None = None,
     skip_substrs: list[str] | None = None,

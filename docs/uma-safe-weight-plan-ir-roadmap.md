@@ -330,16 +330,15 @@ question about the minimal op set.  Design:
 - `WeightPlanSummary` gains transform staging accounting
   (payload × (factor − 1) per entry, peak across entries since execution is
   serial), which `ExecutorCapability.max_staging_bytes` can later veto;
-- `name_transform` hook results migrate from `(name, Callable | None)` to
-  `(name, tuple[TransformOp, ...])`; the legacy `transform` field is removed
-  once the four families migrate.
+- `name_transform` hook results use `(name, tuple[TransformOp, ...])`; opaque
+  callable transforms are not part of `WeightPlanEntry`.
 
 Migration order: (1) registry + entry field + executor application +
 validation, legacy field kept temporarily; (2) migrate the three generic-op
 families; (3) extract model-bound transform closures into pure-args ops:
 llama4 and mistral use shared `qk_rope_permute(n_heads)`, and bagel uses
 `patch_embedding_reshape(patch_size, in_channels)`; (4) delete the legacy
-`transform` field.
+`transform` field and callable `name_transform` compatibility.
 
 At this layer, the declaration is still abstract.  It should not decide which
 checkpoint tensor actually exists, which file offset will be read, or which
@@ -1132,9 +1131,8 @@ has a hard-coded `routed_experts` fallback or parent-loader guessing logic.
 - `summarize_weight_plan` resolves each required entry's ops (unknown op
   names fail before any payload read) and reports
   `peak_transform_staging_bytes` from declared staging factors;
-- the executor applies `transform_ops` after the legacy `transform` callable;
-  `build_auto_weight_plan_from_catalog` accepts both forms from
-  `name_transform` hooks during the transition.
+- the executor applies only `transform_ops`; opaque callable transforms were
+  removed from `WeightPlanEntry` in stage 4.
 
 Migrated to named ops: sarvam (`zero_mean`, including the model-file copy in
 `sarvam.py`), param2moe (`zero_mean`), ernie45_moe (`squeeze`), bailing_moe
@@ -1146,5 +1144,9 @@ bagel (`patch_embedding_reshape`).  mimo_v2's attention-sink rewrite passes
 Stage 3 removed the remaining model-bound transform closures: llama4 no
 longer captures `model.permute_qk_weight_for_rotary`, mistral shares the same
 rope permute op with pure `n_heads`, and bagel's patch reshape uses static
-patch/channel arguments.  The legacy `transform` field is now removable in
-stage 4.
+patch/channel arguments.
+
+Stage 4 removed the legacy `WeightPlanEntry.transform` field and the callable
+`name_transform` compatibility path.  `WeightPlanEntry` is now data-only for
+transforms, with all transform behavior represented by serializable
+`TransformOp` tuples.  This unblocks golden-plan serialization tests.

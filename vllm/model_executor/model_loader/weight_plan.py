@@ -374,7 +374,6 @@ class WeightPlanEntry:
     target_slices: tuple[slice | int, ...] | None = None
     read_segments: tuple[WeightPlanReadSegment, ...] | None = None
     staging_shape: tuple[int, ...] | None = None
-    transform: Callable[[torch.Tensor], torch.Tensor] | None = None
     transform_ops: tuple[TransformOp, ...] = ()
     source_is_sharded: bool = False
     read_into_cpu: bool = False
@@ -1353,12 +1352,7 @@ def build_auto_weight_plan_from_catalog(
     name_transform: (
         Callable[
             [str],
-            tuple[
-                str,
-                tuple[TransformOp, ...]
-                | Callable[[torch.Tensor], torch.Tensor]
-                | None,
-            ]
+            tuple[str, tuple[TransformOp, ...] | None]
             | None,
         ]
         | None
@@ -1383,7 +1377,6 @@ def build_auto_weight_plan_from_catalog(
     entries: list[WeightPlanEntry] = []
     for checkpoint_name in catalog.names():
         name = checkpoint_name
-        transform = None
         transform_ops: tuple[TransformOp, ...] = ()
         if name_transform is not None:
             transformed = name_transform(checkpoint_name)
@@ -1396,23 +1389,15 @@ def build_auto_weight_plan_from_catalog(
                     )
                 )
                 continue
-            name, raw_transform = transformed
-            # Transitional contract: named TransformOp tuples are the target
-            # form; opaque callables remain accepted until every hook
-            # migrates.
-            if raw_transform is None:
-                pass
-            elif isinstance(raw_transform, tuple):
-                transform_ops = raw_transform
-            else:
-                transform = raw_transform
+            name, resolved_transform_ops = transformed
+            if resolved_transform_ops is not None:
+                transform_ops = resolved_transform_ops
         if skip_predicate is not None and skip_predicate(name):
             entries.append(
                 WeightPlanEntry(
                     checkpoint_name=checkpoint_name,
                     target_name=name,
                     required=False,
-                    transform=transform,
                     transform_ops=transform_ops,
                 )
             )
@@ -1425,7 +1410,6 @@ def build_auto_weight_plan_from_catalog(
                     checkpoint_name=checkpoint_name,
                     target_name=name,
                     required=False,
-                    transform=transform,
                     transform_ops=transform_ops,
                 )
             )
@@ -1441,7 +1425,7 @@ def build_auto_weight_plan_from_catalog(
                         checkpoint_name=checkpoint_name,
                         target_name=name,
                         required=False,
-                        transform=transform,
+                        transform_ops=transform_ops,
                     )
                 )
                 continue
@@ -1451,7 +1435,6 @@ def build_auto_weight_plan_from_catalog(
             WeightPlanEntry(
                 checkpoint_name=checkpoint_name,
                 target_name=target_name,
-                transform=transform,
                 transform_ops=transform_ops,
                 shard_id=shard_id,
                 ignore_missing=any(
@@ -1469,7 +1452,7 @@ def build_auto_weight_plan_for_module(
     mapper: object | None = None,
     name_transform: (
         Callable[
-            [str], tuple[str, Callable[[torch.Tensor], torch.Tensor] | None] | None
+            [str], tuple[str, tuple[TransformOp, ...] | None] | None
         ]
         | None
     ) = None,

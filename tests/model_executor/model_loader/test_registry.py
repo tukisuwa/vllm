@@ -1615,77 +1615,6 @@ def test_uma_odirect_telechat2_plan_uses_segmented_key_value_reads():
     assert skipped_entries[0].checkpoint_name == "lm_head.weight"
 
 
-def test_uma_odirect_execute_weight_plan_applies_transform(tmp_path, monkeypatch):
-    metadata = {
-        "weight": {"dtype": "F32", "shape": [2], "data_offsets": [0, 8]},
-    }
-    path = tmp_path / "model.safetensors"
-    _write_safetensors(path, metadata, b"\0" * 8)
-
-    class FakeODirectFile:
-        window_size = 64 * 1024 * 1024
-
-        def __init__(self, *_args):
-            self.direct_reads = 0
-            self.window_loads = 0
-            self.window_hits = 0
-            self.bytes_read = 0
-            self.bytes_copied = 0
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, _exc_type, _exc_value, _traceback):
-            pass
-
-        def read_record_into_tensor(self, tensor, _offset, size, gate=None):
-            self.direct_reads += 1
-            self.bytes_read += size
-            self.bytes_copied += size
-            tensor.copy_(torch.tensor([1.0, 2.0]))
-            if gate is not None:
-                gate(size)
-
-    class FakeParam:
-        def __init__(self):
-            self.loaded = None
-
-        def weight_loader(self, param, tensor, **kwargs):
-            assert param is self
-            assert kwargs == {}
-            self.loaded = tensor.clone()
-
-    class FakeModel:
-        def __init__(self):
-            self.param = FakeParam()
-
-    loader = UmaODirectSafetensorsModelLoader(
-        LoadConfig(load_format="uma_odirect_safetensors")
-    )
-    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
-    monkeypatch.setattr(
-        "vllm.model_executor.model_loader.uma_odirect_safetensors_loader."
-        "_ODirectFile",
-        FakeODirectFile,
-    )
-    source = ODirectSafetensorsWeightSource(loader, str(tmp_path))
-    model = FakeModel()
-    plan = WeightPlan(
-        (
-            WeightPlanEntry(
-                "weight",
-                "param",
-                transform=lambda tensor: tensor.flip(0),
-            ),
-        )
-    )
-
-    loaded = execute_weight_plan(model, source, plan)
-
-    assert loaded == {"param"}
-    assert model.param.loaded.tolist() == [2.0, 1.0]
-
-
 def test_uma_odirect_execute_weight_plan_infers_output_tp_slice(
     tmp_path, monkeypatch
 ):
@@ -4049,7 +3978,6 @@ def test_bagel_build_weight_plan_skips_generation_and_transforms_patch(tmp_path)
 
     patch = entries["vit_model.patch_embedding.weight"]
     assert patch.target_name == "vit_model.patch_embedding.weight"
-    assert patch.transform is None
     assert patch.transform_ops == (TransformOp("patch_embedding_reshape", (2, 3)),)
     tensor = torch.arange(24, dtype=torch.float32).reshape(2, 12)
     transformed = apply_transform_ops(patch.transform_ops, tensor)
@@ -4776,7 +4704,6 @@ def test_mistral_build_weight_plan_remaps_names_and_permute_transform(tmp_path):
     wq = entries["layers.0.attention.wq.weight"]
     assert wq.target_name == "model.layers.0.self_attn.qkv_proj.weight"
     assert wq.shard_id == "q"
-    assert wq.transform is None
     assert wq.transform_ops == (TransformOp("qk_rope_permute", (2,)),)
     tensor = torch.arange(16, dtype=torch.float32).reshape(4, 4)
     assert torch.equal(
@@ -8037,7 +7964,6 @@ def test_param2moe_source_plan_splits_fused_qkv_and_maps_names_before_read():
         bias_entry.target_name
         == "model.layers.0.mlp.gate.e_score_correction_bias"
     )
-    assert bias_entry.transform is None
     assert bias_entry.transform_ops == (TransformOp("zero_mean"),)
     assert torch.equal(
         apply_transform_ops(bias_entry.transform_ops, torch.tensor([1.0, 3.0])),
@@ -8459,7 +8385,6 @@ def test_llama4_source_plan_maps_dense_per_expert_and_fused_names(monkeypatch):
         "model.layers.0.self_attn.qkv_proj.weight"
     )
     assert auto_entries[q_name].shard_id == "q"
-    assert auto_entries[q_name].transform is None
     assert auto_entries[q_name].transform_ops == (
         TransformOp("qk_rope_permute", (2,)),
     )
