@@ -59,11 +59,13 @@ from vllm.model_executor.models import (
     mamba,
     mamba2,
     minimax_m2,
+    mistral3,
     mixtral,
     mistral,
     mpt,
     mimo,
     nemotron,
+    nemotron_nas,
     olmo,
     olmo2,
     orion,
@@ -2681,6 +2683,101 @@ def test_chatglm_build_weight_plan_replays_transformer_child_mapper(tmp_path):
     )
 
 
+def test_decilm_build_weight_plan_uses_mapper_and_tied_lm_head_skip(tmp_path):
+    metadata = {
+        "model.layers.0.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [0, 4],
+        },
+        "model.layers.0.mlp.gate_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [8, 12]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 12)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+
+    class FakeDeciLM:
+        config = FakeConfig()
+        hf_to_vllm_mapper = nemotron_nas.DeciLMForCausalLM.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = nemotron_nas.DeciLMForCausalLM.build_weight_plan(FakeDeciLM(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    q_proj = entries["model.layers.0.self_attn.q_proj.weight"]
+    assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
+    assert q_proj.shard_id == "q"
+    gate_proj = entries["model.layers.0.mlp.gate_proj.weight"]
+    assert gate_proj.target_name == "model.layers.0.mlp.gate_up_proj.weight"
+    assert gate_proj.shard_id == 0
+    assert entries["lm_head.weight"].required is False
+
+
+def test_mistral3_build_weight_plan_uses_multimodal_mapper(tmp_path):
+    metadata = {
+        "model.language_model.layers.0.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [0, 4],
+        },
+        "model.vision_tower.encoder.layers.0.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "model.multi_modal_projector.linear_1.weight_scale_inv": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [8, 12],
+        },
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [12, 16]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 16)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeMistral3:
+        hf_to_vllm_mapper = (
+            mistral3.Mistral3ForConditionalGeneration.hf_to_vllm_mapper
+        )
+
+        def children(self):
+            return []
+
+    plan = mistral3.Mistral3ForConditionalGeneration.build_weight_plan(
+        FakeMistral3(),
+        catalog,
+    )
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries[
+        "model.language_model.layers.0.self_attn.q_proj.weight"
+    ].target_name == "language_model.model.layers.0.self_attn.q_proj.weight"
+    assert entries[
+        "model.vision_tower.encoder.layers.0.self_attn.q_proj.weight"
+    ].target_name == "vision_tower.encoder.layers.0.self_attn.q_proj.weight"
+    assert entries[
+        "model.multi_modal_projector.linear_1.weight_scale_inv"
+    ].target_name == "multi_modal_projector.linear_1.weight_scale"
+    assert entries["lm_head.weight"].target_name == "language_model.lm_head.weight"
+
+
 @pytest.mark.parametrize(
     "model_cls, module",
     [
@@ -2695,6 +2792,8 @@ def test_chatglm_build_weight_plan_replays_transformer_child_mapper(tmp_path):
         (hrm_text.HrmTextForCausalLM, hrm_text),
         (minimax_m2.MiniMaxM2ForCausalLM, minimax_m2),
         (chatglm.ChatGLMForCausalLM, chatglm),
+        (nemotron_nas.DeciLMForCausalLM, nemotron_nas),
+        (mistral3.Mistral3ForConditionalGeneration, mistral3),
     ],
 )
 def test_more_dense_load_weights_from_source_delegates_to_executor(

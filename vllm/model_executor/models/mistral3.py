@@ -16,6 +16,11 @@ from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+    WeightPlan,
+)
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
@@ -34,6 +39,7 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
+from .auto_uma import build_auto_uma_weight_plan, load_auto_uma_weights_from_source
 from .interfaces import (
     MultiModalEmbeddings,
     SupportsEagle,
@@ -562,6 +568,20 @@ class Mistral3ForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
+        return build_auto_uma_weight_plan(
+            self,
+            catalog,
+            mapper=self.hf_to_vllm_mapper,
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: WeightPlan,
+    ) -> set[str]:
+        return load_auto_uma_weights_from_source(self, source, plan)
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """
