@@ -529,8 +529,9 @@ Add model-side plans only where needed:
     payload read
   - shared-expert fusion is represented as source slices into appended expert
     slots, avoiding a full shared-expert tensor read before chunking
-  - deliberately rejects FP8 indexer WK fusion until that dequantization
-    transform is represented in WeightPlan
+  - FP8 indexer WK fusion is handled as a DeepSeek-side deferred plan entry:
+    the hook reads the FP8 WK tensor and its scale tensor through WeightSource,
+    dequantizes to BF16, and loads shard 0 into `wk_weights_proj`
 - Granite MoE variants
   - initial hook implemented for GraniteMoe and GraniteMoeShared checkpoint
     tensors that store all experts in `input_linear` / `output_linear`
@@ -555,7 +556,7 @@ Expected current behavior:
 | Sharded dense safetensors | Should work if no duplicate names | Phase 3 |
 | Qwen2/Qwen3 / OLMoE / Cohere2 routed MoE | Base path should work if normal vLLM load works | Phase 4/5 model hook for `mlp.experts` gate/up/down tensors; loader-side direct path removed |
 | Mixtral / PhiMoE routed MoE | Base path should work if normal vLLM load works | Phase 5 initial model hook for `block_sparse_moe.experts` w1/w2/w3 tensors |
-| DeepSeek V2/V3 routed MoE | Base path should work if normal vLLM load works | Phase 5 hook for routed experts and shared-expert fusion source slices; FP8 indexer WK fusion rejected |
+| DeepSeek V2/V3 routed MoE | Base path should work if normal vLLM load works | Phase 5 hook for routed experts, shared-expert fusion source slices, and FP8 indexer WK fusion |
 | Granite MoE / Granite MoE Shared | Base path should work if normal vLLM load works | Phase 5 initial model hook |
 | Granite MoE Hybrid | Base path should work if normal vLLM load works | Phase 5 initial hook, including fused expert `weight_scale` and `A_log` mapping |
 | Other routed MoE | Base path should work if normal vLLM load works | Not yet implemented |

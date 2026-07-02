@@ -28,6 +28,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 from vllm.model_executor.models import (
     commandr,
     cohere2_moe,
+    deepseek_uma,
     bloom,
     deepseek_v2,
     exaone,
@@ -2886,10 +2887,13 @@ def test_deepseek_moe_source_plan_skips_nonlocal_experts_before_read():
     source = FakeSource(catalog)
 
     plan = model.build_weight_plan(catalog)
-    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+    assert [entry.local_required for entry in plan.routed_plan.routed_entries] == [
+        True,
+        False,
+    ]
     assert {
         entry.checkpoint_name
-        for entry in plan.auto_plan.entries
+        for entry in plan.routed_plan.auto_plan.entries
         if not entry.required
     } == {names[2]}
 
@@ -2975,9 +2979,10 @@ def test_deepseek_moe_source_plan_slices_shared_expert_fusion_before_read():
     source = FakeSource(catalog)
     plan = model.build_weight_plan(catalog)
 
-    assert len(plan.auto_plan.entries) == 0
+    assert len(plan.routed_plan.auto_plan.entries) == 0
     assert [
-        (entry.expert_id, entry.source_slices) for entry in plan.routed_entries
+        (entry.expert_id, entry.source_slices)
+        for entry in plan.routed_plan.routed_entries
     ] == [
         (2, (slice(0, 2), slice(None))),
         (3, (slice(2, 4), slice(None))),
@@ -2992,6 +2997,97 @@ def test_deepseek_moe_source_plan_slices_shared_expert_fusion_before_read():
     assert [call["expert_id"] for call in model.routed_experts.calls] == [2, 3]
     assert [call["shard_id"] for call in model.routed_experts.calls] == ["w1", "w1"]
     assert loaded == {"model.layers.0.mlp.experts.w13_weight"}
+
+
+def test_deepseek_moe_source_plan_loads_fp8_indexer_wk_pair(monkeypatch):
+    weight_name = "model.layers.0.self_attn.indexer.wk.weight"
+    scale_name = "model.layers.0.self_attn.indexer.wk.weight_scale_inv"
+    target_name = "model.layers.0.self_attn.indexer.wk_weights_proj.weight"
+    catalog = TensorCatalog(
+        [
+            TensorMeta(
+                "model.safetensors",
+                weight_name,
+                torch.float8_e4m3fn,
+                [2, 2],
+                0,
+                4,
+            ),
+            TensorMeta("model.safetensors", scale_name, torch.float32, [1, 1], 4, 4),
+        ]
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = False
+        num_nextn_predict_layers = 0
+
+    class FakeDeepseek(deepseek_v2.DeepseekV2ForCausalLM):
+        use_mha = True
+
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = FakeConfig()
+            self.target = torch.nn.Parameter(torch.empty(2, 2))
+            self.target.loaded = []
+
+            def weight_loader(param, loaded_weight, shard_id):
+                assert param is self.target
+                self.target.loaded.append((loaded_weight.clone(), shard_id))
+
+            self.target.weight_loader = weight_loader
+
+        def named_parameters(self, *args, **kwargs):
+            yield target_name, self.target
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            if name == weight_name:
+                return torch.ones(2, 2, dtype=torch.float8_e4m3fn)
+            if name == scale_name:
+                return torch.ones(1, 1, dtype=torch.float32)
+            raise AssertionError(f"unexpected read {name}")
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    def fake_scaled_dequantize(weight, scale, *, group_shape, out_dtype):
+        assert weight.dtype == torch.float8_e4m3fn
+        assert scale.dtype == torch.float32
+        assert tuple(group_shape) == (2, 2)
+        assert out_dtype is torch.bfloat16
+        return torch.full((2, 2), 3, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(
+        deepseek_uma,
+        "scaled_dequantize",
+        fake_scaled_dequantize,
+    )
+
+    model = FakeDeepseek()
+    source = FakeSource(catalog)
+    plan = model.build_weight_plan(catalog)
+
+    assert [entry.weight_name for entry in plan.fp8_indexer_wk_entries] == [
+        weight_name
+    ]
+    assert len(plan.routed_plan.auto_plan.entries) == 2
+
+    loaded = model.load_weights_from_source(source, plan)
+
+    assert source.skips == [
+        (weight_name, "weight plan marked not required"),
+        (scale_name, "weight plan marked not required"),
+    ]
+    assert source.reads == [weight_name, scale_name]
+    assert loaded == {target_name}
+    assert model.target.loaded[0][0].tolist() == [[3, 3], [3, 3]]
+    assert model.target.loaded[0][1] == 0
 
 
 def test_granite_moe_source_plan_slices_fused_expert_tensors_before_read():

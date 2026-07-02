@@ -110,10 +110,10 @@ from .interfaces import (
     SupportsPP,
 )
 from .deepseek_uma import (
+    DeepseekMoeSourcePlan,
     build_deepseek_moe_weight_plan,
     load_deepseek_moe_weights_from_source,
 )
-from .routed_moe_uma import RoutedMoeSourcePlan
 from .utils import (
     PPMissingLayer,
     get_pp_missing_layer_names,
@@ -1876,7 +1876,7 @@ class DeepseekV2ForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def build_weight_plan(self, catalog: TensorCatalog) -> RoutedMoeSourcePlan:
+    def build_weight_plan(self, catalog: TensorCatalog) -> DeepseekMoeSourcePlan:
         skip_prefixes = ["lm_head."] if self.config.tie_word_embeddings else None
 
         def skip_predicate(name: str) -> bool:
@@ -1892,7 +1892,7 @@ class DeepseekV2ForCausalLM(
     def load_weights_from_source(
         self,
         source: ODirectSafetensorsWeightSource,
-        plan: RoutedMoeSourcePlan,
+        plan: DeepseekMoeSourcePlan,
     ) -> set[str]:
         return load_deepseek_moe_weights_from_source(self, source, plan)
 
