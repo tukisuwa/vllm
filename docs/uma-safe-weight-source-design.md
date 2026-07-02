@@ -308,6 +308,8 @@ Implemented so far:
 - minimal `WeightPlanEntry`, `WeightPlan`, and `execute_weight_plan(...)`
   - supports required/skipped entries
   - supports full CPU reads and contiguous source slices
+  - can opt into `source.read_into_cpu(...)` CPU staging via
+    `WeightPlanEntry.read_into_cpu`
   - routes tensors to a target parameter's `weight_loader`
 - `build_auto_weight_plan_from_catalog(...)`
   - performs prefix/substr skips without reading payload bytes
@@ -322,6 +324,8 @@ Implemented so far:
   - resolves target parameters before payload reads
   - skips `ignore_missing` entries before payload reads
   - fails closed before payload reads for unexpected missing targets
+  - supports opt-in `read_into_cpu` entries for caller-controlled CPU staging;
+    parameter/device direct placement is still future work
 - tests for catalog lookup, source construction, full CPU reads, contiguous
   slice reads, source stats, optional model hook dispatch, name-only plan
   building, and basic plan execution

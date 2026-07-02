@@ -279,6 +279,7 @@ class WeightPlanEntry:
     required: bool = True
     source_slices: tuple[slice | int, ...] | None = None
     source_is_sharded: bool = False
+    read_into_cpu: bool = False
     shard_id: str | int | None = None
     expert_id: int | None = None
     weight_name: str | None = None
@@ -555,6 +556,25 @@ def _infer_output_dim_local_shard_size(
     return None
 
 
+def _source_tensor_shape(
+    record: TensorMeta,
+    source_slices: tuple[slice | int, ...] | None,
+) -> list[int]:
+    if source_slices is None:
+        return list(record.shape)
+    try:
+        _element_offset, _element_count, output_shape = _normalize_slice_selection(
+            record.shape,
+            source_slices,
+        )
+        return output_shape
+    except ValueError as exc:
+        strided = _normalize_single_dim_slice_selection(record.shape, source_slices)
+        if strided is None:
+            raise exc
+        return strided[4]
+
+
 def _call_weight_loader(
     weight_loader: Callable,
     param: object,
@@ -609,16 +629,28 @@ def execute_weight_plan(
 
         source_slices = entry.source_slices
         source_is_sharded = entry.source_is_sharded
+        record = source.catalog.get(entry.checkpoint_name)
         if source_slices is None:
             source_slices = _infer_output_dim_source_slice(
                 param,
-                source.catalog.get(entry.checkpoint_name),
+                record,
                 shard_id=entry.shard_id,
                 weight_loader=weight_loader,
             )
             source_is_sharded = source_slices is not None
 
-        if source_slices is None:
+        if entry.read_into_cpu:
+            tensor = torch.empty(
+                _source_tensor_shape(record, source_slices),
+                dtype=record.dtype,
+                device="cpu",
+            )
+            source.read_into_cpu(
+                entry.checkpoint_name,
+                tensor,
+                source_slices=source_slices,
+            )
+        elif source_slices is None:
             tensor = source.read_full_cpu(entry.checkpoint_name)
         else:
             tensor = source.read_slice_cpu(entry.checkpoint_name, source_slices)
