@@ -30,6 +30,9 @@ from vllm.model_executor.models import (
     cohere2_moe,
     deepseek_v2,
     exaone,
+    gemma,
+    gemma2,
+    gemma3,
     granitemoe,
     granitemoehybrid,
     granitemoeshared,
@@ -1955,6 +1958,85 @@ def test_commandr_load_weights_from_source_delegates_to_executor(monkeypatch):
     plan = WeightPlan(())
 
     loaded = commandr.CohereForCausalLM.load_weights_from_source(model, source, plan)
+
+    assert loaded == {"loaded"}
+    assert calls == [(model, source, plan)]
+
+
+@pytest.mark.parametrize(
+    "model_cls",
+    [
+        gemma.GemmaForCausalLM,
+        gemma2.Gemma2ForCausalLM,
+        gemma3.Gemma3ForCausalLM,
+    ],
+)
+def test_gemma_dense_hooks_use_mapper_and_tie_skip(tmp_path, model_cls):
+    metadata = {
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "model.layers.0.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "model.layers.0.mlp.up_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [8, 12],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 12)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+
+    class FakeGemma:
+        config = FakeConfig()
+        hf_to_vllm_mapper = model_cls.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = model_cls.build_weight_plan(FakeGemma(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["lm_head.weight"].required is False
+    q_proj = entries["model.layers.0.self_attn.q_proj.weight"]
+    assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
+    assert q_proj.shard_id == "q"
+    up_proj = entries["model.layers.0.mlp.up_proj.weight"]
+    assert up_proj.target_name == "model.layers.0.mlp.gate_up_proj.weight"
+    assert up_proj.shard_id == 1
+
+
+@pytest.mark.parametrize(
+    "model_cls, module",
+    [
+        (gemma.GemmaForCausalLM, gemma),
+        (gemma2.Gemma2ForCausalLM, gemma2),
+        (gemma3.Gemma3ForCausalLM, gemma3),
+    ],
+)
+def test_gemma_dense_load_weights_from_source_delegates_to_executor(
+    monkeypatch, model_cls, module
+):
+    calls = []
+
+    def fake_load(model, source, plan):
+        calls.append((model, source, plan))
+        return {"loaded"}
+
+    monkeypatch.setattr(module, "load_auto_uma_weights_from_source", fake_load)
+    model = object()
+    source = object()
+    plan = WeightPlan(())
+
+    loaded = model_cls.load_weights_from_source(model, source, plan)
 
     assert loaded == {"loaded"}
     assert calls == [(model, source, plan)]
