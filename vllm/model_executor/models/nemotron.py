@@ -47,6 +47,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+    WeightPlan,
+    build_auto_weight_plan_for_module,
+    execute_weight_plan,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.nemotron import NemotronConfig
 
@@ -442,3 +449,17 @@ class NemotronForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
+        return build_auto_weight_plan_for_module(
+            self,
+            catalog,
+            mapper=self.hf_to_vllm_mapper,
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: WeightPlan,
+    ) -> set[str]:
+        return execute_weight_plan(self, source, plan)

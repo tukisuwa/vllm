@@ -29,11 +29,14 @@ from vllm.model_executor.models import (
     commandr,
     cohere2_moe,
     deepseek_v2,
+    exaone,
     granitemoe,
     granitemoehybrid,
     granitemoeshared,
     llama,
     mixtral,
+    nemotron,
+    olmo,
     olmo2,
     olmoe,
     phimoe,
@@ -1711,6 +1714,126 @@ def test_olmo2_load_weights_from_source_delegates_to_executor(monkeypatch):
 
     assert loaded == {"loaded"}
     assert calls == [(model, source, plan)]
+
+
+@pytest.mark.parametrize(
+    "model_cls, module, fused_source_name, shard_id",
+    [
+        (olmo.OlmoForCausalLM, olmo, "model.layers.0.mlp.gate_proj.weight", 0),
+        (exaone.ExaoneForCausalLM, exaone, "model.layers.0.mlp.c_fc_0.weight", 0),
+    ],
+)
+def test_olmo_exaone_dense_hooks_use_mapper_and_tie_skip(
+    tmp_path, model_cls, module, fused_source_name, shard_id
+):
+    metadata = {
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "model.layers.0.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        fused_source_name: {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [8, 12],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 12)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+
+    class FakeModel:
+        config = FakeConfig()
+        hf_to_vllm_mapper = model_cls.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = model_cls.build_weight_plan(FakeModel(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["lm_head.weight"].required is False
+    q_proj = entries["model.layers.0.self_attn.q_proj.weight"]
+    assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
+    assert q_proj.shard_id == "q"
+    gate_proj = entries[fused_source_name]
+    assert gate_proj.target_name == "model.layers.0.mlp.gate_up_proj.weight"
+    assert gate_proj.shard_id == shard_id
+
+
+@pytest.mark.parametrize(
+    "model_cls, module",
+    [
+        (olmo.OlmoForCausalLM, olmo),
+        (exaone.ExaoneForCausalLM, exaone),
+        (nemotron.NemotronForCausalLM, nemotron),
+    ],
+)
+def test_more_dense_load_weights_from_source_delegates_to_executor(
+    monkeypatch, model_cls, module
+):
+    calls = []
+
+    def fake_execute(model, source, plan):
+        calls.append((model, source, plan))
+        return {"loaded"}
+
+    monkeypatch.setattr(module, "execute_weight_plan", fake_execute)
+    model = object()
+    source = object()
+    plan = WeightPlan(())
+
+    loaded = model_cls.load_weights_from_source(model, source, plan)
+
+    assert loaded == {"loaded"}
+    assert calls == [(model, source, plan)]
+
+
+def test_nemotron_build_weight_plan_uses_qkv_mapper_without_lm_head_skip(tmp_path):
+    metadata = {
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "model.layers.0.self_attn.k_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+        "model.layers.0.mlp.up_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [8, 12],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 12)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeNemotron:
+        hf_to_vllm_mapper = nemotron.NemotronForCausalLM.hf_to_vllm_mapper
+
+        def children(self):
+            return []
+
+    plan = nemotron.NemotronForCausalLM.build_weight_plan(FakeNemotron(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["lm_head.weight"].required is True
+    k_proj = entries["model.layers.0.self_attn.k_proj.weight"]
+    assert k_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
+    assert k_proj.shard_id == "k"
+    assert (
+        entries["model.layers.0.mlp.up_proj.weight"].target_name
+        == "model.layers.0.mlp.up_proj.weight"
+    )
 
 
 def test_commandr_build_weight_plan_uses_catalog_mapper_and_static_skips(tmp_path):
