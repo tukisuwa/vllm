@@ -30,10 +30,19 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
 from .granitemoe import GraniteMoeMoE
+from .granitemoe_uma import (
+    GraniteMoeSourcePlan,
+    build_granite_moe_weight_plan,
+    load_granite_moe_weights_from_source,
+)
 from .granitemoeshared import GraniteMoeSharedMLP
 from .interfaces import (
     HasInnerState,
@@ -693,6 +702,25 @@ class GraniteMoeHybridForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> GraniteMoeSourcePlan:
+        skip_prefixes = ["lm_head."] if self.config.tie_word_embeddings else None
+        return build_granite_moe_weight_plan(
+            self,
+            catalog,
+            num_experts=self.config.num_local_experts,
+            routed_prefix="routed_experts_",
+            skip_prefixes=skip_prefixes,
+            include_weight_scales=True,
+            map_a_log=True,
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: GraniteMoeSourcePlan,
+    ) -> set[str]:
+        return load_granite_moe_weights_from_source(self, source, plan)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

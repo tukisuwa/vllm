@@ -490,8 +490,8 @@ Add model-side plans only where needed:
     Python
   - skips non-local expert slices before payload read when the FusedMoE expert
     map exposes locality
-  - GraniteMoeHybrid remains separate because its Mamba/attention split and
-    additional quantized expert naming need a separate audit
+  - GraniteMoeHybrid has a separate hook for the same fused expert tensors,
+    plus `weight_scale` slices and the existing `A_log` -> `A` Mamba mapping
 
 Each model family should implement its own plan builder instead of adding
 loader-side conditionals.
@@ -508,6 +508,7 @@ Expected current behavior:
 | Mixtral routed MoE | Base path should work if normal vLLM load works | Phase 5 initial model hook |
 | DeepSeek V2/V3 routed MoE | Base path should work if normal vLLM load works | Conservative Phase 5 hook; shared-expert fusion and FP8 indexer WK fusion rejected |
 | Granite MoE / Granite MoE Shared | Base path should work if normal vLLM load works | Phase 5 initial model hook |
+| Granite MoE Hybrid | Base path should work if normal vLLM load works | Phase 5 initial hook, including fused expert `weight_scale` and `A_log` mapping |
 | Other routed MoE | Base path should work if normal vLLM load works | Not yet implemented |
 | Non-safetensors | Not supported | Not supported |
 | Remote HF path | Not supported by UMA-safe loader | Not supported |

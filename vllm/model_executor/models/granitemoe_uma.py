@@ -31,7 +31,13 @@ class GraniteMoeSourcePlan:
 
 
 class _GraniteSourceMapper:
+    def __init__(self, *, map_a_log: bool = False) -> None:
+        self.map_a_log = map_a_log
+
     def _map_name_with_shard(self, name: str) -> tuple[str, str | None] | None:
+        if self.map_a_log and "A_log" in name:
+            name = name.replace("A_log", "A")
+
         stacked = [
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
@@ -87,14 +93,29 @@ def _make_granite_expert_entries(
     *,
     num_experts: int,
     routed_prefix: str,
+    include_weight_scales: bool,
 ) -> list[RoutedMoeEntry]:
     entries: list[RoutedMoeEntry] = []
+    input_suffixes = [(".input_linear.weight", "weight")]
+    output_suffixes = [(".output_linear.weight", "weight")]
+    if include_weight_scales:
+        input_suffixes.append((".input_linear.weight_scale", "weight_scale"))
+        output_suffixes.append((".output_linear.weight_scale", "weight_scale"))
+
     for name in catalog.names():
         layer_id = _parse_layer_id(name)
         if layer_id is None:
             continue
 
-        if name.endswith(".block_sparse_moe.input_linear.weight"):
+        input_suffix = next(
+            (
+                param_suffix
+                for weight_suffix, param_suffix in input_suffixes
+                if name.endswith(f".block_sparse_moe{weight_suffix}")
+            ),
+            None,
+        )
+        if input_suffix is not None:
             meta = catalog.get(name)
             if len(meta.shape) < 2 or meta.shape[0] != num_experts:
                 raise RuntimeError(
@@ -111,7 +132,7 @@ def _make_granite_expert_entries(
             tail = _full_tail(len(meta.shape))
             routed_experts = _resolve_routed_experts_for_layer(model, layer_id)
             for expert_id in range(num_experts):
-                w13_name = f"{routed_prefix}w13_weight"
+                w13_name = f"{routed_prefix}w13_{input_suffix}"
                 w1_weight_name = f"{routed_experts.layer_name}.{w13_name}"
                 entries.append(
                     RoutedMoeEntry(
@@ -139,7 +160,15 @@ def _make_granite_expert_entries(
                         source_slices=(expert_id, slice(half, fused_dim), *tail),
                     )
                 )
-        elif name.endswith(".block_sparse_moe.output_linear.weight"):
+        output_suffix = next(
+            (
+                param_suffix
+                for weight_suffix, param_suffix in output_suffixes
+                if name.endswith(f".block_sparse_moe{weight_suffix}")
+            ),
+            None,
+        )
+        if output_suffix is not None:
             meta = catalog.get(name)
             if len(meta.shape) < 1 or meta.shape[0] != num_experts:
                 raise RuntimeError(
@@ -149,7 +178,7 @@ def _make_granite_expert_entries(
             tail = tuple(slice(None) for _ in range(len(meta.shape) - 1))
             routed_experts = _resolve_routed_experts_for_layer(model, layer_id)
             for expert_id in range(num_experts):
-                w2_name = f"{routed_prefix}w2_weight"
+                w2_name = f"{routed_prefix}w2_{output_suffix}"
                 w2_weight_name = f"{routed_experts.layer_name}.{w2_name}"
                 entries.append(
                     RoutedMoeEntry(
@@ -174,17 +203,20 @@ def build_granite_moe_weight_plan(
     num_experts: int,
     routed_prefix: str = "",
     skip_prefixes: list[str] | None = None,
+    include_weight_scales: bool = False,
+    map_a_log: bool = False,
 ) -> GraniteMoeSourcePlan:
     routed_entries = _make_granite_expert_entries(
         model,
         catalog,
         num_experts=num_experts,
         routed_prefix=routed_prefix,
+        include_weight_scales=include_weight_scales,
     )
     auto_plan = build_auto_weight_plan_for_module(
         model,
         catalog,
-        mapper=_GraniteSourceMapper(),
+        mapper=_GraniteSourceMapper(map_a_log=map_a_log),
         skip_prefixes=skip_prefixes,
         skip_substrs=[
             ".block_sparse_moe.input_linear.",

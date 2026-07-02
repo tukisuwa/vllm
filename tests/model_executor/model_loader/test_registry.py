@@ -30,6 +30,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 from vllm.model_executor.models import (
     deepseek_v2,
     granitemoe,
+    granitemoehybrid,
     granitemoeshared,
     llama,
     mixtral,
@@ -2015,6 +2016,167 @@ def test_granitemoe_shared_source_hook_uses_routed_experts_prefix(monkeypatch):
     assert model.build_weight_plan(catalog) == "plan"
     assert model.load_weights_from_source(source, "plan") == {"loaded"}
     assert calls[0][3]["routed_prefix"] == "routed_experts_"
+    assert calls[1] == ("load", model, source, "plan")
+
+
+def test_granitemoe_hybrid_source_plan_slices_weight_scales_before_read():
+    names = [
+        "model.layers.0.block_sparse_moe.input_linear.weight_scale",
+        "model.layers.0.block_sparse_moe.output_linear.weight_scale",
+        "model.layers.0.mixer.A_log",
+    ]
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", names[0], torch.float32, [2, 4], 0, 32),
+            TensorMeta("model.safetensors", names[1], torch.float32, [2, 3], 32, 24),
+            TensorMeta("model.safetensors", names[2], torch.float32, [1], 56, 4),
+        ]
+    )
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.block_sparse_moe.experts"
+        routed_experts_w13_weight_scale = object()
+        routed_experts_w2_weight_scale = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 0 else -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeBlockSparseMoe(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.experts = routed_experts
+
+    class FakeMixer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.A = nn.Parameter(torch.zeros(1))
+
+    class FakeLayer(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.block_sparse_moe = FakeBlockSparseMoe(routed_experts)
+            self.mixer = FakeMixer()
+
+    class FakeInnerModel(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.layers = nn.ModuleList([FakeLayer(routed_experts)])
+
+    class FakeConfig:
+        tie_word_embeddings = False
+        num_local_experts = 2
+
+    class FakeGraniteHybrid(granitemoehybrid.GraniteMoeHybridForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = FakeConfig()
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.full_reads = []
+            self.slice_reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.full_reads.append(name)
+            return torch.ones(self.catalog.get(name).shape)
+
+        def read_slice_cpu(self, name, source_slices):
+            self.slice_reads.append((name, source_slices))
+            return torch.ones(1)
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    model = FakeGraniteHybrid()
+    source = FakeSource(catalog)
+    plan = model.build_weight_plan(catalog)
+
+    assert [entry.local_required for entry in plan.routed_entries] == [
+        True,
+        True,
+        False,
+        False,
+        True,
+        False,
+    ]
+
+    loaded = model.load_weights_from_source(source, plan)
+
+    assert source.full_reads == [names[2]]
+    assert source.slice_reads == [
+        (names[0], (0, slice(0, 2))),
+        (names[0], (0, slice(2, 4))),
+        (names[1], (0, slice(None))),
+    ]
+    assert source.skips == [
+        (names[0], "non-local routed expert"),
+        (names[0], "non-local routed expert"),
+        (names[1], "non-local routed expert"),
+    ]
+    assert "model.layers.0.mixer.A" in loaded
+    assert (
+        "model.layers.0.block_sparse_moe.experts."
+        "routed_experts_w13_weight_scale"
+    ) in loaded
+    assert (
+        "model.layers.0.block_sparse_moe.experts."
+        "routed_experts_w2_weight_scale"
+    ) in loaded
+    assert [call["shard_id"] for call in model.routed_experts.calls] == [
+        "w1",
+        "w3",
+        "w2",
+    ]
+
+
+def test_granitemoe_hybrid_source_hook_uses_hybrid_options(monkeypatch):
+    calls = []
+
+    def fake_build(model, catalog, **kwargs):
+        calls.append(("build", model, catalog, kwargs))
+        return "plan"
+
+    def fake_load(model, source, plan):
+        calls.append(("load", model, source, plan))
+        return {"loaded"}
+
+    monkeypatch.setattr(granitemoehybrid, "build_granite_moe_weight_plan", fake_build)
+    monkeypatch.setattr(
+        granitemoehybrid,
+        "load_granite_moe_weights_from_source",
+        fake_load,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = False
+        num_local_experts = 2
+
+    class FakeGraniteHybrid(granitemoehybrid.GraniteMoeHybridForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = FakeConfig()
+
+    model = FakeGraniteHybrid()
+    catalog = object()
+    source = object()
+
+    assert model.build_weight_plan(catalog) == "plan"
+    assert model.load_weights_from_source(source, "plan") == {"loaded"}
+    assert calls[0][3]["routed_prefix"] == "routed_experts_"
+    assert calls[0][3]["include_weight_scales"] is True
+    assert calls[0][3]["map_a_log"] is True
     assert calls[1] == ("load", model, source, "plan")
 
 
