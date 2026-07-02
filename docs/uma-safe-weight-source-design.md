@@ -357,7 +357,8 @@ Implemented so far:
 
 Remaining refactor without behavioral change:
 
-- move more `_ODirectFile` orchestration into `ODirectSafetensorsWeightSource`
+- keep narrowing loader/source ownership boundaries where it removes duplicated
+  I/O orchestration
 - expand plan execution only where generic semantics are clear; model-specific
   transforms should stay in model-side plan code
 

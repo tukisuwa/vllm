@@ -1011,11 +1011,9 @@ class ODirectSafetensorsWeightSource:
                     self._stats.files_opened += 1
 
                 assert odirect_file is not None
-                tensor, time_alloc, time_read = self._loader._read_record_tensor(
+                tensor, time_alloc, time_read = self._read_record_tensor(
                     record,
                     odirect_file,
-                    self._note_loaded_bytes,
-                    gate_memory=lambda reason: self._maybe_gate(reason, force=True),
                 )
                 self._stats.tensors_read += 1
                 self._stats.tensors_read_full += 1
@@ -1309,11 +1307,9 @@ class ODirectSafetensorsWeightSource:
             self._loader._window_size,
         ) as odirect_file:
             self._stats.files_opened += 1
-            tensor, time_alloc, time_read = self._loader._read_record_tensor(
+            tensor, time_alloc, time_read = self._read_record_tensor(
                 record,
                 odirect_file,
-                self._note_loaded_bytes,
-                gate_memory=lambda reason: self._maybe_gate(reason, force=True),
             )
             self._stats.collect_file(odirect_file)
         self._stats.tensors_read += 1
@@ -1328,6 +1324,36 @@ class ODirectSafetensorsWeightSource:
         self._stats.time_read += time_read
         self._maybe_gate(f"after reading {record.name}", force=True)
         return tensor
+
+    def _read_record_tensor(
+        self,
+        record: TensorMeta,
+        odirect_file: "_ODirectFile",
+    ) -> tuple[torch.Tensor, float, float]:
+        force_allocation_gate = record.size >= self._loader._allocation_gate_min_bytes
+        if force_allocation_gate:
+            self._maybe_gate(f"before allocating {record.name}", force=True)
+        t0 = time.perf_counter()
+        tensor = torch.empty(record.shape, dtype=record.dtype, device="cpu")
+        time_alloc = time.perf_counter() - t0
+        if force_allocation_gate:
+            self._maybe_gate(f"after allocating {record.name}", force=True)
+
+        t0 = time.perf_counter()
+        odirect_file.read_record_into_tensor(
+            tensor,
+            record.offset,
+            record.size,
+            gate=(
+                self._note_loaded_bytes
+                if record.size > odirect_file.window_size
+                else None
+            ),
+        )
+        time_read = time.perf_counter() - t0
+        if record.size <= odirect_file.window_size:
+            self._note_loaded_bytes(record.size)
+        return tensor, time_alloc, time_read
 
     def _read_record_into_cpu(
         self,
@@ -1866,39 +1892,6 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         source = ODirectSafetensorsWeightSource(self, model_or_path)
         yield from source.iter_full_tensors()
-
-    def _read_record_tensor(
-        self,
-        record: TensorMeta,
-        odirect_file: _ODirectFile,
-        note_loaded_bytes: Callable[[int], None],
-        gate_memory: Callable[[str], None] | None = None,
-    ) -> tuple[torch.Tensor, float, float]:
-        gate_memory = gate_memory or self._gate_memory
-        force_allocation_gate = record.size >= self._allocation_gate_min_bytes
-        if force_allocation_gate:
-            gate_memory(f"before allocating {record.name}")
-        t0 = time.perf_counter()
-        tensor = torch.empty(record.shape, dtype=record.dtype, device="cpu")
-        time_alloc = time.perf_counter() - t0
-        if force_allocation_gate:
-            gate_memory(f"after allocating {record.name}")
-
-        t0 = time.perf_counter()
-        odirect_file.read_record_into_tensor(
-            tensor,
-            record.offset,
-            record.size,
-            gate=(
-                note_loaded_bytes
-                if record.size > odirect_file.window_size
-                else None
-            ),
-        )
-        time_read = time.perf_counter() - t0
-        if record.size <= odirect_file.window_size:
-            note_loaded_bytes(record.size)
-        return tensor, time_alloc, time_read
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_files(model_config.model)
