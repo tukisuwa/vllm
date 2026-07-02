@@ -394,19 +394,21 @@ Current limitations:
 
 ### Phase 4: Qwen MoE prototype
 
-Status: started with `Qwen3MoeForCausalLM`.
+Status: started with `Qwen3MoeForCausalLM`, `Qwen3NextForCausalLM`, and
+`Qwen3_5MoeForCausalLM`.
 
 Replace `direct_per_expert_moe` with a model-side plan for Qwen MoE.
 
 Target behavior:
 
-- model plan declares local expert reads: implemented for Qwen3 MoE routed
+- model plan declares local expert reads: implemented for Qwen-family MoE routed
   expert tensors
-- non-local experts are skipped before payload read: implemented for Qwen3 MoE
+- non-local experts are skipped before payload read: implemented for Qwen-family
+  MoE
 - gate/up/down fused placements are described by plan entries: implemented for
-  Qwen3 MoE per-expert gate/up/down naming
+  Qwen-family MoE per-expert gate/up/down naming
 - quant payload and scale suffixes are handled by the model plan, not by loader:
-  implemented for suffix-based Qwen3 MoE routed expert targets
+  implemented for suffix-based Qwen-family MoE routed expert targets
 
 This should preserve the observed Qwen35B performance while moving the
 model-specific knowledge out of the loader.
@@ -415,8 +417,8 @@ Remaining work:
 
 - remove or deprecate the older loader-side `direct_per_expert_moe`
   compatibility path once the model hook is validated on a real Qwen3 MoE load
-- extend the same model-side pattern to Qwen3.5/Qwen3Next MoE if their routed
-  expert naming is compatible
+- validate Qwen3.5/Qwen3Next MoE on real checkpoints; they share the model-side
+  helper but have not been real-loaded yet
 - add real-load verification that the model hook matches the previous
   Qwen35B performance and memory behavior
 

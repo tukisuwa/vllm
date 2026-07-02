@@ -47,6 +47,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -77,6 +81,11 @@ from .qwen3_next import (
     Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
     _is_shared_expert_fse_compatible,
+)
+from .qwen_moe_uma import (
+    QwenMoeSourcePlan,
+    build_qwen_moe_weight_plan,
+    load_qwen_moe_weights_from_source,
 )
 from .qwen3_vl import (
     Qwen3_VisionTransformer,
@@ -374,6 +383,33 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
 
         # set MoE hyperparameters
         self.set_moe_parameters()
+
+    def _uma_weight_mapper(self) -> WeightsMapper | None:
+        mapper = self.model.hf_to_vllm_mapper
+        is_fse = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled() and (
+            _is_shared_expert_fse_compatible(self.quant_config)
+        )
+        if is_fse:
+            num_routed = self.config.num_experts
+            mapper = mapper | WeightsMapper(
+                orig_to_new_substr={"mlp.shared_expert.": f"mlp.experts.{num_routed}."}
+            )
+        return mapper
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> QwenMoeSourcePlan:
+        return build_qwen_moe_weight_plan(
+            self,
+            catalog,
+            mapper=self._uma_weight_mapper(),
+            skip_prefixes=["mtp."],
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: QwenMoeSourcePlan,
+    ) -> set[str]:
+        return load_qwen_moe_weights_from_source(self, source, plan)
 
 
 ########################################################

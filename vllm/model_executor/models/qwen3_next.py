@@ -41,6 +41,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -71,6 +75,11 @@ from .utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+)
+from .qwen_moe_uma import (
+    QwenMoeSourcePlan,
+    build_qwen_moe_weight_plan,
+    load_qwen_moe_weights_from_source,
 )
 
 logger = init_logger(__name__)
@@ -796,6 +805,30 @@ class Qwen3NextForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def _uma_weight_mapper(self) -> WeightsMapper | None:
+        mapper = self.model.hf_to_vllm_mapper
+        if rocm_aiter_ops.is_fusion_moe_shared_experts_enabled():
+            num_routed = getattr(self.config, "num_experts", 0)
+            mapper = mapper | WeightsMapper(
+                orig_to_new_substr={"mlp.shared_expert.": f"mlp.experts.{num_routed}."}
+            )
+        return mapper
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> QwenMoeSourcePlan:
+        return build_qwen_moe_weight_plan(
+            self,
+            catalog,
+            mapper=self._uma_weight_mapper(),
+            skip_prefixes=["mtp."],
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: QwenMoeSourcePlan,
+    ) -> set[str]:
+        return load_qwen_moe_weights_from_source(self, source, plan)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_prefixes=["mtp."])

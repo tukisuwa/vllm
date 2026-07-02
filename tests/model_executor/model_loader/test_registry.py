@@ -27,7 +27,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     build_auto_weight_plan_from_catalog,
     execute_weight_plan,
 )
-from vllm.model_executor.models import llama, qwen3, qwen3_moe
+from vllm.model_executor.models import llama, qwen3, qwen3_5, qwen3_moe, qwen3_next
 from vllm.model_executor.models.utils import WeightsMapper
 
 
@@ -1105,6 +1105,51 @@ def test_qwen3_moe_source_plan_skips_nonlocal_experts_before_read():
     assert loaded == {"model.layers.0.mlp.experts.routed_experts.w13_weight"}
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
+
+
+@pytest.mark.parametrize(
+    "model_cls, module",
+    [
+        (qwen3_moe.Qwen3MoeForCausalLM, qwen3_moe),
+        (qwen3_next.Qwen3NextForCausalLM, qwen3_next),
+        (qwen3_5.Qwen3_5MoeForCausalLM, qwen3_5),
+    ],
+)
+def test_qwen_moe_source_hook_delegates_to_shared_helper(
+    monkeypatch, model_cls, module
+):
+    calls = []
+
+    def fake_build(model, catalog, **kwargs):
+        calls.append(("build", model, catalog, kwargs))
+        return "plan"
+
+    def fake_load(model, source, plan):
+        calls.append(("load", model, source, plan))
+        return {"loaded"}
+
+    monkeypatch.setattr(module, "build_qwen_moe_weight_plan", fake_build)
+    monkeypatch.setattr(module, "load_qwen_moe_weights_from_source", fake_load)
+
+    class FakeModel(model_cls):
+        config = type("FakeConfig", (), {"tie_word_embeddings": False})()
+
+        def __init__(self):
+            nn.Module.__init__(self)
+
+        def _uma_weight_mapper(self):
+            return None
+
+    model = FakeModel()
+    catalog = object()
+    source = object()
+
+    assert model.build_weight_plan(catalog) == "plan"
+    assert model.load_weights_from_source(source, "plan") == {"loaded"}
+    assert calls[0][0] == "build"
+    assert calls[0][1] is model
+    assert calls[0][2] is catalog
+    assert calls[1] == ("load", model, source, "plan")
 
 
 def test_uma_odirect_model_source_hook_requires_both_methods(tmp_path, monkeypatch):
