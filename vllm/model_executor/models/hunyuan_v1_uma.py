@@ -10,11 +10,13 @@ from torch import nn
 
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
+    _call_weight_loader,
+    _resolve_attr,
+)
+from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
     WeightPlan,
     WeightPlanEntry,
-    _call_weight_loader,
-    _resolve_attr,
 )
 from vllm.model_executor.models.utils import WeightsMapper
 
@@ -27,7 +29,6 @@ from .routed_moe_uma import (
     load_routed_moe_weights_from_source,
 )
 from .utils import PPMissingLayer
-
 
 HunyuanV1RoutedEntry = RoutedMoeEntry
 

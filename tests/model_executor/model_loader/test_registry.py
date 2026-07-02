@@ -12,19 +12,21 @@ from vllm.config.load import LoadConfig
 from vllm.model_executor.model_loader import get_model_loader, register_model_loader
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    UmaODirectSafetensorsModelLoader,
+    execute_weight_plan,
+)
 from vllm.model_executor.model_loader.uma_safetensors_loader import (
     UmaSafetensorsModelLoader,
 )
-from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
-    ODirectSafetensorsWeightSource,
+from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
     TensorMeta,
-    UmaODirectSafetensorsModelLoader,
     WeightPlan,
     WeightPlanEntry,
     WeightPlanReadSegment,
     build_auto_weight_plan_from_catalog,
-    execute_weight_plan,
     summarize_weight_plan,
 )
 from vllm.model_executor.models import (
@@ -4392,7 +4394,10 @@ def test_gemma4_build_weight_plan_slices_packed_moe_and_k_eq_v(tmp_path):
         entry.target_name == "model.layers.1.self_attn.qkv_proj.weight"
         for entry in k_eq_v_entries
     )
-    assert next(entry for entry in plan if entry.checkpoint_name == "lm_head.weight").required is False
+    lm_head_entry = next(
+        entry for entry in plan if entry.checkpoint_name == "lm_head.weight"
+    )
+    assert lm_head_entry.required is False
 
 
 @pytest.mark.parametrize(

@@ -10,10 +10,12 @@ from torch import nn
 
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
+    execute_weight_plan,
+)
+from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
     WeightPlan,
     build_auto_weight_plan_for_module,
-    execute_weight_plan,
 )
 
 
@@ -23,7 +25,9 @@ def build_auto_uma_weight_plan(
     *,
     mapper: object | None = None,
     name_transform: (
-        Callable[[str], tuple[str, Callable[[torch.Tensor], torch.Tensor] | None] | None]
+        Callable[
+            [str], tuple[str, Callable[[torch.Tensor], torch.Tensor] | None] | None
+        ]
         | None
     ) = None,
     skip_prefixes: list[str] | None = None,
