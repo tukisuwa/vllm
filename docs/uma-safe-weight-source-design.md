@@ -6,6 +6,15 @@ This document describes a deeper loader design for UMA-safe model loading in
 vLLM.  It is based on the current `uma_odirect_safetensors` experiments and on
 the limitations found while testing Qwen3.6-35B-A3B on DGX Spark.
 
+Follow-up roadmap:
+
+- [Weight Plan IR Roadmap for UMA-safe Loading](uma-safe-weight-plan-ir-roadmap.md)
+
+This document describes the current prototype and operational contract.  The
+roadmap document explains how this prototype should evolve into a shared
+planner/executor loading architecture rather than a growing collection of
+UMA-specific model helpers.
+
 ## Problem
 
 vLLM's current weight loading contract is mostly:
