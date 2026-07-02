@@ -30,6 +30,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 from vllm.model_executor.models import (
     afmoe,
     apertus,
+    arctic,
     arcee,
     chatglm,
     commandr,
@@ -2876,6 +2877,154 @@ def test_afmoe_build_weight_plan_uses_mapper(tmp_path):
     assert entries["model.layers.0.mlp.router.gate.weight"].target_name == (
         "model.layers.0.mlp.gate.weight"
     )
+
+
+def test_arctic_build_weight_plan_maps_child_loader_decisions(tmp_path, monkeypatch):
+    metadata = {
+        "model.layers.0.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [0, 4],
+        },
+        "model.layers.0.block_sparse_moe.mlp.w1.weight": {
+            "dtype": "F32",
+            "shape": [2, 2],
+            "data_offsets": [4, 20],
+        },
+        "model.layers.1.block_sparse_moe.experts.0.w1.weight": {
+            "dtype": "F32",
+            "shape": [4, 2],
+            "data_offsets": [20, 52],
+        },
+        "model.layers.1.block_sparse_moe.experts.0.w2.weight": {
+            "dtype": "F32",
+            "shape": [2, 4],
+            "data_offsets": [52, 84],
+        },
+        "lm_head.weight": {"dtype": "F32", "shape": [1], "data_offsets": [84, 88]},
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 88)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = True
+        num_hidden_layers = 2
+        moe_layer_frequency = 2
+        use_residual = False
+        num_local_experts = 1
+        intermediate_size = 4
+
+    class FakeArcticModel:
+        config = FakeConfig()
+
+    class FakeArctic:
+        config = FakeConfig()
+        model = FakeArcticModel()
+
+    monkeypatch.setattr(arctic, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(arctic, "get_tensor_model_parallel_world_size", lambda: 1)
+    plan = arctic.ArcticForCausalLM.build_weight_plan(FakeArctic(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    q_proj = entries["model.layers.0.self_attn.q_proj.weight"]
+    assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
+    assert q_proj.shard_id == "q"
+    mlp_w1 = entries["model.layers.0.block_sparse_moe.mlp.w1.weight"]
+    assert mlp_w1.target_name == "model.layers.0.block_sparse_moe.mlp.w13.weight"
+    assert mlp_w1.shard_id == 0
+    expert_w1 = entries["model.layers.1.block_sparse_moe.experts.0.w1.weight"]
+    assert expert_w1.target_name == "model.layers.1.block_sparse_moe.ws"
+    assert expert_w1.expert_id == 0
+    assert expert_w1.weight_name == "experts.0.w1.weight"
+    assert expert_w1.source_slices == (slice(0, 4), slice(None))
+    expert_w2 = entries["model.layers.1.block_sparse_moe.experts.0.w2.weight"]
+    assert expert_w2.target_name == "model.layers.1.block_sparse_moe.w2s"
+    assert expert_w2.source_slices == (slice(None), slice(0, 4))
+    assert entries["lm_head.weight"].required is False
+
+
+def test_arctic_load_weights_from_source_places_expert_slices():
+    class FakeSource:
+        def __init__(self):
+            self.reads = []
+
+        def read_slice_cpu(self, name, slices):
+            self.reads.append((name, slices))
+            if name.endswith("w1.weight"):
+                return torch.full((2, 3), 1.0)
+            if name.endswith("w3.weight"):
+                return torch.full((2, 3), 3.0)
+            return torch.full((3, 2), 2.0)
+
+    class FakeMoe:
+        def __init__(self):
+            self.ws = nn.Parameter(torch.zeros(1, 4, 3), requires_grad=False)
+            self.w2s = nn.Parameter(torch.zeros(1, 3, 2), requires_grad=False)
+
+    class FakeLayer:
+        def __init__(self):
+            self.block_sparse_moe = FakeMoe()
+
+    class FakeLayers:
+        def __init__(self):
+            self._layer = FakeLayer()
+
+        def __getattr__(self, name):
+            if name == "0":
+                return self._layer
+            raise AttributeError(name)
+
+    class FakeModelInner:
+        def __init__(self):
+            self.layers = FakeLayers()
+
+    class FakeModel:
+        def __init__(self):
+            self.model = FakeModelInner()
+
+    plan = WeightPlan(
+        (
+            WeightPlanEntry(
+                "model.layers.0.block_sparse_moe.experts.0.w1.weight",
+                "model.layers.0.block_sparse_moe.ws",
+                source_slices=(slice(0, 2), slice(None)),
+                expert_id=0,
+                weight_name="experts.0.w1.weight",
+            ),
+            WeightPlanEntry(
+                "model.layers.0.block_sparse_moe.experts.0.w3.weight",
+                "model.layers.0.block_sparse_moe.ws",
+                source_slices=(slice(0, 2), slice(None)),
+                expert_id=0,
+                weight_name="experts.0.w3.weight",
+            ),
+            WeightPlanEntry(
+                "model.layers.0.block_sparse_moe.experts.0.w2.weight",
+                "model.layers.0.block_sparse_moe.w2s",
+                source_slices=(slice(None), slice(0, 2)),
+                expert_id=0,
+                weight_name="experts.0.w2.weight",
+            ),
+        )
+    )
+
+    model = FakeModel()
+    source = FakeSource()
+    loaded = arctic._arctic_load_weights_from_source(model, source, plan)
+
+    moe = model.model.layers._layer.block_sparse_moe
+    assert loaded == {
+        "model.layers.0.block_sparse_moe.ws",
+        "model.layers.0.block_sparse_moe.w2s",
+    }
+    assert moe.ws[0, :2, :].tolist() == [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]]
+    assert moe.ws[0, 2:, :].tolist() == [[3.0, 3.0, 3.0], [3.0, 3.0, 3.0]]
+    assert moe.w2s[0].tolist() == [[2.0, 2.0], [2.0, 2.0], [2.0, 2.0]]
+    assert len(source.reads) == 3
 
 
 @pytest.mark.parametrize(

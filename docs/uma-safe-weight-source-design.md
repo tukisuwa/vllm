@@ -619,6 +619,13 @@ Add model-side plans only where needed:
     before delegating to the existing FusedMoE loader
   - preserves Gemma4 checkpoint name normalization, tied `lm_head` skip, and
     k_eq_v K-to-V duplication in the model-side plan
+- Arctic MoE
+  - initial hook implemented for the model's child-loader qkv, dense MLP,
+    residual MLP, and local expert mappings
+  - reads TP-local expert slices for `experts.<id>.w{1,2,3}.weight` before
+    payload placement and writes them into the existing `ws` / `w2s` slots
+  - preserves tied `lm_head` skip and pipeline-missing checks through the
+    existing target names and generic executor path
 
 Each model family should implement its own plan builder instead of adding
 loader-side conditionals.
@@ -638,6 +645,7 @@ Expected current behavior:
 | Granite MoE Hybrid | Base path should work if normal vLLM load works | Phase 5 initial hook, including fused expert `weight_scale` and `A_log` mapping |
 | GLM4 MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts; fused shared-expert special path not yet implemented |
 | Gemma4 MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for packed 3D expert tensors and k_eq_v duplication |
+| Arctic MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for local expert slices into `ws` / `w2s` |
 | Other routed MoE | Base path should work if normal vLLM load works | Not yet implemented |
 | Non-safetensors | Not supported | Not supported |
 | Remote HF path | Not supported by UMA-safe loader | Not supported |
