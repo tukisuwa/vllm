@@ -15,6 +15,7 @@ from vllm.model_executor.model_loader.weight_plan import (
     build_auto_weight_plan_from_catalog,
     resolve_weight_plan,
     resolve_weight_plan_source_hooks,
+    schedule_weight_plan_reads,
     summarize_weight_plan,
     verify_loaded_weights,
 )
@@ -174,3 +175,66 @@ def test_executor_capability_uma_odirect_defaults_fail_closed():
     assert capability.supports_full_tensor_fallback is False
     assert capability.fail_closed is True
     assert capability.max_staging_bytes == 1024
+
+
+def test_schedule_weight_plan_reads_orders_required_entries_by_file_offset():
+    catalog = TensorCatalog(
+        [
+            TensorMeta("f", "a", torch.uint8, [4], 0, 4),
+            TensorMeta("f", "b", torch.uint8, [4], 4096, 4),
+            TensorMeta("f", "c", torch.uint8, [4], 8192, 4),
+            TensorMeta("f", "pad", torch.uint8, [4096], 12288, 4096),
+        ]
+    )
+    plan = WeightPlan(
+        (
+            WeightPlanEntry("c", "c"),
+            WeightPlanEntry("a", "a"),
+            WeightPlanEntry("skip", "skip", required=False),
+            WeightPlanEntry("b", "b"),
+        )
+    )
+
+    schedule = schedule_weight_plan_reads(
+        catalog,
+        plan,
+        chunk_size=4096,
+        window_size=8192,
+        alignment=4096,
+    )
+
+    assert [entry.checkpoint_name for entry in schedule.plan.entries] == [
+        "a",
+        "b",
+        "c",
+        "skip",
+    ]
+    assert schedule.summary.required_entries == 3
+    assert schedule.summary.read_ranges == 3
+    assert schedule.summary.expected_window_loads == 2
+    assert schedule.summary.expected_window_hits == 3
+    assert schedule.summary.expected_bytes_read == 16 * 1024
+    assert schedule.summary.payload_bytes == 12
+
+
+def test_schedule_weight_plan_reads_estimates_large_direct_reads():
+    catalog = TensorCatalog(
+        [
+            TensorMeta("f", "large", torch.uint8, [12288], 0, 12288),
+        ]
+    )
+    plan = WeightPlan((WeightPlanEntry("large", "large"),))
+
+    schedule = schedule_weight_plan_reads(
+        catalog,
+        plan,
+        chunk_size=4096,
+        window_size=4096,
+        alignment=4096,
+    )
+
+    assert schedule.summary.read_ranges == 1
+    assert schedule.summary.expected_direct_reads == 3
+    assert schedule.summary.expected_window_loads == 0
+    assert schedule.summary.expected_bytes_read == 12288
+    assert schedule.summary.read_amplification == 1.0

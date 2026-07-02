@@ -632,15 +632,16 @@ today.
 Tasks:
 
 - derive a `ReadSchedulePlan` from a `PlacementPlan` plus `ExecutorCapability`;
-- sort and coalesce nearby byte ranges under a staging-bytes cap;
+- sort entries by source file offset where execution semantics allow, and
+  coalesce nearby byte ranges for expected-read accounting;
 - report expected read amplification (payload bytes read / payload bytes
   needed) in the plan summary before execution;
 - keep placement and scheduling as separate artifacts.
 
 Exit criteria:
 
-- routed-MoE loads issue coalesced group reads instead of one read per expert
-  projection;
+- routed-MoE loads no longer rely on incidental auto-plan catalog ordering to
+  avoid a second pass over expert regions;
 - read amplification is reported for every load and tracked as a regression
   metric.
 
@@ -999,3 +1000,18 @@ the previous 1 MiB workaround is no longer required for amplification control.
 Per-file counters are now folded into source stats when the handle is closed or
 switched, and `stats_snapshot()` includes the currently open handle so registry
 tests and mid-load snapshots see live counters.
+
+### 2026-07-03 Phase 2.5 stage 2: read schedule summary
+
+Stage 2 now has a first concrete `ReadSchedulePlan`: required plan entries are
+ordered by `(file, first_offset)` before the common executor reads them, skipped
+entries remain recorded but move after required reads, and a metadata-only
+O_DIRECT simulation reports expected direct reads, window loads, window hits,
+bytes read, payload bytes, and expected read amplification before execution.
+
+This makes the low-amplification property explicit instead of depending on the
+current auto-plan construction order.  The initial stage does not introduce a
+new bulk group-read API; the actual read path still uses the Stage 1 handle
+cache, while the schedule gives logs and CI a stable expected-amplification
+metric and prepares the IR for later range-group execution if it becomes worth
+the extra staging complexity.

@@ -43,6 +43,14 @@ if hasattr(torch, "float8_e5m2"):
     _DTYPE_NBYTES[torch.float8_e5m2] = 1
 
 
+def _round_down(value: int, align: int) -> int:
+    return value // align * align
+
+
+def _round_up(value: int, align: int) -> int:
+    return (value + align - 1) // align * align
+
+
 def _tensor_nbytes(shape: list[int], dtype: torch.dtype) -> int:
     elements = 1
     for dim in shape:
@@ -250,6 +258,30 @@ class WeightPlanSummary:
             + self.sliced_payload_bytes
             + self.read_into_payload_bytes
         )
+
+
+@dataclass(frozen=True)
+class ReadScheduleSummary:
+    entries: int
+    required_entries: int
+    read_ranges: int
+    expected_direct_reads: int
+    expected_window_loads: int
+    expected_window_hits: int
+    expected_bytes_read: int
+    payload_bytes: int
+
+    @property
+    def read_amplification(self) -> float:
+        if self.payload_bytes == 0:
+            return 0.0
+        return self.expected_bytes_read / self.payload_bytes
+
+
+@dataclass(frozen=True)
+class ReadSchedulePlan:
+    plan: WeightPlan
+    summary: ReadScheduleSummary
 
 
 class TensorCatalog:
@@ -739,6 +771,44 @@ def _weight_plan_entry_payload_size(
     return element_count * _DTYPE_NBYTES[record.dtype]
 
 
+def _weight_plan_entry_read_ranges(
+    record: TensorMeta,
+    source_slices: tuple[slice | int, ...] | None,
+) -> tuple[tuple[int, int], ...]:
+    if source_slices is None:
+        return ((record.offset, record.size),)
+    try:
+        element_offset, element_count, _output_shape = _normalize_slice_selection(
+            record.shape,
+            source_slices,
+        )
+    except ValueError as exc:
+        strided = _normalize_single_dim_slice_selection(record.shape, source_slices)
+        if strided is None:
+            raise exc
+        outer_count, source_dim, start, length, output_shape = strided
+        partial_dim = next(
+            idx
+            for idx, (src, out) in enumerate(zip(record.shape, output_shape))
+            if src != out
+        )
+        inner_count = math.prod(record.shape[partial_dim + 1 :])
+        segment_elements = length * inner_count
+        element_size = _DTYPE_NBYTES[record.dtype]
+        segment_bytes = segment_elements * element_size
+        return tuple(
+            (
+                record.offset
+                + (outer_idx * source_dim * inner_count + start * inner_count)
+                * element_size,
+                segment_bytes,
+            )
+            for outer_idx in range(outer_count)
+        )
+    element_size = _DTYPE_NBYTES[record.dtype]
+    return ((record.offset + element_offset * element_size, element_count * element_size),)
+
+
 def _weight_plan_entry_target_shape(
     record: TensorMeta,
     source_slices: tuple[slice | int, ...] | None,
@@ -835,6 +905,167 @@ def summarize_weight_plan(
         read_into_payload_bytes=read_into_payload_bytes,
         skipped_payload_bytes=skipped_payload_bytes,
         missing_skipped_payload_bytes=missing_skipped_payload_bytes,
+    )
+
+
+def _weight_plan_read_ranges(
+    catalog: TensorCatalog,
+    entry: WeightPlanEntry,
+) -> tuple[tuple[str, int, int], ...]:
+    if not entry.required or not catalog.has(entry.checkpoint_name):
+        return ()
+    record = catalog.get(entry.checkpoint_name)
+    if entry.read_segments is not None:
+        ranges: list[tuple[str, int, int]] = []
+        for segment in entry.read_segments:
+            ranges.extend(
+                (record.file_path, offset, size)
+                for offset, size in _weight_plan_entry_read_ranges(
+                    record,
+                    segment.source_slices,
+                )
+            )
+        return tuple(ranges)
+    return tuple(
+        (record.file_path, offset, size)
+        for offset, size in _weight_plan_entry_read_ranges(
+            record,
+            entry.source_slices,
+        )
+    )
+
+
+def _first_read_key(
+    catalog: TensorCatalog,
+    indexed_entry: tuple[int, WeightPlanEntry],
+) -> tuple[str, int, int]:
+    index, entry = indexed_entry
+    ranges = _weight_plan_read_ranges(catalog, entry)
+    if not ranges:
+        return ("", 0, index)
+    path, offset, _size = min(ranges, key=lambda item: (item[0], item[1]))
+    return (path, offset, index)
+
+
+def _file_sizes_from_catalog(catalog: TensorCatalog) -> dict[str, int]:
+    sizes: dict[str, int] = {}
+    for record in catalog.records():
+        sizes[record.file_path] = max(
+            sizes.get(record.file_path, 0),
+            record.offset + record.size,
+        )
+    return sizes
+
+
+def _simulate_odirect_reads(
+    ranges: tuple[tuple[str, int, int], ...],
+    *,
+    file_sizes: dict[str, int],
+    chunk_size: int,
+    window_size: int,
+    alignment: int,
+) -> tuple[int, int, int, int]:
+    chunk_size = max(_round_up(chunk_size, alignment), alignment)
+    window_size = max(_round_up(window_size, alignment), chunk_size)
+    current_path: str | None = None
+    window_start = 0
+    window_valid = 0
+    direct_reads = 0
+    window_loads = 0
+    window_hits = 0
+    bytes_read = 0
+
+    for path, offset, size in ranges:
+        if size == 0:
+            continue
+        if path != current_path:
+            current_path = path
+            window_start = 0
+            window_valid = 0
+        file_size = file_sizes[path]
+        if size <= window_size:
+            window_end = window_start + window_valid
+            if offset < window_start or offset + size > window_end:
+                read_start = _round_down(offset, alignment)
+                required_size = _round_up((offset - read_start) + size, alignment)
+                read_size = max(window_size, required_size)
+                got = min(read_size, max(file_size - read_start, 0))
+                direct_reads += 1
+                window_loads += 1
+                bytes_read += got
+                window_start = read_start
+                window_valid = got
+            window_hits += 1
+            continue
+
+        copied = 0
+        while copied < size:
+            wanted_offset = offset + copied
+            wanted_size = min(size - copied, chunk_size)
+            read_start = _round_down(wanted_offset, alignment)
+            read_end = _round_up(wanted_offset + wanted_size, alignment)
+            read_size = read_end - read_start
+            got = min(read_size, max(file_size - read_start, 0))
+            direct_reads += 1
+            bytes_read += got
+            available_start = read_start
+            available_end = read_start + got
+            copy_start = max(wanted_offset, available_start)
+            copy_end = min(wanted_offset + wanted_size, available_end)
+            if copy_end <= copy_start:
+                break
+            copied = (copy_start - offset) + (copy_end - copy_start)
+
+    return direct_reads, window_loads, window_hits, bytes_read
+
+
+def schedule_weight_plan_reads(
+    catalog: TensorCatalog,
+    plan: WeightPlan,
+    *,
+    chunk_size: int,
+    window_size: int,
+    alignment: int,
+) -> ReadSchedulePlan:
+    """Order required plan entries by file offset and estimate O_DIRECT reads."""
+
+    required: list[tuple[int, WeightPlanEntry]] = []
+    skipped: list[WeightPlanEntry] = []
+    for index, entry in enumerate(plan.entries):
+        if entry.required:
+            required.append((index, entry))
+        else:
+            skipped.append(entry)
+
+    scheduled_required = [
+        entry for _index, entry in sorted(required, key=lambda item: _first_read_key(catalog, item))
+    ]
+    scheduled_plan = WeightPlan(tuple([*scheduled_required, *skipped]))
+    ranges: list[tuple[str, int, int]] = []
+    payload_bytes = 0
+    for entry in scheduled_required:
+        entry_ranges = _weight_plan_read_ranges(catalog, entry)
+        ranges.extend(entry_ranges)
+        payload_bytes += sum(size for _path, _offset, size in entry_ranges)
+    direct_reads, window_loads, window_hits, bytes_read = _simulate_odirect_reads(
+        tuple(ranges),
+        file_sizes=_file_sizes_from_catalog(catalog),
+        chunk_size=chunk_size,
+        window_size=window_size,
+        alignment=alignment,
+    )
+    return ReadSchedulePlan(
+        plan=scheduled_plan,
+        summary=ReadScheduleSummary(
+            entries=len(scheduled_plan.entries),
+            required_entries=len(scheduled_required),
+            read_ranges=len(ranges),
+            expected_direct_reads=direct_reads,
+            expected_window_loads=window_loads,
+            expected_window_hits=window_hits,
+            expected_bytes_read=bytes_read,
+            payload_bytes=payload_bytes,
+        ),
     )
 
 

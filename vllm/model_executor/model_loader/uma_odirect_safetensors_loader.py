@@ -39,6 +39,7 @@ from vllm.model_executor.model_loader.weight_plan import (
     build_auto_weight_plan_from_catalog,
     resolve_weight_plan,
     resolve_weight_plan_source_hooks,
+    schedule_weight_plan_reads,
     summarize_weight_plan,
     verify_loaded_weights,
 )
@@ -65,6 +66,7 @@ __all__ = [
     "execute_weight_plan",
     "resolve_weight_plan",
     "resolve_weight_plan_source_hooks",
+    "schedule_weight_plan_reads",
     "summarize_weight_plan",
     "verify_loaded_weights",
 ]
@@ -245,6 +247,27 @@ def execute_weight_plan(
 
     plan = resolve_weight_plan(model, source.catalog, plan)
     summary = summarize_weight_plan(source.catalog, plan)
+    loader = getattr(source, "_loader", None)
+    schedule = schedule_weight_plan_reads(
+        source.catalog,
+        plan,
+        chunk_size=getattr(
+            loader,
+            "_chunk_size",
+            UmaODirectSafetensorsModelLoader.DEFAULT_CHUNK_SIZE,
+        ),
+        window_size=getattr(
+            loader,
+            "_window_size",
+            UmaODirectSafetensorsModelLoader.DEFAULT_WINDOW_SIZE,
+        ),
+        alignment=getattr(
+            loader,
+            "_alignment",
+            UmaODirectSafetensorsModelLoader.DEFAULT_ALIGNMENT,
+        ),
+    )
+    schedule_summary = schedule.summary
     logger.info(
         "uma_odirect_safetensors weight plan: entries=%d required=%d skipped=%d "
         "missing_skipped=%d full_reads=%d sliced_reads=%d read_into=%d "
@@ -263,9 +286,24 @@ def execute_weight_plan(
         _format_gib(summary.skipped_payload_bytes),
         _format_gib(summary.total_read_payload_bytes),
     )
+    logger.info(
+        "uma_odirect_safetensors read schedule: entries=%d required=%d "
+        "read_ranges=%d expected_direct_reads=%d expected_window_loads=%d "
+        "expected_window_hits=%d expected_bytes_read=%s payload=%s "
+        "expected_read_amplification=%.2fx",
+        schedule_summary.entries,
+        schedule_summary.required_entries,
+        schedule_summary.read_ranges,
+        schedule_summary.expected_direct_reads,
+        schedule_summary.expected_window_loads,
+        schedule_summary.expected_window_hits,
+        _format_gib(schedule_summary.expected_bytes_read),
+        _format_gib(schedule_summary.payload_bytes),
+        schedule_summary.read_amplification,
+    )
 
     loaded: set[str] = set()
-    for entry in plan:
+    for entry in schedule.plan:
         if not entry.required:
             source.skip(
                 entry.checkpoint_name,
