@@ -407,15 +407,20 @@ class AutoWeightsLoader:
         iterator = (m.quant_config for m in modules if hasattr(m, "quant_config"))
         if quant_config := next(iterator, None):
             # Get mappings and ignore prefixes for KV cache quantization scales
-            mapper = mapper or WeightsMapper()
-            mapper |= quant_config.get_cache_scale_mapper()
+            cache_scale_mapper = quant_config.get_cache_scale_mapper()
+            if cache_scale_mapper is not None:
+                mapper = (
+                    mapper | cache_scale_mapper
+                    if mapper is not None
+                    else cache_scale_mapper
+                )
             ignore_unexpected_suffixes = quant_config._ignore_unexpected_suffixes
             self.ignore_unexpected_suffixes.extend(ignore_unexpected_suffixes)
         if mapper is not None:
             weights = mapper.apply(weights)
         # filter out weights with first-prefix/substr to skip in name
         weights = (
-            (name, weight) for name, weight in weights if not self._can_skip(name)
+            name_weight for name_weight in weights if not self._can_skip(name_weight[0])
         )
 
         autoloaded_weights = set(self._load_module("", self.module, weights))

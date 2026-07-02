@@ -155,6 +155,10 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-host/
+.cache-host/
+.cache-host-smoke/
+.host-sysroot/
 env/
 venv/
 ENV/
