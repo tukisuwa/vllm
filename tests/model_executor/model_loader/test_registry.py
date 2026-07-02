@@ -24,6 +24,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     WeightPlanEntry,
     build_auto_weight_plan_from_catalog,
     execute_weight_plan,
+    summarize_weight_plan,
 )
 from vllm.model_executor.models import (
     apertus,
@@ -893,6 +894,58 @@ def test_uma_odirect_load_weights_uses_model_source_hook(tmp_path, monkeypatch):
     assert model.loaded.tolist() == [5.0]
 
 
+def test_uma_odirect_weight_plan_summary_counts_payload_bytes():
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", "full", torch.float32, [2], 0, 8),
+            TensorMeta("model.safetensors", "rows", torch.float32, [4, 2], 8, 32),
+            TensorMeta("model.safetensors", "cols", torch.float32, [2, 4], 40, 32),
+            TensorMeta("model.safetensors", "skip", torch.float32, [3], 72, 12),
+        ]
+    )
+    plan = WeightPlan(
+        (
+            WeightPlanEntry("full", "full_param"),
+            WeightPlanEntry(
+                "rows",
+                "rows_param",
+                source_slices=(slice(1, 3), slice(None)),
+            ),
+            WeightPlanEntry(
+                "cols",
+                "cols_param",
+                source_slices=(slice(0, 1), slice(None)),
+                read_into_cpu=True,
+            ),
+            WeightPlanEntry("skip", "missing", required=False),
+            WeightPlanEntry("absent_skip", "missing", required=False),
+        )
+    )
+
+    summary = summarize_weight_plan(catalog, plan)
+
+    assert summary.entries == 5
+    assert summary.required_entries == 3
+    assert summary.skipped_entries == 2
+    assert summary.missing_skipped_entries == 1
+    assert summary.full_read_entries == 1
+    assert summary.sliced_read_entries == 1
+    assert summary.read_into_entries == 1
+    assert summary.full_payload_bytes == 8
+    assert summary.sliced_payload_bytes == 16
+    assert summary.read_into_payload_bytes == 16
+    assert summary.skipped_payload_bytes == 12
+    assert summary.total_read_payload_bytes == 40
+
+
+def test_uma_odirect_weight_plan_summary_rejects_missing_required():
+    catalog = TensorCatalog([])
+    plan = WeightPlan((WeightPlanEntry("missing", "param"),))
+
+    with pytest.raises(RuntimeError, match="requires missing tensor"):
+        summarize_weight_plan(catalog, plan)
+
+
 def test_uma_odirect_execute_weight_plan_reads_full_and_slice(tmp_path, monkeypatch):
     metadata = {
         "full": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
@@ -1548,6 +1601,9 @@ def test_uma_odirect_execute_weight_plan_skips_absent_not_required(
 def test_uma_odirect_execute_weight_plan_ignores_missing_target_before_read():
     class FakeSource:
         def __init__(self):
+            self.catalog = TensorCatalog(
+                [TensorMeta("model.safetensors", "bias", torch.float32, [1], 0, 4)]
+            )
             self.skipped = []
             self.reads = 0
 
@@ -1577,6 +1633,9 @@ def test_uma_odirect_execute_weight_plan_ignores_missing_target_before_read():
 def test_uma_odirect_execute_weight_plan_missing_target_fails_before_read():
     class FakeSource:
         def __init__(self):
+            self.catalog = TensorCatalog(
+                [TensorMeta("model.safetensors", "weight", torch.float32, [1], 0, 4)]
+            )
             self.reads = 0
 
         def read_full_cpu(self, _name):
@@ -3965,7 +4024,8 @@ def test_qwen_moe_source_plan_skips_pp_missing_layer_before_read():
             return []
 
     class FakeSource:
-        def __init__(self):
+        def __init__(self, catalog):
+            self.catalog = catalog
             self.reads = []
             self.skips = []
 
@@ -3977,7 +4037,7 @@ def test_qwen_moe_source_plan_skips_pp_missing_layer_before_read():
             self.skips.append((name, reason))
 
     model = FakeModel()
-    source = FakeSource()
+    source = FakeSource(catalog)
     plan = qwen3_5.build_qwen_moe_weight_plan(model, catalog)
 
     assert [entry.local_required for entry in plan.routed_entries] == [False]

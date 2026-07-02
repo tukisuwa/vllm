@@ -229,6 +229,8 @@ Responsibilities:
 - route to `param.weight_loader`
 - preserve existing vLLM post-load processing
 - collect timing and byte counters
+- summarize full/sliced/read-into/skipped payload bytes from metadata before
+  payload read
 
 Conceptual execution:
 
@@ -621,6 +623,7 @@ Runtime metrics to record:
 - full-tensor fallback bytes
 - slice/direct-read bytes
 - full vs sliced tensor read counts and payload bytes from source stats
+- metadata-only WeightPlan summary bytes before execution
 
 ## Design rules
 

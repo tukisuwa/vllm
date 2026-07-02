@@ -325,12 +325,120 @@ class WeightPlan:
         return iter(self.entries)
 
 
+@dataclass(frozen=True)
+class WeightPlanSummary:
+    entries: int
+    required_entries: int
+    skipped_entries: int
+    missing_skipped_entries: int
+    full_read_entries: int
+    sliced_read_entries: int
+    read_into_entries: int
+    full_payload_bytes: int
+    sliced_payload_bytes: int
+    read_into_payload_bytes: int
+    skipped_payload_bytes: int
+    missing_skipped_payload_bytes: int
+
+    @property
+    def total_read_payload_bytes(self) -> int:
+        return (
+            self.full_payload_bytes
+            + self.sliced_payload_bytes
+            + self.read_into_payload_bytes
+        )
+
+
 _ROTARY_EMBEDS_UNUSED_WEIGHTS = (
     "rotary_pos_emb.inv_freq",
     "rotary_emb.inv_freq",
     "rotary_emb.cos_cached",
     "rotary_emb.sin_cached",
 )
+
+
+def _weight_plan_entry_payload_size(
+    record: TensorMeta,
+    source_slices: tuple[slice | int, ...] | None,
+) -> int:
+    if source_slices is None:
+        return record.size
+    try:
+        _element_offset, element_count, _output_shape = _normalize_slice_selection(
+            record.shape,
+            source_slices,
+        )
+    except ValueError as exc:
+        strided = _normalize_single_dim_slice_selection(record.shape, source_slices)
+        if strided is None:
+            raise exc
+        element_count = strided[2]
+    return element_count * _DTYPE_NBYTES[record.dtype]
+
+
+def summarize_weight_plan(catalog: "TensorCatalog", plan: WeightPlan) -> WeightPlanSummary:
+    """Summarize planned payload reads from metadata only.
+
+    The result is intentionally conservative: it only accounts for explicit
+    source slices declared by the model plan.  Additional executor-inferred TP
+    slices can reduce real reads at execution time, but this summary remains a
+    fail-closed pre-read estimate with no parameter inspection or payload I/O.
+    """
+
+    required_entries = 0
+    skipped_entries = 0
+    missing_skipped_entries = 0
+    full_read_entries = 0
+    sliced_read_entries = 0
+    read_into_entries = 0
+    full_payload_bytes = 0
+    sliced_payload_bytes = 0
+    read_into_payload_bytes = 0
+    skipped_payload_bytes = 0
+    missing_skipped_payload_bytes = 0
+
+    for entry in plan:
+        has_record = catalog.has(entry.checkpoint_name)
+        if not entry.required:
+            skipped_entries += 1
+            if has_record:
+                skipped_payload_bytes += catalog.get(entry.checkpoint_name).size
+            else:
+                missing_skipped_entries += 1
+            continue
+
+        if not has_record:
+            raise RuntimeError(
+                f"Weight plan requires missing tensor {entry.checkpoint_name!r}"
+            )
+
+        required_entries += 1
+        record = catalog.get(entry.checkpoint_name)
+        payload_size = _weight_plan_entry_payload_size(record, entry.source_slices)
+        if entry.read_into_cpu:
+            read_into_entries += 1
+            read_into_payload_bytes += payload_size
+        elif entry.source_slices is not None:
+            sliced_read_entries += 1
+            sliced_payload_bytes += payload_size
+        else:
+            full_read_entries += 1
+            full_payload_bytes += payload_size
+
+    return WeightPlanSummary(
+        entries=len(plan.entries),
+        required_entries=required_entries,
+        skipped_entries=skipped_entries,
+        missing_skipped_entries=missing_skipped_entries,
+        full_read_entries=full_read_entries,
+        sliced_read_entries=sliced_read_entries,
+        read_into_entries=read_into_entries,
+        full_payload_bytes=full_payload_bytes,
+        sliced_payload_bytes=sliced_payload_bytes,
+        read_into_payload_bytes=read_into_payload_bytes,
+        skipped_payload_bytes=skipped_payload_bytes,
+        missing_skipped_payload_bytes=missing_skipped_payload_bytes,
+    )
 
 
 def build_auto_weight_plan_from_catalog(
@@ -676,6 +784,26 @@ def execute_weight_plan(
     plan: WeightPlan,
 ) -> set[str]:
     """Execute a simple model-side WeightPlan with UMA-safe source reads."""
+
+    summary = summarize_weight_plan(source.catalog, plan)
+    logger.info(
+        "uma_odirect_safetensors weight plan: entries=%d required=%d skipped=%d "
+        "missing_skipped=%d full_reads=%d sliced_reads=%d read_into=%d "
+        "full_payload=%s sliced_payload=%s read_into_payload=%s "
+        "skipped_payload=%s total_read_payload=%s",
+        summary.entries,
+        summary.required_entries,
+        summary.skipped_entries,
+        summary.missing_skipped_entries,
+        summary.full_read_entries,
+        summary.sliced_read_entries,
+        summary.read_into_entries,
+        _format_gib(summary.full_payload_bytes),
+        _format_gib(summary.sliced_payload_bytes),
+        _format_gib(summary.read_into_payload_bytes),
+        _format_gib(summary.skipped_payload_bytes),
+        _format_gib(summary.total_read_payload_bytes),
+    )
 
     loaded: set[str] = set()
     for entry in plan:
