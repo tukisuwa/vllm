@@ -460,8 +460,7 @@ Status: started with `Qwen2ForCausalLM`, `Qwen3ForCausalLM`,
 `FalconH1ForCausalLM`, `Zamba2ForCausalLM`, `OuroForCausalLM`,
 `MambaForCausalLM`, `Mamba2ForCausalLM`, `HrmTextForCausalLM`,
 `ChatGLMForCausalLM`, `DeciLMForCausalLM`,
-`Mistral3ForConditionalGeneration`, `Glm4ForCausalLM`, and
-`AfmoeForCausalLM`.
+`Mistral3ForConditionalGeneration`, and `Glm4ForCausalLM`.
 
 Start with Llama/Qwen dense, not MoE.
 
@@ -499,9 +498,6 @@ Target behavior:
   prefix mapper and quant suffix mapper before payload read
 - GLM4 uses the shared dense hook while preserving tied `lm_head` skip and
   speculative next-token layer skips before payload read
-- AFMoE uses the shared hook for its AutoWeightsLoader mapper, including qkv,
-  dense/shared-expert gate-up mappings and router suffix mapping; routed expert
-  locality remains future work
 - plan skips rotary/cache tensors: implemented through shared auto-plan helper
 - dense model hooks use the shared `auto_uma` model-side helper instead of
   calling generic executor internals directly
@@ -682,6 +678,12 @@ Add model-side plans only where needed:
   - skips non-local routed experts before payload read
   - preserves `model.*` checkpoint name replay through the inner qkv mapper and
     appended MTP-layer skip before payload read
+- AFMoE
+  - initial hook implemented for standard
+    `mlp.experts.<expert>.{gate,up,down}_proj.*` tensors
+  - skips non-local routed experts before payload read
+  - preserves qkv, dense/shared-expert gate-up mappings, and router suffix
+    mapping through the model-side auto plan
 
 Each model family should implement its own plan builder instead of adding
 loader-side conditionals.
@@ -692,7 +694,7 @@ Expected current behavior:
 
 | Model type | Base `uma_odirect_safetensors` | Direct plan path |
 | --- | --- | --- |
-| Dense safetensors | Should work if normal vLLM load works | Phase 3 hooks for Qwen2/Qwen3/Llama/Gemma/Gemma2/Gemma3/InternLM2/Phi/Starcoder2/Falcon/FalconH1/Mistral/GPTBigCode/OPT/BLOOM/GPT-J/MPT/Orion/Step1/Apertus/StableLM/Solar/GPT-NeoX/Persimmon/Granite/Jais2/EXAONE4/Plamo3/Arcee/SeedOss/HyperCLOVAX/LFM2/MiMo/OLMo/OLMo2/Nemotron/EXAONE/Cohere/TeleChat2/Zamba2/Ouro/Mamba/Mamba2/HrmText/ChatGLM/DeciLM/Mistral3/GLM4/AFMoE-style AutoWeightsLoader models |
+| Dense safetensors | Should work if normal vLLM load works | Phase 3 hooks for Qwen2/Qwen3/Llama/Gemma/Gemma2/Gemma3/InternLM2/Phi/Starcoder2/Falcon/FalconH1/Mistral/GPTBigCode/OPT/BLOOM/GPT-J/MPT/Orion/Step1/Apertus/StableLM/Solar/GPT-NeoX/Persimmon/Granite/Jais2/EXAONE4/Plamo3/Arcee/SeedOss/HyperCLOVAX/LFM2/MiMo/OLMo/OLMo2/Nemotron/EXAONE/Cohere/TeleChat2/Zamba2/Ouro/Mamba/Mamba2/HrmText/ChatGLM/DeciLM/Mistral3/GLM4 AutoWeightsLoader models |
 | Sharded dense safetensors | Should work if no duplicate names | Phase 3 |
 | Qwen2/Qwen3 / OLMoE / Cohere2 routed MoE | Base path should work if normal vLLM load works | Phase 4/5 model hook for `mlp.experts` gate/up/down tensors; loader-side direct path removed |
 | Mixtral / PhiMoE routed MoE | Base path should work if normal vLLM load works | Phase 5 initial model hook for `block_sparse_moe.experts` w1/w2/w3 tensors |
@@ -712,6 +714,7 @@ Expected current behavior:
 | Kimi Linear MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for `block_sparse_moe` routed experts, spec-layer skip, and shared-expert stacking |
 | InternS1Pro MoE | Base path should work if normal vLLM load works | Phase 5 initial hook via Qwen-family helper with wrapper prefix mapping |
 | MiniMaxM2 MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for `mlp.experts` w1/w2/w3 tensors, non-local expert skip, inner qkv mapper replay, and MTP skip |
+| AFMoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts while preserving qkv, shared-expert, and router mappings |
 | Other routed MoE | Base path should work if normal vLLM load works | Not yet implemented |
 | Non-safetensors | Not supported | Not supported |
 | Remote HF path | Not supported by UMA-safe loader | Not supported |

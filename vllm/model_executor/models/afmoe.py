@@ -37,7 +37,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
     TensorCatalog,
-    WeightPlan,
 )
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
@@ -47,9 +46,10 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
 )
 from vllm.model_executor.models.llama import LlamaMLP as AfmoeMLP
-from vllm.model_executor.models.auto_uma import (
-    build_auto_uma_weight_plan,
-    load_auto_uma_weights_from_source,
+from vllm.model_executor.models.afmoe_uma import (
+    AfmoeMoeSourcePlan,
+    build_afmoe_moe_weight_plan,
+    load_afmoe_moe_weights_from_source,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -605,8 +605,8 @@ class AfmoeForCausalLM(
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
-    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
-        return build_auto_uma_weight_plan(
+    def build_weight_plan(self, catalog: TensorCatalog) -> AfmoeMoeSourcePlan:
+        return build_afmoe_moe_weight_plan(
             self,
             catalog,
             mapper=self.hf_to_vllm_mapper,
@@ -615,6 +615,6 @@ class AfmoeForCausalLM(
     def load_weights_from_source(
         self,
         source: ODirectSafetensorsWeightSource,
-        plan: WeightPlan,
+        plan: AfmoeMoeSourcePlan,
     ) -> set[str]:
-        return load_auto_uma_weights_from_source(self, source, plan)
+        return load_afmoe_moe_weights_from_source(self, source, plan)

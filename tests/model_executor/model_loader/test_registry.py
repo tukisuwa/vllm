@@ -2999,7 +2999,7 @@ def test_afmoe_build_weight_plan_uses_mapper(tmp_path):
             return []
 
     plan = afmoe.AfmoeForCausalLM.build_weight_plan(FakeAfmoe(), catalog)
-    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+    entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
 
     q_proj = entries["model.layers.0.self_attn.q_proj.weight"]
     assert q_proj.target_name == "model.layers.0.self_attn.qkv_proj.weight"
@@ -3015,6 +3015,147 @@ def test_afmoe_build_weight_plan_uses_mapper(tmp_path):
     assert entries["model.layers.0.mlp.router.gate.weight"].target_name == (
         "model.layers.0.mlp.gate.weight"
     )
+
+
+def test_afmoe_moe_source_plan_skips_nonlocal_experts_before_read():
+    names = [
+        "model.layers.1.mlp.experts.0.gate_proj.weight",
+        "model.layers.1.mlp.experts.1.gate_proj.weight",
+        "model.layers.0.mlp.gate_proj.weight",
+        "model.layers.1.self_attn.q_proj.weight",
+    ]
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", names[0], torch.float32, [1], 0, 4),
+            TensorMeta("model.safetensors", names[1], torch.float32, [1], 4, 4),
+            TensorMeta("model.safetensors", names[2], torch.float32, [1, 1], 8, 4),
+            TensorMeta("model.safetensors", names[3], torch.float32, [1, 1], 12, 4),
+        ]
+    )
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.1.mlp.experts"
+        w13_weight = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 0 else -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeSelfAttn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv_proj = nn.Linear(1, 3, bias=False)
+            nn.init.zeros_(self.qkv_proj.weight)
+            self.qkv_calls = []
+
+            def weight_loader(param, loaded_weight, shard_id):
+                self.qkv_calls.append(
+                    {
+                        "param": param,
+                        "loaded_weight": loaded_weight,
+                        "shard_id": shard_id,
+                    }
+                )
+                if shard_id == "q":
+                    param.data.narrow(0, 0, 1).copy_(loaded_weight)
+
+            self.qkv_proj.weight.weight_loader = weight_loader
+
+    class FakeDenseMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = nn.Linear(1, 2, bias=False)
+            nn.init.zeros_(self.gate_up_proj.weight)
+            self.gate_up_calls = []
+
+            def weight_loader(param, loaded_weight, shard_id):
+                self.gate_up_calls.append(
+                    {
+                        "param": param,
+                        "loaded_weight": loaded_weight,
+                        "shard_id": shard_id,
+                    }
+                )
+
+            self.gate_up_proj.weight.weight_loader = weight_loader
+
+    class FakeMoeMLP:
+        def __init__(self, routed_experts):
+            self.experts = routed_experts
+
+    class FakeLayer(nn.Module):
+        def __init__(self, *, routed_experts=None, moe_enabled=False):
+            super().__init__()
+            self.moe_enabled = moe_enabled
+            self.self_attn = FakeSelfAttn()
+            self.mlp = (
+                FakeMoeMLP(routed_experts) if moe_enabled else FakeDenseMLP()
+            )
+
+    class FakeInnerModel(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.layers = nn.ModuleList([
+                FakeLayer(),
+                FakeLayer(routed_experts=routed_experts, moe_enabled=True),
+            ])
+
+    class FakeAfmoe(afmoe.AfmoeForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            if name in (names[2], names[3]):
+                return torch.tensor([[5.0]])
+            return torch.ones(1)
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    model = FakeAfmoe()
+    source = FakeSource(catalog)
+
+    plan = model.build_weight_plan(catalog)
+    auto_entries = {
+        entry.checkpoint_name: entry for entry in plan.auto_plan.entries
+    }
+    assert auto_entries[names[2]].target_name == (
+        "model.layers.0.mlp.gate_up_proj.weight"
+    )
+    assert auto_entries[names[2]].shard_id == 0
+    assert auto_entries[names[3]].target_name == (
+        "model.layers.1.self_attn.qkv_proj.weight"
+    )
+    assert auto_entries[names[3]].shard_id == "q"
+    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+
+    loaded = model.load_weights_from_source(source, plan)
+
+    assert source.reads == [names[2], names[3], names[0]]
+    assert source.skips == [(names[1], "non-local routed expert")]
+    assert "model.layers.0.mlp.gate_up_proj.weight" in loaded
+    assert "model.layers.1.self_attn.qkv_proj.weight" in loaded
+    assert "model.layers.1.mlp.experts.w13_weight" in loaded
+    assert model.model.layers[1].self_attn.qkv_calls[0]["shard_id"] == "q"
+    assert model.model.layers[0].mlp.gate_up_calls[0]["shard_id"] == 0
+    assert model.routed_experts.calls[0]["expert_id"] == 0
+    assert model.routed_experts.calls[0]["shard_id"] == "w1"
 
 
 def test_arctic_build_weight_plan_maps_child_loader_decisions(tmp_path, monkeypatch):
@@ -3181,7 +3322,6 @@ def test_arctic_load_weights_from_source_places_expert_slices():
         (nemotron_nas.DeciLMForCausalLM, nemotron_nas),
         (mistral3.Mistral3ForConditionalGeneration, mistral3),
         (glm4.Glm4ForCausalLM, glm4),
-        (afmoe.AfmoeForCausalLM, afmoe),
     ],
 )
 def test_more_dense_load_weights_from_source_delegates_to_executor(
