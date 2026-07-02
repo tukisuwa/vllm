@@ -971,12 +971,10 @@ class ODirectSafetensorsWeightSource:
 
     def iter_full_tensors(
         self,
-        direct_consumer: Callable[[TensorMeta, torch.Tensor], bool] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         yield from self._loader._iter_records(
             self.files,
             self.catalog,
-            direct_consumer=direct_consumer,
         )
 
     def read_full_cpu(self, name: str) -> torch.Tensor:
@@ -1406,150 +1404,6 @@ class _ConsumerProfile:
                 )
 
 
-class _PerExpertMoeDirectLoader:
-    """Direct loader for per-expert routed MoE safetensors.
-
-    This is deliberately narrow. It only consumes checkpoint names that match
-    the common routed-expert layout:
-    ``layers.<n>.mlp.experts.<expert>.{gate,up,down}_proj.*``.
-    The actual copy/sharding semantics remain delegated to
-    RoutedExperts.weight_loader().
-    """
-
-    _PROJ_TO_PARAM = {
-        "gate_proj": ("w13_", "w1"),
-        "down_proj": ("w2_", "w2"),
-        "up_proj": ("w13_", "w3"),
-    }
-    _MOE_MARKER = ".mlp.experts."
-
-    def __init__(self, model: nn.Module) -> None:
-        self._routed_experts_by_layer = self._find_routed_experts(model)
-        if not self._routed_experts_by_layer:
-            raise RuntimeError(
-                "direct_per_expert_moe was enabled, but no routed "
-                "experts were found at language_model.model.layers[*].mlp.experts"
-            )
-        self.count = 0
-        self.bytes = 0
-        self.seconds = 0.0
-        self.skipped_not_local = 0
-
-    @staticmethod
-    def _resolve_attr(root: object, path: str) -> object | None:
-        current = root
-        for part in path.split("."):
-            if not hasattr(current, part):
-                return None
-            current = getattr(current, part)
-        return current
-
-    @classmethod
-    def _find_routed_experts(cls, model: nn.Module) -> dict[int, object]:
-        layers = cls._resolve_attr(model, "language_model.model.layers")
-        if layers is None:
-            layers = cls._resolve_attr(model, "model.layers")
-        if layers is None:
-            return {}
-
-        routed_by_layer: dict[int, object] = {}
-        for layer_id, layer in enumerate(layers):
-            experts = cls._resolve_attr(layer, "mlp.experts.routed_experts")
-            if experts is None:
-                continue
-            if not hasattr(experts, "weight_loader"):
-                continue
-            routed_by_layer[layer_id] = experts
-        return routed_by_layer
-
-    @classmethod
-    def _parse_name(cls, name: str) -> tuple[int, int, str, str] | None:
-        parts = name.split(".")
-        for idx in range(len(parts) - 6):
-            if parts[idx] != "layers":
-                continue
-            if (
-                not parts[idx + 1].isdigit()
-                or parts[idx + 2] != "mlp"
-                or parts[idx + 3] != "experts"
-                or not parts[idx + 4].isdigit()
-            ):
-                continue
-            proj_name = parts[idx + 5]
-            if proj_name not in cls._PROJ_TO_PARAM:
-                continue
-            suffix = ".".join(parts[idx + 6 :])
-            if not suffix:
-                return None
-            return int(parts[idx + 1]), int(parts[idx + 4]), proj_name, suffix
-        return None
-
-    def __call__(self, record: _TensorRecord, tensor: torch.Tensor) -> bool:
-        parsed = self._parse_name(record.name)
-        if parsed is None:
-            if self._MOE_MARKER in record.name:
-                raise RuntimeError(
-                    "direct_per_expert_moe was enabled, but this MoE tensor "
-                    "does not match the supported per-expert layout: "
-                    f"{record.name}"
-                )
-            return False
-
-        layer_id, expert_id, proj_name, suffix = parsed
-        routed_experts = self._routed_experts_by_layer.get(layer_id)
-        if routed_experts is None:
-            raise RuntimeError(
-                "direct_per_expert_moe matched a tensor for layer "
-                f"{layer_id}, but no routed experts module exists: {record.name}"
-            )
-
-        param_prefix, shard_id = self._PROJ_TO_PARAM[proj_name]
-        param_name = f"{param_prefix}{suffix}"
-        if not hasattr(routed_experts, param_name):
-            raise RuntimeError(
-                "direct_per_expert_moe matched a tensor but the target parameter "
-                f"{param_name!r} does not exist for {record.name}"
-            )
-
-        t0 = time.perf_counter()
-        success = routed_experts.weight_loader(
-            param=getattr(routed_experts, param_name),
-            loaded_weight=tensor,
-            weight_name=f"{routed_experts.layer_name}.{param_name}",
-            shard_id=shard_id,
-            expert_id=expert_id,
-            return_success=True,
-        )
-        self.seconds += time.perf_counter() - t0
-        self.count += 1
-        self.bytes += record.size
-        if not success:
-            map_global = getattr(
-                routed_experts, "_map_global_expert_id_to_local_expert_id", None
-            )
-            if not callable(map_global) or map_global(expert_id) != -1:
-                raise RuntimeError(
-                    "direct_per_expert_moe routed expert weight_loader returned "
-                    f"False for a local or unverifiable expert: {record.name}"
-                )
-            self.skipped_not_local += 1
-        return True
-
-    def log(self) -> None:
-        logger.info(
-            "uma_odirect_safetensors direct_per_expert_moe: tensors=%d "
-            "bytes=%s seconds=%.3fs skipped_not_local=%d layers=%d",
-            self.count,
-            _format_gib(self.bytes),
-            self.seconds,
-            self.skipped_not_local,
-            len(self._routed_experts_by_layer),
-        )
-
-
-_Qwen35MoeDirectLoader = _PerExpertMoeDirectLoader
-
-
 class _AlignedBuffer:
     def __init__(self, size: int, alignment: int):
         self.size = size
@@ -1777,8 +1631,6 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
             "allocation_gate_min_mib",
             "psi_gate_seconds",
             "max_swap_gib",
-            "direct_per_expert_moe",
-            "direct_qwen35_moe",
         }
         unexpected_keys = set(extra_config) - allowed_keys
         if unexpected_keys:
@@ -1828,21 +1680,6 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
             * 1024
             * 1024
         )
-        direct_per_expert_moe = self._get_bool(
-            extra_config, "direct_per_expert_moe", False
-        )
-        direct_qwen35_moe = self._get_bool(
-            extra_config, "direct_qwen35_moe", False
-        )
-        self._direct_per_expert_moe = direct_per_expert_moe or direct_qwen35_moe
-        if self._direct_per_expert_moe:
-            logger.warning(
-                "uma_odirect_safetensors direct_per_expert_moe/direct_qwen35_moe "
-                "is deprecated. Prefer model-side build_weight_plan() and "
-                "load_weights_from_source() hooks; the compatibility path is "
-                "only used for models without those hooks."
-            )
-
         if self._alignment & (self._alignment - 1) != 0:
             raise ValueError("alignment must be a power of two")
         if self._window_size < self._chunk_size:
@@ -1877,13 +1714,6 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
             raise ValueError(f"{key} must be a non-negative number, got {value!r}")
         return float(value)
-
-    @staticmethod
-    def _get_bool(config: dict, key: str, default: bool) -> bool:
-        value = config.get(key, default)
-        if not isinstance(value, bool):
-            raise ValueError(f"{key} must be a boolean, got {value!r}")
-        return value
 
     def _gate_memory(self, phase: str) -> None:
         if sys.platform != "linux":
@@ -1962,10 +1792,9 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
     def _get_weights_iterator(
         self,
         model_or_path: str,
-        direct_consumer: Callable[[_TensorRecord, torch.Tensor], bool] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         source = ODirectSafetensorsWeightSource(self, model_or_path)
-        yield from source.iter_full_tensors(direct_consumer=direct_consumer)
+        yield from source.iter_full_tensors()
 
     def _read_record_tensor(
         self,
@@ -2032,7 +1861,6 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
         self,
         files: list[str],
         catalog: TensorCatalog,
-        direct_consumer: Callable[[TensorMeta, torch.Tensor], bool] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         records = catalog.records()
         total_bytes = catalog.total_bytes()
@@ -2119,11 +1947,8 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
                 time_read += elapsed_read
 
                 t0 = time.perf_counter()
-                if direct_consumer is not None and direct_consumer(record, tensor):
-                    elapsed_consumer = time.perf_counter() - t0
-                else:
-                    yield record.name, tensor
-                    elapsed_consumer = time.perf_counter() - t0
+                yield record.name, tensor
+                elapsed_consumer = time.perf_counter() - t0
                 time_consumer += elapsed_consumer
                 if consumer_profile is not None:
                     consumer_profile.record(record, elapsed_consumer)
@@ -2163,8 +1988,6 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
             )
             if consumer_profile is not None:
                 consumer_profile.log()
-            if direct_consumer is not None and hasattr(direct_consumer, "log"):
-                direct_consumer.log()
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_files(model_config.model)
@@ -2187,13 +2010,6 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
                 "uma_odirect_safetensors using model WeightSource path: %s",
                 type(model).__name__,
             )
-            if self._direct_per_expert_moe:
-                logger.warning(
-                    "uma_odirect_safetensors ignoring deprecated "
-                    "direct_per_expert_moe/direct_qwen35_moe because %s "
-                    "implements model-side WeightSource hooks",
-                    type(model).__name__,
-                )
             plan = build_weight_plan(source.catalog)
             try:
                 load_weights_from_source(source, plan)
@@ -2205,7 +2021,4 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
             "uma_odirect_safetensors using compatibility iterator path: %s",
             type(model).__name__,
         )
-        direct_consumer = (
-            _PerExpertMoeDirectLoader(model) if self._direct_per_expert_moe else None
-        )
-        model.load_weights(source.iter_full_tensors(direct_consumer=direct_consumer))
+        model.load_weights(source.iter_full_tensors())

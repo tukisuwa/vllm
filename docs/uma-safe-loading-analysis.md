@@ -369,9 +369,10 @@ Important `model_loader_extra_config` keys:
 - `max_swap_gib`: maximum allowed swap use.
 - `psi_gate_seconds`: maximum allowed memory PSI `some/full avg10`.
 - `metadata_limit_mib`: maximum safetensors metadata header size.
-- `direct_per_expert_moe`: opt-in direct consumer for routed per-expert MoE
-  safetensors that use `layers.<n>.mlp.experts.<expert>.{gate,up,down}_proj.*`
-  naming. `direct_qwen35_moe` remains accepted as a backward-compatible alias.
+
+Routed MoE shortcuts are no longer configured in the storage loader.  Qwen,
+Mixtral, DeepSeek, and Granite-style placement decisions are represented by
+model-side WeightSource hooks so the loader remains model-family agnostic.
 
 Example:
 
@@ -382,33 +383,21 @@ vllm serve /models/local-safetensors-model \
     '{"chunk_size":8388608,"window_size":134217728,"gate_interval_mib":128,"min_available_gib":20,"max_swap_gib":0}'
 ```
 
-### Per-Expert MoE Direct Consumer
+### Model-Side Routed MoE Plans
 
-`direct_per_expert_moe=true` is a narrow optimization for routed MoE
-checkpoints that store per-expert tensors such as:
+Routed MoE models should implement `build_weight_plan(catalog)` and
+`load_weights_from_source(source, plan)`.  The model plan:
 
-```text
-model.language_model.layers.<layer>.mlp.experts.<expert>.gate_proj.weight_packed
-model.language_model.layers.<layer>.mlp.experts.<expert>.up_proj.weight_packed
-model.language_model.layers.<layer>.mlp.experts.<expert>.down_proj.weight_packed
-```
+- maps checkpoint expert tensors to the corresponding routed expert parameters
+  before payload read
+- delegates the actual sharding/copy behavior to the existing
+  `RoutedExperts.weight_loader()`
+- skips non-local experts before payload read when expert locality is known
+- fails closed when a matched expert tensor cannot be represented safely
 
-The direct consumer:
-
-- Finds `RoutedExperts` modules in the already-created vLLM model.
-- Maps checkpoint `gate_proj`, `up_proj`, and `down_proj` tensors to the
-  corresponding routed expert parameters.
-- Delegates the actual sharding/copy behavior to
-  `RoutedExperts.weight_loader()`.
-- Avoids routing these many small per-expert tensors through the generic
-  `AutoWeightsLoader` tree walk.
-- Is fail-closed for matched expert tensors: if enabled, expert tensors that
-  contain `.mlp.experts.` but do not match the supported layout raise an error
-  instead of silently falling back to the generic path.
-
-This optimization is intentionally not a fully general MoE loader. It should
-remain opt-in and only be used for model families whose routed expert modules
-use vLLM `RoutedExperts.weight_loader()` with the above checkpoint naming.
+This keeps Qwen/Mixtral/DeepSeek/Granite naming rules out of the storage loader
+and avoids accumulating model-family conditionals in
+`uma_odirect_safetensors_loader.py`.
 
 ### Docker / Base Image Compatibility
 
@@ -427,8 +416,8 @@ For the current DGX Spark test image:
   that do not match newer source-tree assumptions.
 
 The public branch should keep the core loader self-contained. Model-specific
-speedups should live in the loader as opt-in direct consumers rather than as
-large edits to common model or layer files.
+speedups should live in model-side WeightSource hooks rather than as
+loader-side direct consumers.
 
 ### Current DGX Spark 35B Results
 

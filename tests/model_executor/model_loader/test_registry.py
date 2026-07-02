@@ -22,8 +22,6 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     UmaODirectSafetensorsModelLoader,
     WeightPlan,
     WeightPlanEntry,
-    _Qwen35MoeDirectLoader,
-    _TensorRecord,
     build_auto_weight_plan_from_catalog,
     execute_weight_plan,
 )
@@ -214,6 +212,8 @@ def test_uma_safetensors_prepares_local_safetensors(tmp_path):
             {"allocation_gate_min_mib": -1},
             "allocation_gate_min_mib must be a non-negative",
         ),
+        ({"direct_per_expert_moe": True}, "Unexpected extra config"),
+        ({"direct_qwen35_moe": True}, "Unexpected extra config"),
     ],
 )
 def test_uma_odirect_safetensors_rejects_invalid_extra_config(extra, match):
@@ -2388,16 +2388,6 @@ def test_uma_odirect_model_source_hook_requires_both_methods(tmp_path, monkeypat
         loader.load_weights(IncompleteFakeModel(), FakeModelConfig())
 
 
-def test_uma_odirect_safetensors_accepts_generic_direct_moe_flag():
-    loader = UmaODirectSafetensorsModelLoader(
-        LoadConfig(
-            load_format="uma_odirect_safetensors",
-            model_loader_extra_config={"direct_per_expert_moe": True},
-        )
-    )
-    assert loader._direct_per_expert_moe is True
-
-
 def test_uma_odirect_safetensors_staging_tensor_is_cpu(tmp_path, monkeypatch):
     metadata = {"a": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
     path = tmp_path / "model.safetensors"
@@ -2435,59 +2425,3 @@ def test_uma_odirect_safetensors_staging_tensor_is_cpu(tmp_path, monkeypatch):
     assert tensors[0][0] == "a"
     assert tensors[0][1].device.type == "cpu"
     assert seen_device_types == ["cpu"]
-
-
-def test_direct_qwen35_moe_false_requires_nonlocal_expert():
-    class FakeRoutedExperts:
-        layer_name = "model.layers.0.mlp.experts.routed_experts"
-        w13_weight_packed = object()
-
-        def __init__(self, local_expert: bool):
-            self.local_expert = local_expert
-
-        def weight_loader(self, **_kwargs):
-            return False
-
-        def _map_global_expert_id_to_local_expert_id(self, _expert_id):
-            return 0 if self.local_expert else -1
-
-    class FakeExperts:
-        def __init__(self, routed_experts):
-            self.routed_experts = routed_experts
-
-    class FakeMLP:
-        def __init__(self, routed_experts):
-            self.experts = FakeExperts(routed_experts)
-
-    class FakeLayer:
-        def __init__(self, routed_experts):
-            self.mlp = FakeMLP(routed_experts)
-
-    class FakeInnerModel:
-        def __init__(self, routed_experts):
-            self.layers = [FakeLayer(routed_experts)]
-
-    class FakeLanguageModel:
-        def __init__(self, routed_experts):
-            self.model = FakeInnerModel(routed_experts)
-
-    class FakeModel:
-        def __init__(self, routed_experts):
-            self.language_model = FakeLanguageModel(routed_experts)
-
-    record = _TensorRecord(
-        file_path="model.safetensors",
-        name="model.language_model.layers.0.mlp.experts.0.gate_proj.weight_packed",
-        dtype=torch.float32,
-        shape=[1],
-        offset=0,
-        size=4,
-    )
-
-    local_loader = _Qwen35MoeDirectLoader(FakeModel(FakeRoutedExperts(True)))
-    with pytest.raises(RuntimeError, match="False for a local"):
-        local_loader(record, torch.zeros(1))
-
-    nonlocal_loader = _Qwen35MoeDirectLoader(FakeModel(FakeRoutedExperts(False)))
-    assert nonlocal_loader(record, torch.zeros(1)) is True
-    assert nonlocal_loader.skipped_not_local == 1

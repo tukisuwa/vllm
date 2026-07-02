@@ -35,10 +35,12 @@ buffers, CUDA allocations, and device-visible memory all share the same physical
 pool.  The loader needs to avoid reading and staging data that the model will
 later discard or slice.
 
-The current `direct_per_expert_moe` optimization proves the issue: it improves
+The earlier `direct_per_expert_moe` optimization proved the issue: it improved
 Qwen MoE loading by bypassing the normal full-tensor iterator for per-expert
-weights, but it does so by teaching the loader about a specific MoE checkpoint
-layout.  That is a local optimization, not a sound general design.
+weights, but it did so by teaching the loader about a specific MoE checkpoint
+layout.  That was a local optimization, not a sound general design.  This
+branch now keeps that knowledge in model-side WeightSource hooks instead of in
+the storage loader.
 
 ## Current relevant code
 
@@ -52,7 +54,8 @@ Current loader entry points:
 - `vllm/model_executor/model_loader/uma_odirect_safetensors_loader.py`
   - current fail-closed local O_DIRECT safetensors loader
   - currently yields `(name, CPU tensor)` for the base path
-  - optionally uses `direct_per_expert_moe` for Qwen-like routed expert tensors
+  - does not contain model-family direct-loading branches; routed expert
+    placement is handled by model-side WeightSource hooks
 
 Current model-side loading:
 
@@ -426,8 +429,9 @@ Current limitations:
 - It proves model-side planning and skip/map decisions before payload read, but
   only performs conservative TP-local source slicing for simple output-dimension
   shards and single-dimension input shards.
-- Qwen3 MoE now has a first model-side source hook, but other MoE families and
-  full removal of the older compatibility optimization remain Phase 4/5 work.
+- Qwen3 MoE now has a model-side source hook; the older loader-side
+  compatibility optimization has been removed so routed expert special cases
+  remain model-side.
 
 ### Phase 4: Qwen MoE prototype
 
@@ -454,9 +458,6 @@ model-specific knowledge out of the loader.
 
 Remaining work:
 
-- remove the older loader-side `direct_per_expert_moe` compatibility path once
-  the model hook is validated on a real Qwen3 MoE load. It is now logged as
-  deprecated, and ignored when a model-side WeightSource hook is available.
 - validate Qwen3.5/Qwen3Next MoE and Qwen3.5 MoE conditional generation on real
   checkpoints; they share the model-side helper but have not been real-loaded
   yet
