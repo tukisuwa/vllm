@@ -949,7 +949,15 @@ def test_uma_odirect_weight_plan_summary_counts_payload_bytes():
             TensorMeta("model.safetensors", "rows", torch.float32, [4, 2], 8, 32),
             TensorMeta("model.safetensors", "cols", torch.float32, [2, 4], 40, 32),
             TensorMeta("model.safetensors", "kv", torch.float32, [4, 2], 72, 32),
-            TensorMeta("model.safetensors", "skip", torch.float32, [3], 104, 12),
+            TensorMeta(
+                "model.safetensors",
+                "strided",
+                torch.float32,
+                [3, 4],
+                104,
+                48,
+            ),
+            TensorMeta("model.safetensors", "skip", torch.float32, [3], 152, 12),
         ]
     )
     plan = WeightPlan(
@@ -982,6 +990,11 @@ def test_uma_odirect_weight_plan_summary_counts_payload_bytes():
                     ),
                 ),
             ),
+            WeightPlanEntry(
+                "strided",
+                "strided_param",
+                source_slices=(slice(None), slice(0, 2)),
+            ),
             WeightPlanEntry("skip", "missing", required=False),
             WeightPlanEntry("absent_skip", "missing", required=False),
         )
@@ -989,18 +1002,18 @@ def test_uma_odirect_weight_plan_summary_counts_payload_bytes():
 
     summary = summarize_weight_plan(catalog, plan)
 
-    assert summary.entries == 6
-    assert summary.required_entries == 4
+    assert summary.entries == 7
+    assert summary.required_entries == 5
     assert summary.skipped_entries == 2
     assert summary.missing_skipped_entries == 1
     assert summary.full_read_entries == 1
-    assert summary.sliced_read_entries == 1
+    assert summary.sliced_read_entries == 2
     assert summary.read_into_entries == 2
     assert summary.full_payload_bytes == 8
-    assert summary.sliced_payload_bytes == 16
+    assert summary.sliced_payload_bytes == 40
     assert summary.read_into_payload_bytes == 32
     assert summary.skipped_payload_bytes == 12
-    assert summary.total_read_payload_bytes == 56
+    assert summary.total_read_payload_bytes == 80
 
 
 def test_uma_odirect_weight_plan_summary_rejects_missing_required():

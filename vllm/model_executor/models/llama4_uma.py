@@ -322,17 +322,15 @@ def _load_fused_expert_entries(
     entries: tuple[Llama4FusedExpertEntry, ...],
 ) -> set[str]:
     loaded: set[str] = set()
-    tensors: dict[
-        tuple[str, str],
-        torch.Tensor,
-    ] = {}
+    last_key: tuple[str, str] | None = None
+    last_tensor: torch.Tensor | None = None
     for entry in entries:
         key = (entry.checkpoint_name, repr(entry.source_slices))
-        tensor = tensors.get(key)
-        if tensor is None:
-            tensor = _read_fused_expert_tensor(source, entry)
-            tensors[key] = tensor
-        loaded.add(_dispatch_fused_expert_entry(model, entry, tensor))
+        if key != last_key:
+            last_tensor = _read_fused_expert_tensor(source, entry)
+            last_key = key
+        assert last_tensor is not None
+        loaded.add(_dispatch_fused_expert_entry(model, entry, last_tensor))
     return loaded
 
 

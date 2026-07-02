@@ -380,7 +380,7 @@ def _weight_plan_entry_payload_size(
         strided = _normalize_single_dim_slice_selection(record.shape, source_slices)
         if strided is None:
             raise exc
-        element_count = strided[2]
+        element_count = math.prod(strided[4])
     return element_count * _DTYPE_NBYTES[record.dtype]
 
 
