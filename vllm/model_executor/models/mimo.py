@@ -38,6 +38,15 @@ from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+    WeightPlan,
+)
+from vllm.model_executor.models.auto_uma import (
+    build_auto_uma_weight_plan,
+    load_auto_uma_weights_from_source,
+)
 from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM, Qwen2Model
 from vllm.sequence import IntermediateTensors
 
@@ -125,6 +134,22 @@ class MiMoForCausalLM(Qwen2ForCausalLM, nn.Module):
         skip_prefixes.append("model.mtp_layers.")
         loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
         return loader.load_weights(weights)
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
+        skip_prefixes = ["lm_head."] if self.config.tie_word_embeddings else []
+        skip_prefixes.append("model.mtp_layers.")
+        return build_auto_uma_weight_plan(
+            self,
+            catalog,
+            skip_prefixes=skip_prefixes,
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: WeightPlan,
+    ) -> set[str]:
+        return load_auto_uma_weights_from_source(self, source, plan)
 
     def compute_logits(
         self,

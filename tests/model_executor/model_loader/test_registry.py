@@ -49,10 +49,12 @@ from vllm.model_executor.models import (
     hyperclovax,
     internlm2,
     jais2,
+    lfm2,
     llama,
     mixtral,
     mistral,
     mpt,
+    mimo,
     nemotron,
     olmo,
     olmo2,
@@ -2765,6 +2767,7 @@ def test_plain_dense_build_weight_plan_uses_auto_mapping(tmp_path, model_cls, na
         (apertus.ApertusForCausalLM, apertus.ApertusForCausalLM.hf_to_vllm_mapper),
         (granite.GraniteForCausalLM, None),
         (plamo3.Plamo3ForCausalLM, None),
+        (lfm2.Lfm2ForCausalLM, None),
     ],
 )
 def test_dense_build_weight_plan_skips_tied_lm_head(tmp_path, model_cls, mapper):
@@ -2846,6 +2849,42 @@ def test_arcee_build_weight_plan_skips_gate_proj(tmp_path):
     assert entries["model.layers.0.mlp.up_proj.weight"].required is True
 
 
+def test_mimo_build_weight_plan_skips_mtp_layers(tmp_path):
+    metadata = {
+        "model.mtp_layers.0.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [0, 4],
+        },
+        "model.layers.0.self_attn.q_proj.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [4, 8],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 8)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = False
+
+    class FakeMiMo:
+        config = FakeConfig()
+
+        def children(self):
+            return []
+
+    plan = mimo.MiMoForCausalLM.build_weight_plan(FakeMiMo(), catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    assert entries["model.mtp_layers.0.weight"].required is False
+    assert entries["model.layers.0.self_attn.q_proj.weight"].required is True
+
+
 @pytest.mark.parametrize(
     "model_cls, module",
     [
@@ -2868,6 +2907,8 @@ def test_arcee_build_weight_plan_skips_gate_proj(tmp_path):
         (arcee.ArceeForCausalLM, arcee),
         (seed_oss.SeedOssForCausalLM, seed_oss),
         (hyperclovax.HyperCLOVAXForCausalLM, hyperclovax),
+        (lfm2.Lfm2ForCausalLM, lfm2),
+        (mimo.MiMoForCausalLM, mimo),
     ],
 )
 def test_more_dense_compat_load_weights_from_source_delegates_to_executor(
