@@ -55,6 +55,8 @@ from vllm.model_executor.models import (
     granitemoe,
     granitemoehybrid,
     granitemoeshared,
+    hy_v3,
+    hy_v3_uma,
     hyperclovax,
     hrm_text,
     internlm2,
@@ -4143,14 +4145,30 @@ def test_glm4_moe_source_plan_skips_nonlocal_experts_and_spec_layers():
     class FakeMLP:
         def __init__(self, routed_experts):
             self.experts = routed_experts
+            self.gate = nn.Linear(1, 1, bias=False)
 
     class FakeLayer:
         def __init__(self, routed_experts):
             self.mlp = FakeMLP(routed_experts)
 
+    class FakeLayers:
+        def __init__(self, routed_experts):
+            self._layers = [FakeLayer(routed_experts)]
+
+        def __len__(self):
+            return len(self._layers)
+
+        def __getitem__(self, idx):
+            return self._layers[idx]
+
+        def __getattr__(self, name):
+            if name.isdigit():
+                return self._layers[int(name)]
+            raise AttributeError(name)
+
     class FakeInnerModel:
         def __init__(self, routed_experts):
-            self.layers = [FakeLayer(routed_experts)]
+            self.layers = FakeLayers(routed_experts)
 
     class FakeConfig:
         num_hidden_layers = 2
@@ -4194,6 +4212,116 @@ def test_glm4_moe_source_plan_skips_nonlocal_experts_and_spec_layers():
         (names[1], "non-local routed expert"),
     ]
     assert loaded == {"model.layers.0.mlp.experts.w13_weight"}
+    assert model.routed_experts.calls[0]["expert_id"] == 0
+    assert model.routed_experts.calls[0]["shard_id"] == "w1"
+
+
+def test_hy_v3_moe_source_plan_skips_nonlocal_experts_and_spec_layers():
+    names = [
+        "model.layers.0.mlp.experts.0.gate_proj.weight",
+        "model.layers.0.mlp.experts.1.gate_proj.weight",
+        "model.layers.0.mlp.router.gate.weight",
+        "model.layers.2.mlp.experts.0.gate_proj.weight",
+    ]
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", names[0], torch.float32, [1], 0, 4),
+            TensorMeta("model.safetensors", names[1], torch.float32, [1], 4, 4),
+            TensorMeta("model.safetensors", names[2], torch.float32, [1], 8, 4),
+            TensorMeta("model.safetensors", names[3], torch.float32, [1], 12, 4),
+        ]
+    )
+
+    class FakeRoutedExperts:
+        layer_name = "model.layers.0.mlp.experts"
+        w13_weight = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 0 else -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeMLP:
+        def __init__(self, routed_experts):
+            self.experts = routed_experts
+            self.gate = nn.Linear(1, 1, bias=False)
+
+    class FakeLayer:
+        def __init__(self, routed_experts):
+            self.mlp = FakeMLP(routed_experts)
+
+    class FakeLayers:
+        def __init__(self, routed_experts):
+            self._layers = [FakeLayer(routed_experts)]
+
+        def __len__(self):
+            return len(self._layers)
+
+        def __getitem__(self, idx):
+            return self._layers[idx]
+
+        def __getattr__(self, name):
+            if name.isdigit():
+                return self._layers[int(name)]
+            raise AttributeError(name)
+
+    class FakeInnerModel:
+        def __init__(self, routed_experts):
+            self.layers = FakeLayers(routed_experts)
+
+    class FakeConfig:
+        tie_word_embeddings = False
+        num_hidden_layers = 2
+        num_nextn_predict_layers = 1
+
+    class FakeHYV3(hy_v3.HYV3ForCausalLM):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = FakeConfig()
+            self.routed_experts = FakeRoutedExperts()
+            self.model = FakeInnerModel(self.routed_experts)
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            return torch.ones(1)
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    model = FakeHYV3()
+    source = FakeSource(catalog)
+
+    plan = model.build_weight_plan(catalog)
+    assert len(plan.auto_plan.entries) == 2
+    auto_entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    assert auto_entries[names[2]].target_name == "model.layers.0.mlp.gate.weight"
+    assert auto_entries[names[3]].required is False
+    assert [entry.checkpoint_name for entry in plan.routed_entries] == names[:2]
+    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+
+    loaded = model.load_weights_from_source(source, plan)
+
+    assert source.reads == [names[2], names[0]]
+    assert source.skips == [
+        (names[3], "weight plan marked not required"),
+        (names[1], "non-local routed expert"),
+    ]
+    assert loaded == {
+        "model.layers.0.mlp.gate.weight",
+        "model.layers.0.mlp.experts.w13_weight",
+    }
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
 

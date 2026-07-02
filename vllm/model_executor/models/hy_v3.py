@@ -66,9 +66,18 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.hy_v3 import HYV3Config
 
+from .hy_v3_uma import (
+    HyV3MoeSourcePlan,
+    build_hy_v3_moe_weight_plan,
+    load_hy_v3_moe_weights_from_source,
+)
 from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
@@ -735,3 +744,21 @@ class HYV3ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> HyV3MoeSourcePlan:
+        return build_hy_v3_moe_weight_plan(
+            self,
+            catalog,
+            skip_predicate=lambda name: get_spec_layer_idx_from_weight_name(
+                self.config,
+                name,
+            )
+            is not None,
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: HyV3MoeSourcePlan,
+    ) -> set[str]:
+        return load_hy_v3_moe_weights_from_source(self, source, plan)
