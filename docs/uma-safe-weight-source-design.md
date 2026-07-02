@@ -669,6 +669,10 @@ Add model-side plans only where needed:
     payload read
   - keeps shared expert `gate_proj` / `up_proj` stacking and router correction
     bias on the model-side WeightSource plan
+- InternS1Pro MoE
+  - reuses the Qwen-family routed-MoE helper for language-model experts
+  - preserves InternS1Pro's visual/language-model prefix remapping and visual
+    skip when the tower is absent
 
 Each model family should implement its own plan builder instead of adding
 loader-side conditionals.
@@ -696,6 +700,7 @@ Expected current behavior:
 | Bailing / Sarvam Bailing-style MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts and model-specific normalization |
 | Laguna MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts while preserving bias/shared-expert auto loads |
 | Kimi Linear MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for `block_sparse_moe` routed experts, spec-layer skip, and shared-expert stacking |
+| InternS1Pro MoE | Base path should work if normal vLLM load works | Phase 5 initial hook via Qwen-family helper with wrapper prefix mapping |
 | Other routed MoE | Base path should work if normal vLLM load works | Not yet implemented |
 | Non-safetensors | Not supported | Not supported |
 | Remote HF path | Not supported by UMA-safe loader | Not supported |

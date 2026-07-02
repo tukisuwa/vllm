@@ -57,10 +57,19 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from .interfaces import MixtureOfExperts
+from .qwen_moe_uma import (
+    QwenMoeSourcePlan,
+    build_qwen_moe_weight_plan,
+    load_qwen_moe_weights_from_source,
+)
 from .qwen3_moe import (
     Qwen3MoeForCausalLM,
 )
@@ -623,13 +632,14 @@ class InternS1ProForConditionalGeneration(
                 )
         return mapper
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        """load weights"""
+    def _uma_skip_prefixes(self) -> list[str]:
         skip_prefixes = ["model.time_series."]
         if self.visual is None:
-            skip_prefixes.append("visual.")
-        # FIXME(Isotr0py): See if we can avoid tighing FoPE to PP layers
-        weights_mapper = WeightsMapper(
+            skip_prefixes.extend(["model.visual.", "visual."])
+        return skip_prefixes
+
+    def _uma_weight_mapper(self) -> WeightsMapper:
+        return WeightsMapper(
             orig_to_new_prefix={
                 "model.visual.": "visual.",
                 "lm_head.": "language_model.lm_head.",
@@ -637,5 +647,30 @@ class InternS1ProForConditionalGeneration(
             },
             orig_to_new_suffix=self.get_frope_params_map(),
         )
-        loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
-        return loader.load_weights(weights, mapper=weights_mapper)
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> QwenMoeSourcePlan:
+        return build_qwen_moe_weight_plan(
+            self,
+            catalog,
+            family_name="InternS1Pro MoE",
+            mapper=self._uma_weight_mapper(),
+            skip_prefixes=self._uma_skip_prefixes(),
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: QwenMoeSourcePlan,
+    ) -> set[str]:
+        return load_qwen_moe_weights_from_source(
+            self,
+            source,
+            plan,
+            family_name="InternS1Pro MoE",
+        )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        """load weights"""
+        # FIXME(Isotr0py): See if we can avoid tighing FoPE to PP layers
+        loader = AutoWeightsLoader(self, skip_prefixes=self._uma_skip_prefixes())
+        return loader.load_weights(weights, mapper=self._uma_weight_mapper())

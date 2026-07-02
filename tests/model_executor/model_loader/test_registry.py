@@ -64,6 +64,7 @@ from vllm.model_executor.models import (
     hyperclovax,
     hrm_text,
     internlm2,
+    interns1_pro,
     jais2,
     jamba,
     jamba_uma,
@@ -4803,6 +4804,122 @@ def test_kimi_linear_moe_source_plan_skips_nonlocal_and_spec_layers():
         "model.layers.0.block_sparse_moe.gate.e_score_correction_bias",
         "model.layers.0.block_sparse_moe.shared_experts.gate_up_proj.weight",
         "model.layers.0.block_sparse_moe.experts.w13_weight",
+    }
+    assert model.routed_experts.calls[0]["expert_id"] == 0
+    assert model.routed_experts.calls[0]["shard_id"] == "w1"
+
+
+def test_interns1_pro_source_plan_reuses_qwen_moe_helper_and_prefix_mapper():
+    names = [
+        "model.language_model.layers.0.mlp.experts.0.gate_proj.weight",
+        "model.language_model.layers.0.mlp.experts.1.gate_proj.weight",
+        "lm_head.weight",
+        "model.visual.patch_embed.weight",
+    ]
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", names[0], torch.float32, [1], 0, 4),
+            TensorMeta("model.safetensors", names[1], torch.float32, [1], 4, 4),
+            TensorMeta("model.safetensors", names[2], torch.float32, [1, 1], 8, 4),
+            TensorMeta("model.safetensors", names[3], torch.float32, [1], 12, 4),
+        ]
+    )
+
+    class FakeRoutedExperts:
+        layer_name = "language_model.model.layers.0.mlp.experts"
+        w13_weight = object()
+        quant_method = object()
+
+        def __init__(self):
+            self.calls = []
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return 0 if expert_id == 0 else -1
+
+        def weight_loader(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class FakeMLP(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.experts = type("ExpertsWrapper", (), {})()
+            self.experts.routed_experts = routed_experts
+
+    class FakeLayer(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.mlp = FakeMLP(routed_experts)
+
+    class FakeLayers:
+        def __init__(self, routed_experts):
+            self._layers = [FakeLayer(routed_experts)]
+
+        def __len__(self):
+            return len(self._layers)
+
+        def __getitem__(self, idx):
+            return self._layers[idx]
+
+        def __getattr__(self, name):
+            if name.isdigit():
+                return self._layers[int(name)]
+            raise AttributeError(name)
+
+    class FakeInnerLanguageModel(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.layers = FakeLayers(routed_experts)
+
+    class FakeLanguageModel(nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.model = FakeInnerLanguageModel(routed_experts)
+            self.lm_head = nn.Linear(1, 1, bias=False)
+
+    class FakeInternS1Pro(interns1_pro.InternS1ProForConditionalGeneration):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.visual = None
+            self.routed_experts = FakeRoutedExperts()
+            self.language_model = FakeLanguageModel(self.routed_experts)
+
+    class FakeSource:
+        def __init__(self, catalog):
+            self.catalog = catalog
+            self.reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            if name == names[2]:
+                return torch.tensor([[7.0]])
+            return torch.ones(1)
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    model = FakeInternS1Pro()
+    source = FakeSource(catalog)
+
+    plan = model.build_weight_plan(catalog)
+    auto_entries = {entry.checkpoint_name: entry for entry in plan.auto_plan.entries}
+    assert auto_entries[names[2]].target_name == "language_model.lm_head.weight"
+    assert auto_entries[names[3]].required is False
+    assert [entry.checkpoint_name for entry in plan.routed_entries] == names[:2]
+    assert [entry.local_required for entry in plan.routed_entries] == [True, False]
+
+    loaded = model.load_weights_from_source(source, plan)
+
+    assert source.reads == [names[2], names[0]]
+    assert source.skips == [
+        (names[3], "weight plan marked not required"),
+        (names[1], "non-local routed expert"),
+    ]
+    assert torch.equal(model.language_model.lm_head.weight, torch.tensor([[7.0]]))
+    assert loaded == {
+        "language_model.lm_head.weight",
+        "language_model.model.layers.0.mlp.experts.w13_weight",
     }
     assert model.routed_experts.calls[0]["expert_id"] == 0
     assert model.routed_experts.calls[0]["shard_id"] == "w1"
