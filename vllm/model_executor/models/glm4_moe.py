@@ -64,8 +64,17 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+)
 from vllm.sequence import IntermediateTensors
 
+from .glm4_moe_uma import (
+    Glm4MoeSourcePlan,
+    build_glm4_moe_weight_plan,
+    load_glm4_moe_weights_from_source,
+)
 from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
@@ -776,6 +785,23 @@ class Glm4MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA, Glm4MixtureOfExper
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> Glm4MoeSourcePlan:
+        return build_glm4_moe_weight_plan(
+            self,
+            catalog,
+            skip_predicate=self._is_spec_layer_weight,
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: Glm4MoeSourcePlan,
+    ) -> set[str]:
+        return load_glm4_moe_weights_from_source(self, source, plan)
+
+    def _is_spec_layer_weight(self, name: str) -> bool:
+        return get_spec_layer_idx_from_weight_name(self.config, name) is not None
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

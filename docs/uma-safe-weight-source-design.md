@@ -601,6 +601,13 @@ Add model-side plans only where needed:
     map exposes locality
   - GraniteMoeHybrid has a separate hook for the same fused expert tensors,
     plus `weight_scale` slices and the existing `A_log` -> `A` Mamba mapping
+- GLM4 MoE
+  - initial hook implemented for per-expert
+    `mlp.experts.<expert>.{gate,up,down}_proj.*` tensors
+  - skips non-local routed experts and speculative next-token layers before
+    payload read
+  - keeps standard qkv/gate-up packed dense mapping model-side; ROCm fused
+    shared-expert special handling remains future work
 
 Each model family should implement its own plan builder instead of adding
 loader-side conditionals.
@@ -618,6 +625,7 @@ Expected current behavior:
 | DeepSeek V2/V3 routed MoE | Base path should work if normal vLLM load works | Phase 5 hook for routed experts, shared-expert fusion source slices, and FP8 indexer WK fusion |
 | Granite MoE / Granite MoE Shared | Base path should work if normal vLLM load works | Phase 5 initial model hook |
 | Granite MoE Hybrid | Base path should work if normal vLLM load works | Phase 5 initial hook, including fused expert `weight_scale` and `A_log` mapping |
+| GLM4 MoE | Base path should work if normal vLLM load works | Phase 5 initial hook for standard routed experts; fused shared-expert special path not yet implemented |
 | Other routed MoE | Base path should work if normal vLLM load works | Not yet implemented |
 | Non-safetensors | Not supported | Not supported |
 | Remote HF path | Not supported by UMA-safe loader | Not supported |
