@@ -33,6 +33,7 @@ from vllm.model_executor.models import (
     apertus,
     arctic,
     arcee,
+    bagel,
     bailing_moe,
     bailing_moe_uma,
     chatglm,
@@ -3807,6 +3808,71 @@ def test_mellum_inherits_qwen_moe_weight_plan(tmp_path):
     assert plan.routed_entries[0].local_required is True
     assert plan.routed_entries[0].param_name == "w13_weight"
     assert plan.routed_entries[0].shard_id == "w1"
+
+
+def test_bagel_build_weight_plan_skips_generation_and_transforms_patch(tmp_path):
+    metadata = {
+        "vit_model.patch_embedding.weight": {
+            "dtype": "F32",
+            "shape": [2, 12],
+            "data_offsets": [0, 96],
+        },
+        "moe_gen.experts.0.w1.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [96, 100],
+        },
+        "vit_pos_embed.pos_embed.weight": {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [100, 104],
+        },
+    }
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(path, metadata, b"\0" * 104)
+    catalog = TensorCatalog.from_safetensors_files(
+        [str(path)],
+        metadata_limit_bytes=1024 * 1024,
+    )
+
+    class FakeVitConfig:
+        patch_size = 2
+        num_channels = 3
+
+    class FakeConfig:
+        vit_config = FakeVitConfig()
+
+    class FakePatchEmbedding(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(2, 3, 2, 2), requires_grad=False)
+
+    class FakeVitModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.patch_embedding = FakePatchEmbedding()
+
+    class FakeBagel(bagel.BagelForConditionalGeneration):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = FakeConfig()
+            self.vit_model = FakeVitModel()
+            self.hf_to_vllm_mapper = bagel.WeightsMapper(
+                orig_to_new_prefix={"vit_model.": "vit_model."}
+            )
+
+    plan = FakeBagel().build_weight_plan(catalog)
+    entries = {entry.checkpoint_name: entry for entry in plan.entries}
+
+    patch = entries["vit_model.patch_embedding.weight"]
+    assert patch.target_name == "vit_model.patch_embedding.weight"
+    assert patch.transform is not None
+    tensor = torch.arange(24, dtype=torch.float32).reshape(2, 12)
+    transformed = patch.transform(tensor)
+    assert transformed.shape == (2, 3, 2, 2)
+    assert transformed[0, :, 0, 0].tolist() == [0.0, 1.0, 2.0]
+    assert entries["moe_gen.experts.0.w1.weight"].required is False
+    assert entries["vit_pos_embed.pos_embed.weight"].required is False
 
 
 @pytest.mark.parametrize(

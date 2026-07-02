@@ -7,7 +7,7 @@ BAGEL is a unified multimodal model for image understanding and generation.
 For vLLM, we focus on the image understanding (vision-to-text) capabilities.
 """
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Literal, TypeAlias
 
 import torch
@@ -23,6 +23,11 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
+    ODirectSafetensorsWeightSource,
+    TensorCatalog,
+    WeightPlan,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
@@ -46,6 +51,7 @@ from .interfaces import (
     SupportsPP,
 )
 from .siglip import SiglipVisionModel
+from .auto_uma import build_auto_uma_weight_plan, load_auto_uma_weights_from_source
 from .utils import (
     AutoWeightsLoader,
     StageMissingLayer,
@@ -55,6 +61,46 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+_BAGEL_GENERATION_KEYWORDS = (
+    "moe_gen",
+    "latent_pos_embed",
+    "llm2vae",
+    "vae2llm",
+    "time_embedder",
+)
+
+_BAGEL_VAE_PREFIXES = (
+    "decoder.",
+    "encoder.",
+)
+
+
+def _bagel_should_skip_weight(name: str) -> bool:
+    if any(skip in name for skip in _BAGEL_GENERATION_KEYWORDS):
+        return True
+    if any(name.startswith(prefix) for prefix in _BAGEL_VAE_PREFIXES):
+        return True
+    return name.startswith("vit_pos_embed.pos_embed")
+
+
+def _bagel_patch_embedding_transform(
+    config: Any,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    def transform(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim != 2:
+            return tensor
+        out_channels = tensor.shape[0]
+        in_features = tensor.shape[1]
+        patch_size = config.vit_config.patch_size
+        in_channels = config.vit_config.num_channels
+        if in_features != in_channels * patch_size * patch_size:
+            return tensor
+        tensor = tensor.reshape(out_channels, patch_size, patch_size, in_channels)
+        return tensor.permute(0, 3, 1, 2).contiguous()
+
+    return transform
 
 
 class BagelImagePixelInputs(TensorSchema):
@@ -582,3 +628,28 @@ class BagelForConditionalGeneration(
         # Skip vit_pos_embed.pos_embed as it's handled by PositionEmbedding module
         loader = AutoWeightsLoader(self, skip_prefixes=["vit_pos_embed.pos_embed"])
         return loader.load_weights(filtered_weights, mapper=self.hf_to_vllm_mapper)
+
+    def build_weight_plan(self, catalog: TensorCatalog) -> WeightPlan:
+        def name_transform(
+            name: str,
+        ) -> tuple[str, Callable[[torch.Tensor], torch.Tensor] | None] | None:
+            if _bagel_should_skip_weight(name):
+                return name, None
+            if "patch_embedding.weight" in name:
+                return name, _bagel_patch_embedding_transform(self.config)
+            return name, None
+
+        return build_auto_uma_weight_plan(
+            self,
+            catalog,
+            mapper=self.hf_to_vllm_mapper,
+            name_transform=name_transform,
+            skip_predicate=_bagel_should_skip_weight,
+        )
+
+    def load_weights_from_source(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        plan: WeightPlan,
+    ) -> set[str]:
+        return load_auto_uma_weights_from_source(self, source, plan)
