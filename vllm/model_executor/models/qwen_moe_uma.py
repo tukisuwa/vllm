@@ -27,12 +27,19 @@ class QwenMoeRoutedEntry:
     param_name: str
     shard_id: str
     local_required: bool
+    skip_reason: str | None = None
 
 
 @dataclass(frozen=True)
 class QwenMoeSourcePlan:
     auto_plan: WeightPlan
     routed_entries: tuple[QwenMoeRoutedEntry, ...]
+
+
+@dataclass(frozen=True)
+class _RoutedExpertsResolution:
+    routed_experts: Any | None
+    skip_reason: str | None = None
 
 
 def _parse_routed_expert_name(
@@ -80,20 +87,38 @@ def _get_model_layers(model: Any) -> Any | None:
     return getattr(getattr(language_model, "model", None), "layers", None)
 
 
-def _get_routed_experts_for_layer(model: Any, layer_id: int) -> Any | None:
+def _resolve_routed_experts_for_layer(
+    model: Any,
+    layer_id: int,
+) -> _RoutedExpertsResolution:
     layers = _get_model_layers(model)
-    if layers is None or layer_id < 0 or layer_id >= len(layers):
-        return None
+    if layers is None:
+        raise RuntimeError("Qwen MoE UMA plan could not find model layers")
+    if layer_id < 0 or layer_id >= len(layers):
+        raise RuntimeError(
+            f"Qwen MoE UMA plan found checkpoint layer {layer_id}, "
+            f"but model has {len(layers)} layers"
+        )
     layer = layers[layer_id]
     if isinstance(layer, PPMissingLayer):
-        return None
+        return _RoutedExpertsResolution(None, "pipeline-missing routed expert layer")
     mlp = getattr(layer, "mlp", None)
     if not hasattr(mlp, "experts"):
-        return None
+        raise RuntimeError(
+            "Qwen MoE UMA plan matched a routed expert tensor for "
+            f"layer {layer_id}, but that model layer has no experts module"
+        )
     routed_experts = getattr(mlp.experts, "routed_experts", None)
     if routed_experts is None or not hasattr(routed_experts, "weight_loader"):
-        return None
-    return routed_experts
+        raise RuntimeError(
+            "Qwen MoE UMA plan matched a routed expert tensor for "
+            f"layer {layer_id}, but no RoutedExperts weight_loader was found"
+        )
+    return _RoutedExpertsResolution(routed_experts)
+
+
+def _get_routed_experts_for_layer(model: Any, layer_id: int) -> Any | None:
+    return _resolve_routed_experts_for_layer(model, layer_id).routed_experts
 
 
 def _routed_entry_requires_local_read(
@@ -129,7 +154,8 @@ def build_qwen_moe_weight_plan(
         if parsed is None:
             continue
         layer_id, expert_id, proj_name, suffix = parsed
-        routed_experts = _get_routed_experts_for_layer(model, layer_id)
+        resolution = _resolve_routed_experts_for_layer(model, layer_id)
+        routed_experts = resolution.routed_experts
         if routed_experts is None:
             routed_entries.append(
                 QwenMoeRoutedEntry(
@@ -139,6 +165,7 @@ def build_qwen_moe_weight_plan(
                     param_name="",
                     shard_id="",
                     local_required=False,
+                    skip_reason=resolution.skip_reason,
                 )
             )
             continue
@@ -180,7 +207,10 @@ def load_qwen_moe_weights_from_source(
     loaded = execute_weight_plan(model, source, plan.auto_plan)
     for entry in plan.routed_entries:
         if not entry.local_required:
-            source.skip(entry.checkpoint_name, "non-local routed expert")
+            source.skip(
+                entry.checkpoint_name,
+                entry.skip_reason or "non-local routed expert",
+            )
             continue
         routed_experts = _get_routed_experts_for_layer(model, entry.layer_id)
         if routed_experts is None:

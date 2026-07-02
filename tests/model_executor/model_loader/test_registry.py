@@ -28,7 +28,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     execute_weight_plan,
 )
 from vllm.model_executor.models import llama, qwen3, qwen3_5, qwen3_moe, qwen3_next
-from vllm.model_executor.models.utils import WeightsMapper
+from vllm.model_executor.models.utils import PPMissingLayer, WeightsMapper
 
 
 @register_model_loader("custom_load_format")
@@ -1224,6 +1224,68 @@ def test_qwen_moe_source_plan_handles_nested_language_model_before_read():
     assert qwen3_5.load_qwen_moe_weights_from_source(model, source, plan) == set()
     assert source.reads == []
     assert source.skips == [(name, "non-local routed expert")]
+
+
+def test_qwen_moe_source_plan_rejects_missing_routed_experts():
+    name = "model.layers.0.mlp.experts.0.down_proj.weight"
+    catalog = TensorCatalog(
+        [TensorMeta("model.safetensors", name, torch.float32, [1], 0, 4)]
+    )
+
+    class FakeDenseMLP:
+        pass
+
+    class FakeLayer:
+        mlp = FakeDenseMLP()
+
+    class FakeInnerModel:
+        layers = [FakeLayer()]
+
+    class FakeModel:
+        model = FakeInnerModel()
+
+        def children(self):
+            return []
+
+    with pytest.raises(RuntimeError, match="has no experts module"):
+        qwen3_5.build_qwen_moe_weight_plan(FakeModel(), catalog)
+
+
+def test_qwen_moe_source_plan_skips_pp_missing_layer_before_read():
+    name = "model.layers.0.mlp.experts.0.down_proj.weight"
+    catalog = TensorCatalog(
+        [TensorMeta("model.safetensors", name, torch.float32, [1], 0, 4)]
+    )
+
+    class FakeInnerModel:
+        layers = [PPMissingLayer()]
+
+    class FakeModel:
+        model = FakeInnerModel()
+
+        def children(self):
+            return []
+
+    class FakeSource:
+        def __init__(self):
+            self.reads = []
+            self.skips = []
+
+        def read_full_cpu(self, name):
+            self.reads.append(name)
+            return torch.ones(1)
+
+        def skip(self, name, reason):
+            self.skips.append((name, reason))
+
+    model = FakeModel()
+    source = FakeSource()
+    plan = qwen3_5.build_qwen_moe_weight_plan(model, catalog)
+
+    assert [entry.local_required for entry in plan.routed_entries] == [False]
+    assert qwen3_5.load_qwen_moe_weights_from_source(model, source, plan) == set()
+    assert source.reads == []
+    assert source.skips == [(name, "pipeline-missing routed expert layer")]
 
 
 def test_uma_odirect_model_source_hook_requires_both_methods(tmp_path, monkeypatch):
