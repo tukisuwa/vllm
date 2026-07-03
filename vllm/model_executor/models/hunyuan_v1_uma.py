@@ -106,6 +106,7 @@ def _resolve_routed_experts_for_layer(
         return RoutedExpertsResolution(None, "pipeline-missing routed expert layer")
     mlp = getattr(layer, "mlp", None)
     routed_experts = getattr(mlp, "experts", None)
+    routed_experts = getattr(routed_experts, "routed_experts", routed_experts)
     if routed_experts is None or not hasattr(routed_experts, "weight_loader"):
         raise RuntimeError(
             "HunYuan UMA plan matched a routed expert tensor for "

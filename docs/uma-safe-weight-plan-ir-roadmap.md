@@ -1765,3 +1765,153 @@ This remains an executor scheduling optimization, not a new serialized plan
 primitive.  A grouped fused-source IR node is still reserved for a later stage
 only if real checkpoint smokes show amplification that cannot be removed by
 range scheduling alone.
+
+### 2026-07-04 Hunyuan-A13B-Instruct-GPTQ-Int4 real-checkpoint smoke
+
+The first real quantized routed-MoE checkpoint smoke passed on
+`--skip-tokenizer-init model_load` stop mode:
+
+```
+plan: 25634 entries, required 25634
+expected bytes read: 40.09 GiB
+actual bytes read:   40.09 GiB
+payload:             39.74 GiB
+amplification:       1.01x
+model load:          39.61 GiB, 20.46s
+local min available: 41.25 GiB
+local peak used + buff/cache: 80.94 GiB (used 78.38 GiB + buff/cache 2.56 GiB)
+swap: 0.00 GiB, memory PSI: 0.00/0.00, IO PSI: 22.41/22.16
+```
+
+Page cache grew only 0.08 GiB (2.48 -> 2.56 GiB) while reading 39.74 GiB of
+payload, confirming the O_DIRECT path does not amplify into page cache on this
+checkpoint. Two fixes came out of this run:
+
+- The generic loader wrapper's tokenizer preflight fails closed on this
+  checkpoint (`vocab_file=None`); weight-structure-only validation runs with
+  `--skip-tokenizer-init` instead of a tokenizer fix, since tokenizer wiring is
+  out of scope for this loader.
+- The GPTQ-quantized checkpoint wraps `layer.mlp.experts` in a MoE runner
+  module; the real `weight_loader` lives on `runner.routed_experts`, not the
+  runner itself. `hunyuan_v1_uma.py` now resolves through the runner wrapper.
+  Targeted `hunyuan_v1` tests: 3 passed.
+
+This closes a major real-checkpoint gap for quantized routed-MoE structure:
+GPTQ expert tensors (`qweight`/`qzeros`/`scales`/`g_idx`) are parsed, routed to
+the MARLIN WNA16 MoE backend, and loaded through the model WeightSource path
+with exact expected/actual byte accounting. It does **not** close the
+`read_segments` real-checkpoint gap: this checkpoint used full tensor reads
+(`full_reads=25634`, `read_into=0`) rather than segment reads. TeleChat2,
+Llama4 fused experts, and any real Hunyuan fused-QKV checkpoint still need
+their own segment-path smokes; OpenPangu remains a source-slice/stacked path
+smoke target rather than a `read_segments` target.
+
+### 2026-07-04 2node UMA O_DIRECT tensor streaming design
+
+Attempting a second node before the next checkpoint surfaced a structural gap:
+vLLM has no network-transfer weight loading path today, so a 2-node run of
+`uma_odirect_safetensors` can only reach the second rank's model path over NFS
+(`/data/shared`). That defeats the purpose of this loader. NFS-mounted reads on
+the non-owning rank go through the kernel page cache like any other filesystem
+read, so the safety property this whole IR exists to provide -- bounded,
+accounted, O_DIRECT reads that do not balloon into page cache -- is lost on
+every rank except whichever one happens to hold the local disk.
+
+This is the same problem the sibling `tukisuwa/llama.cpp` UMA O_DIRECT loader
+already solved for RPC nodes: see
+`docs/uma-odirect-loader.md` in that fork. The design there fixes payload
+ownership to the node with local disk access, reads with O_DIRECT only on that
+node, and streams tensor bytes to RPC peers instead of letting peers open the
+checkpoint file themselves. vLLM's 2-node case needs the same shape of fix.
+
+**Problem statement**
+
+- `ODirectSafetensorsWeightSource` assumes the safetensors files it opens are
+  on local disk with O_DIRECT support. On a second rank whose local disk does
+  not hold the checkpoint, the only path today is a shared/NFS mount, which
+  reintroduces page-cache amplification on that rank and defeats the memory
+  accounting this loader reports.
+- Metadata (safetensors headers, i.e. `TensorCatalog`) is small enough that
+  reading it over NFS or a shared mount is acceptable. Payload bytes are not.
+
+**Goals**
+
+- Exactly one rank per payload file ever opens that file for payload reads
+  (the "payload owner"). All other ranks that need tensors from that file
+  receive bytes over an explicit transport instead of opening the file.
+- `execute_weight_plan()` and the rest of the executor stay unchanged. Only the
+  `WeightSource` implementation differs between the owner rank and remote
+  ranks, matching the existing duck-typed surface (`catalog`, `read_full_cpu`,
+  `read_slice_cpu`, `read_into_cpu`, `read_segments_into_cpu`,
+  `read_segment_group_into_cpu`, `empty_cpu`/`empty_cpu_shape`, `skip`,
+  `set_expected_read_summary`, `stats_snapshot`).
+- Accounting and fail-closed gates extend across the two ranks instead of
+  being purely local: a remote rank that unexpectedly opens the payload file
+  should be treated as a fail-closed violation, not a silent fallback path.
+
+**Non-goals for the first design pass**
+
+- No GPU-to-GPU RDMA transport. This is a CPU-side host-memory streaming
+  design; GPU placement happens after `execute_weight_plan()` returns, as it
+  does today.
+- No attempt to unify the streaming transport with vLLM's NCCL process groups.
+  NCCL groups are built for collective GPU tensor ops after weights are
+  resident; this is a pre-placement, CPU-bytes, point-to-point transfer.
+- No change to vLLM's tensor-parallel/pipeline-parallel sharding semantics.
+  `WeightPlan` already knows which shard/expert each rank needs; this design
+  only changes how the owning rank's bytes reach a non-owning rank's staging
+  tensors.
+
+**Proposed shape**
+
+- `RemoteODirectSafetensorsWeightSource`: implements the same surface as
+  `ODirectSafetensorsWeightSource` but has no local file handles for payload
+  files. Read calls become requests sent to the payload-owner process; the
+  owner reads locally with the existing O_DIRECT path and streams the bytes
+  back.
+- Payload ownership assignment: for this fork's target topology (small, fixed
+  node count, checkpoint replicated or partitioned across known local disks),
+  ownership can start as static configuration (which rank owns which file
+  path) rather than a discovery protocol.
+- Metadata distribution: either every rank builds its own `TensorCatalog` from
+  a shared/NFS-visible header read (acceptable, KB-scale), or rank 0 builds it
+  once and broadcasts the serialized catalog. Keep this pluggable; it is not
+  the safety-critical path.
+- Transport candidates:
+  - A dedicated TCP stream server/client, mirroring the `llama.cpp` UMA
+    O_DIRECT RPC design. Easiest to reason about in isolation from vLLM's own
+    distributed init, easiest to fail closed on (refuse to serve anything but
+    declared payload ranges).
+  - `torch.distributed` with a Gloo subgroup for CPU-byte point-to-point
+    transfer, kept separate from the NCCL groups vLLM already uses for GPU
+    collectives. Reuses process-group bootstrap vLLM already has, but couples
+    the streaming path's lifecycle to `torch.distributed` init ordering and
+    needs care that it is not confused with NCCL-based paths.
+  - Both need an explicit allowlist/path-prefix/capability gate before serving
+    any read, matching the fail-closed posture the rest of this loader
+    follows.
+- Required accounting/safety fields (extending today's single-rank stats):
+  `local_direct_bytes_read`, `remote_stream_bytes_sent`,
+  `remote_stream_bytes_recv`, `remote_payload_loaded`,
+  `local_buff_cache_peak`, `remote_buff_cache_peak`, `local_memory_psi`,
+  `remote_memory_psi`. A remote rank opening the payload file directly should
+  be detectable and treated as a fail-closed error, not silently tolerated.
+
+**Open questions**
+
+- How does per-rank payload ownership interact with pipeline-parallel layer
+  distribution, where a rank's required layers may not align with which node
+  physically holds which checkpoint shard?
+- How does a remote-rank failure (transport drop, owner rank crash mid-stream)
+  propagate as a fail-closed abort to the rest of the run, rather than hanging?
+- Where does rank/ownership configuration live -- new `LoadConfig` fields,
+  environment variables, or a small topology file -- given this fork's
+  intentionally narrow deployment target?
+- Should the transport be introduced behind the same `ExecutorCapability`
+  mechanism already used to describe O_DIRECT alignment requirements, so a
+  future executor can query "can this source stream to a remote rank" the same
+  way it queries alignment needs today?
+
+Detailed `RemoteODirectSafetensorsWeightSource` design (message shapes, error
+handling, and phased implementation plan) is tracked separately in
+`docs/uma-safe-2node-remote-weight-source-design.md`.

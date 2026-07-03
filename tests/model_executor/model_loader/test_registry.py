@@ -8432,6 +8432,10 @@ def test_hunyuan_v1_source_plan_maps_fused_and_routed_names_before_read():
         def __init__(self, experts):
             self.experts = experts
 
+    class FakeMoeRunner:
+        def __init__(self, routed_experts):
+            self.routed_experts = routed_experts
+
     class FakeLayer:
         def __init__(self, experts):
             self.mlp = FakeMLP(experts)
@@ -8446,7 +8450,7 @@ def test_hunyuan_v1_source_plan_maps_fused_and_routed_names_before_read():
         def __init__(self):
             super().__init__()
             self.routed_experts = FakeRoutedExperts()
-            self.model = FakeInnerModel(self.routed_experts)
+            self.model = FakeInnerModel(FakeMoeRunner(self.routed_experts))
 
         def children(self):
             return []
