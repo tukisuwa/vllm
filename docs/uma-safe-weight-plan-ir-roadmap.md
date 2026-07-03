@@ -1357,3 +1357,22 @@ RoutedProjectionMap((
 
 This leaves dense-layer rejection in AFMoE and mapper replay in Nemotron-H as
 family policy while removing the repeated checkpoint-token parser from both.
+
+### 2026-07-03 Phase 3 stage 1e: mapper and skip-wrapper patterns
+
+`lfm2_moe_uma.py`, `kimi_linear_uma.py`, and `hy_v3_uma.py` now use
+`RoutedExpertPattern` as well:
+
+- LFM2 uses `feed_forward.experts` with `w1`/`w2`/`w3`, plus its existing
+  name transform and mapper;
+- Kimi Linear uses `block_sparse_moe.experts` with `w1`/`w2`/`w3`, plus its
+  speculative-layer skip predicate;
+- HYV3 uses `mlp.experts` with the standard gate/up/down projection map, while
+  retaining its wrapper that suppresses routed parsing for names skipped by
+  the family skip predicate.
+
+At this point the first-pass routed parser primitive covers the standard MoE
+families that only need tokenized path matching plus projection-map data.  The
+remaining handwritten parsers mostly involve name rewrites, fused/shared
+expert entries, or source-slice rules and should move after those primitives
+are explicit.

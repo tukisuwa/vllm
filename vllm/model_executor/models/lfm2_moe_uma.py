@@ -15,8 +15,11 @@ from vllm.model_executor.model_loader.weight_plan import (
 )
 
 from .routed_moe_uma import (
+    RoutedExpertPattern,
     RoutedExpertsResolution,
     RoutedMoeEntry,
+    RoutedProjectionMap,
+    RoutedProjectionRule,
     build_routed_moe_weight_plan,
     load_routed_moe_weights_from_source,
 )
@@ -25,6 +28,18 @@ from .utils import PPMissingLayer, WeightsMapper
 
 Lfm2MoeRoutedEntry = RoutedMoeEntry
 Lfm2MoeSourcePlan = WeightPlan
+
+_LFM2_ROUTED_EXPERT_PATTERN = RoutedExpertPattern(
+    module_path=("feed_forward", "experts"),
+    projections=("w1", "w2", "w3"),
+)
+_LFM2_ROUTED_PROJECTION_MAP = RoutedProjectionMap(
+    (
+        RoutedProjectionRule("w1", "w13", "w1"),
+        RoutedProjectionRule("w3", "w13", "w3"),
+        RoutedProjectionRule("w2", "w2", "w2"),
+    )
+)
 
 
 def _lfm2_moe_name_transform(name: str) -> tuple[str, None]:
@@ -43,43 +58,6 @@ def _lfm2_moe_weight_mapper(base_mapper: WeightsMapper) -> WeightsMapper:
             ".w3": (".w13", 1),
         }
     )
-
-
-def _parse_lfm2_routed_expert_name(
-    name: str,
-) -> tuple[int, int, str, str] | None:
-    parts = name.split(".")
-    for idx in range(len(parts) - 6):
-        if parts[idx] != "layers":
-            continue
-        if (
-            not parts[idx + 1].isdigit()
-            or parts[idx + 2] != "feed_forward"
-            or parts[idx + 3] != "experts"
-            or not parts[idx + 4].isdigit()
-        ):
-            continue
-        proj_name = parts[idx + 5]
-        if proj_name not in ("w1", "w2", "w3"):
-            continue
-        suffix = ".".join(parts[idx + 6 :])
-        if not suffix:
-            return None
-        return int(parts[idx + 1]), int(parts[idx + 4]), proj_name, suffix
-    return None
-
-
-def _routed_param_for_projection(
-    proj_name: str,
-    suffix: str,
-) -> tuple[str, str]:
-    if proj_name == "w1":
-        return f"w13_{suffix}", "w1"
-    if proj_name == "w3":
-        return f"w13_{suffix}", "w3"
-    if proj_name == "w2":
-        return f"w2_{suffix}", "w2"
-    raise ValueError(f"Unsupported LFM2 MoE expert projection {proj_name!r}")
 
 
 def _resolve_routed_experts_for_layer(
@@ -122,8 +100,8 @@ def build_lfm2_moe_weight_plan(
         model,
         catalog,
         family_name="LFM2 MoE",
-        parse_name=_parse_lfm2_routed_expert_name,
-        map_projection=_routed_param_for_projection,
+        parse_name=_LFM2_ROUTED_EXPERT_PATTERN.parse,
+        map_projection=_LFM2_ROUTED_PROJECTION_MAP.map,
         resolve_routed_experts=_resolve_routed_experts_for_layer,
         auto_skip_substr=".feed_forward.experts.",
         mapper=_lfm2_moe_weight_mapper(mapper),
