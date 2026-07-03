@@ -1688,7 +1688,10 @@ segment.  This protects Llama4-style per-row segment plans from millions of
 forced gate probes while preserving pre/post safety checks around the whole
 staging read.
 
+The O_DIRECT unit coverage now includes one real `_ODirectFile` test on
+filesystems that support it.  It verifies window-backed unaligned record reads
+and fail-closed short-read handling without faking `pread()`.
+
 Remaining lower-priority review items: possible fused-entry coalescing to
-reduce window-cache sweeps, shared gate/PSI helper cleanup, broader real
-O_DIRECT tests, and adding a real segment-family checkpoint to the smoke
-matrix.
+reduce window-cache sweeps, shared gate/PSI helper cleanup, and adding a real
+segment-family checkpoint to the smoke matrix.

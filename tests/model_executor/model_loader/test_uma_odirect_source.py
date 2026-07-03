@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the O_DIRECT source read-window handle cache."""
 
+import errno
+import os
 import types
 
+import pytest
 import torch
 
 from vllm.model_executor.model_loader import uma_odirect_safetensors_loader as L
@@ -165,3 +168,33 @@ def test_log_stats_warns_when_actual_reads_exceed_expected(caplog, monkeypatch):
 
     assert "actual read amplification exceeded" in caplog.text
     assert "threshold=1.10x" in caplog.text
+
+
+def test_real_odirect_file_reads_window_and_fails_closed_on_short_read(tmp_path):
+    if not hasattr(os, "O_DIRECT"):
+        pytest.skip("O_DIRECT is not available on this platform")
+
+    path = tmp_path / "weights.bin"
+    payload = bytes(range(256)) * 32
+    path.write_bytes(payload)
+    try:
+        odirect = L._ODirectFile(
+            str(path),
+            chunk_size=4096,
+            alignment=4096,
+            window_size=8192,
+        )
+    except OSError as exc:
+        if exc.errno in {errno.EINVAL, errno.EOPNOTSUPP}:
+            pytest.skip("test filesystem does not support O_DIRECT")
+        raise
+
+    try:
+        tensor = torch.empty(16, dtype=torch.uint8)
+        odirect.read_record_into_tensor(tensor, 13, 16)
+        assert bytes(tensor.tolist()) == payload[13:29]
+
+        with pytest.raises(EOFError, match="short read did not cover"):
+            odirect.read_record_into_tensor(torch.empty(16, dtype=torch.uint8), 8188, 16)
+    finally:
+        odirect.close()
