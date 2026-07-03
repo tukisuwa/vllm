@@ -178,6 +178,33 @@ def test_routed_expert_pattern_parses_standard_moe_names():
     with pytest.raises(ValueError, match="Unsupported routed expert projection"):
         projection_map.map("foo", "weight")
 
+    mixtral_pattern = RoutedExpertPattern(
+        module_path=("block_sparse_moe", "experts"),
+        projections=("w1", "w2", "w3"),
+    )
+    mixtral_projection_map = RoutedProjectionMap(
+        (
+            RoutedProjectionRule("w1", "w13", "w1"),
+            RoutedProjectionRule("w3", "w13", "w3"),
+            RoutedProjectionRule("w2", "w2", "w2"),
+        )
+    )
+    assert mixtral_pattern.parse(
+        "model.layers.2.block_sparse_moe.experts.5.w3.weight_scale"
+    ) == (2, 5, "w3", "weight_scale")
+    assert mixtral_pattern.parse(
+        "model.layers.2.block_sparse_moe.experts.5.w4.weight"
+    ) is None
+    assert mixtral_projection_map.map("w1", "weight") == ("w13_weight", "w1")
+
+    jamba_pattern = RoutedExpertPattern(
+        module_path=("feed_forward", "experts"),
+        projections=("gate_proj", "down_proj", "up_proj"),
+    )
+    assert jamba_pattern.parse(
+        "model.layers.1.feed_forward.experts.7.gate_proj.weight"
+    ) == (1, 7, "gate_proj", "weight")
+
 
 def _entry_local_required(entry):
     return entry.required

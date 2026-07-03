@@ -1280,3 +1280,40 @@ Phase 3 migration contract: replacing parser code with spec data must preserve
 the serialized `WeightPlan`.  This pattern should be reusable for Mixtral,
 Jamba, Laguna, Sarvam, Bailing, Ernie45, AFMoE, EXAONE, and Nemotron-H before
 moving on to families that need shape-derived `SliceRule`s.
+
+### 2026-07-03 Phase 3 stage 1b: standard routed expert patterns
+
+`mixtral_uma.py`, `jamba_uma.py`, and `laguna_uma.py` now use the same
+declarative primitive as Qwen instead of owning family-local parsers and
+projection mappers.
+
+Mixtral keeps its checkpoint spelling (`w1`/`w2`/`w3`) as data:
+
+```python
+RoutedExpertPattern(
+    module_path=("block_sparse_moe", "experts"),
+    projections=("w1", "w2", "w3"),
+)
+RoutedProjectionMap((
+    RoutedProjectionRule("w1", "w13", "w1"),
+    RoutedProjectionRule("w3", "w13", "w3"),
+    RoutedProjectionRule("w2", "w2", "w2"),
+))
+```
+
+Jamba differs only in the module path:
+
+```python
+RoutedExpertPattern(
+    module_path=("feed_forward", "experts"),
+    projections=("gate_proj", "down_proj", "up_proj"),
+)
+```
+
+Laguna uses the same `mlp.experts` pattern as Qwen, with family-specific layer
+resolution and skip behavior left in ordinary Python for now.
+
+The existing Mixtral, Jamba, and Laguna plan tests still exercise the actual
+plan paths, and the generic routed-pattern unit test now covers Qwen-style
+`mlp.experts`, Mixtral-style `block_sparse_moe.experts`, and Jamba-style
+`feed_forward.experts` names.
