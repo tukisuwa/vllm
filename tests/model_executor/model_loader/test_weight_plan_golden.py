@@ -84,21 +84,6 @@ def _plan_json(plan: WeightPlan):
     return [_entry_json(entry) for entry in plan.entries]
 
 
-def _fused_expert_entries_json(entries):
-    return [
-        {
-            "checkpoint_name": entry.checkpoint_name,
-            "layer_id": entry.layer_id,
-            "target_name": entry.target_name,
-            "shard_id": entry.shard_id,
-            "source_slices": _slices_json(entry.source_slices),
-            "expert_id": entry.expert_id,
-            "kind": entry.kind,
-        }
-        for entry in entries
-    ]
-
-
 def test_qwen3_moe_weight_plan_golden():
     names = [
         "model.layers.0.mlp.experts.0.gate_proj.weight",
@@ -399,13 +384,7 @@ def test_llama4_weight_plan_golden(monkeypatch):
 
     plan = llama4_uma.build_llama4_weight_plan(FakeOuter(), catalog)
 
-    assert {
-        "weight_plan": _plan_json(plan.weight_plan),
-        "fused_expert_entries": _fused_expert_entries_json(
-            plan.fused_expert_entries
-        ),
-    } == {
-        "weight_plan": [
+    assert _plan_json(plan) == [
             {
                 "checkpoint_name": q_name,
                 "target_name": "model.layers.0.self_attn.qkv_proj.weight",
@@ -429,25 +408,60 @@ def test_llama4_weight_plan_golden(monkeypatch):
                 "weight_name": "w2_weight",
                 "skip_reason": "non-local routed expert",
             },
-        ],
-        "fused_expert_entries": [
             {
                 "checkpoint_name": fused_gate_up,
-                "layer_id": 0,
                 "target_name": "model.layers.0.feed_forward.experts.w13_weight",
+                "read_segments": [
+                    {
+                        "source_slices": [1, 0, [0, 3, None]],
+                        "target_slices": [0, 0, [0, 3, None]],
+                    },
+                    {
+                        "source_slices": [1, 1, [0, 3, None]],
+                        "target_slices": [0, 1, [0, 3, None]],
+                    },
+                    {
+                        "source_slices": [2, 0, [0, 3, None]],
+                        "target_slices": [1, 0, [0, 3, None]],
+                    },
+                    {
+                        "source_slices": [2, 1, [0, 3, None]],
+                        "target_slices": [1, 1, [0, 3, None]],
+                    },
+                ],
+                "staging_shape": [2, 2, 3],
+                "transform_ops": [{"op": "transpose_last_two", "args": []}],
+                "read_into_cpu": True,
                 "shard_id": "w1",
-                "source_slices": [[1, 3, None], [None, None, None], [None, None, None]],
                 "expert_id": 1,
-                "kind": "gate_up",
+                "weight_name": "model.layers.0.feed_forward.experts.w13_weight",
             },
             {
                 "checkpoint_name": fused_gate_up,
-                "layer_id": 0,
                 "target_name": "model.layers.0.feed_forward.experts.w13_weight",
+                "read_segments": [
+                    {
+                        "source_slices": [1, 0, [3, 6, None]],
+                        "target_slices": [0, 0, [0, 3, None]],
+                    },
+                    {
+                        "source_slices": [1, 1, [3, 6, None]],
+                        "target_slices": [0, 1, [0, 3, None]],
+                    },
+                    {
+                        "source_slices": [2, 0, [3, 6, None]],
+                        "target_slices": [1, 0, [0, 3, None]],
+                    },
+                    {
+                        "source_slices": [2, 1, [3, 6, None]],
+                        "target_slices": [1, 1, [0, 3, None]],
+                    },
+                ],
+                "staging_shape": [2, 2, 3],
+                "transform_ops": [{"op": "transpose_last_two", "args": []}],
+                "read_into_cpu": True,
                 "shard_id": "w3",
-                "source_slices": [[1, 3, None], [None, None, None], [None, None, None]],
                 "expert_id": 1,
-                "kind": "gate_up",
+                "weight_name": "model.layers.0.feed_forward.experts.w13_weight",
             },
-        ],
-    }
+        ]

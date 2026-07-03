@@ -1575,3 +1575,22 @@ back to the original name; if a shared expert target exists as a normal model
 parameter, the shared-expert fallback entries are not emitted.  This follows
 the same shape as GLM4's rocm_aiter gate: conditions stay in Python, while the
 resulting plan remains concrete data.
+
+### 2026-07-03 Phase 3 stage 2g: Llama4 fused experts folded into WeightPlan
+
+Llama4's remaining composite side path is now ordinary IR data.  The
+`Llama4FusedExpertEntry` wrapper and custom dispatch loop are gone;
+`Llama4SourcePlan` is a plain `WeightPlan`, and
+`load_llama4_weights_from_source()` delegates directly to
+`execute_weight_plan()`.
+
+The fused `gate_up_proj` checkpoint tensor emits two segmented
+`WeightPlanEntry` records, one for `w1` and one for `w3`.  Each entry reads
+only its half of the last dimension into an explicit staging tensor via
+`WeightPlanReadSegment`, so the reads stay visible to plan summary and
+scheduler accounting.  The fused `down_proj` tensor uses the same ordinary
+entry machinery with a local expert slice.  The old tensor transpose in the
+custom loader is represented by a serializable `TransformOp("transpose_last_two")`.
+
+With HunYuan, DeepSeek, and Llama4 covered, the known fused/composite routed
+paths no longer require non-`WeightPlan` execution contracts.

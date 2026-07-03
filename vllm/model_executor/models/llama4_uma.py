@@ -2,29 +2,33 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """UMA-safe WeightSource helpers for Llama4 models."""
 
-from dataclasses import dataclass
 from typing import Any
 
-import torch
 from torch import nn
 
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
-    _call_weight_loader,
     execute_weight_plan,
-    _resolve_attr,
 )
 from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
     TransformOp,
     WeightPlan,
+    WeightPlanEntry,
+    WeightPlanReadSegment,
 )
-from vllm.model_executor.models.utils import WeightsMapper
 
 from .llama4 import Llama4MoE
 from .routed_moe_uma import (
+    RoutedExpertPattern,
     RoutedExpertsResolution,
     RoutedMoeEntry,
+    RoutedProjectionMap,
+    RoutedProjectionRule,
+    SliceRule,
+    SliceRuleEntry,
+    StackedProjectionMap,
+    StackedProjectionRule,
     build_routed_moe_weight_plan,
 )
 from .utils import PPMissingLayer
@@ -32,34 +36,28 @@ from .utils import PPMissingLayer
 
 Llama4RoutedEntry = RoutedMoeEntry
 
+Llama4SourcePlan = WeightPlan
 
-@dataclass(frozen=True)
-class Llama4FusedExpertEntry:
-    checkpoint_name: str
-    layer_id: int
-    target_name: str
-    shard_id: str
-    source_slices: tuple[slice | int, ...] | None
-    expert_id: int
-    kind: str
-
-
-@dataclass(frozen=True)
-class Llama4SourcePlan:
-    weight_plan: WeightPlan
-    fused_expert_entries: tuple[Llama4FusedExpertEntry, ...]
-
-
-def _llama4_weight_mapper() -> WeightsMapper:
-    return WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        }
+_LLAMA4_STACKED_PROJECTIONS = StackedProjectionMap(
+    (
+        StackedProjectionRule(".q_proj", ".qkv_proj", "q"),
+        StackedProjectionRule(".k_proj", ".qkv_proj", "k"),
+        StackedProjectionRule(".v_proj", ".qkv_proj", "v"),
+        StackedProjectionRule(".gate_proj", ".gate_up_proj", 0),
+        StackedProjectionRule(".up_proj", ".gate_up_proj", 1),
     )
+)
+_LLAMA4_ROUTED_EXPERT_PATTERN = RoutedExpertPattern(
+    module_path=("feed_forward", "experts"),
+    projections=("gate_proj", "down_proj", "up_proj"),
+)
+_LLAMA4_ROUTED_PROJECTION_MAP = RoutedProjectionMap(
+    (
+        RoutedProjectionRule("gate_proj", "w13", "w1"),
+        RoutedProjectionRule("up_proj", "w13", "w3"),
+        RoutedProjectionRule("down_proj", "w2", "w2"),
+    )
+)
 
 
 def _llama4_name_transform(
@@ -86,38 +84,7 @@ def _llama4_name_transform(
 def _parse_llama4_routed_expert_name(
     name: str,
 ) -> tuple[int, int, str, str] | None:
-    parts = name.split(".")
-    for idx in range(len(parts) - 6):
-        if parts[idx] != "layers":
-            continue
-        if (
-            not parts[idx + 1].isdigit()
-            or parts[idx + 2] != "feed_forward"
-            or parts[idx + 3] != "experts"
-            or not parts[idx + 4].isdigit()
-        ):
-            continue
-        proj_name = parts[idx + 5]
-        if proj_name not in ("gate_proj", "down_proj", "up_proj"):
-            continue
-        suffix = ".".join(parts[idx + 6 :])
-        if not suffix:
-            return None
-        return int(parts[idx + 1]), int(parts[idx + 4]), proj_name, suffix
-    return None
-
-
-def _routed_param_for_projection(
-    proj_name: str,
-    suffix: str,
-) -> tuple[str, str]:
-    if proj_name == "gate_proj":
-        return f"w13_{suffix}", "w1"
-    if proj_name == "up_proj":
-        return f"w13_{suffix}", "w3"
-    if proj_name == "down_proj":
-        return f"w2_{suffix}", "w2"
-    raise ValueError(f"Unsupported Llama4 expert projection {proj_name!r}")
+    return _LLAMA4_ROUTED_EXPERT_PATTERN.parse(name)
 
 
 def _resolve_routed_experts_for_layer(
@@ -189,11 +156,62 @@ def _parse_fused_expert_name(name: str) -> tuple[int, str] | None:
     return None
 
 
+def _fused_expert_plan_entry(
+    *,
+    checkpoint_name: str,
+    target_name: str,
+    source_slices: tuple[slice | int, ...] | None = None,
+    read_segments: tuple[WeightPlanReadSegment, ...] | None = None,
+    staging_shape: tuple[int, ...] | None = None,
+    shard_id: str,
+    expert_id: int,
+) -> WeightPlanEntry:
+    return WeightPlanEntry(
+        checkpoint_name=checkpoint_name,
+        target_name=target_name,
+        source_slices=source_slices,
+        read_into_cpu=read_segments is not None,
+        read_segments=read_segments,
+        staging_shape=staging_shape,
+        transform_ops=(TransformOp("transpose_last_two"),),
+        shard_id=shard_id,
+        expert_id=expert_id,
+        weight_name=target_name,
+    )
+
+
+def _llama4_gate_up_segments(
+    *,
+    expert_axis: slice,
+    record_shape: list[int],
+    start: int,
+    stop: int,
+) -> tuple[tuple[WeightPlanReadSegment, ...], tuple[int, ...]]:
+    expert_start, expert_stop, expert_step = expert_axis.indices(record_shape[0])
+    if expert_step != 1:
+        raise RuntimeError("Llama4 fused expert slices must be contiguous")
+    expert_count = expert_stop - expert_start
+    if expert_count <= 0:
+        raise RuntimeError("Llama4 fused expert slice is empty")
+    middle = record_shape[1]
+    width = stop - start
+    segments: list[WeightPlanReadSegment] = []
+    for expert_offset, expert_idx in enumerate(range(expert_start, expert_stop)):
+        for middle_idx in range(middle):
+            segments.append(
+                WeightPlanReadSegment(
+                    (expert_idx, middle_idx, slice(start, stop)),
+                    (expert_offset, middle_idx, slice(0, width)),
+                )
+            )
+    return tuple(segments), (expert_count, middle, width)
+
+
 def _collect_fused_expert_entries(
     model: nn.Module,
     catalog: TensorCatalog,
-) -> tuple[list[Llama4FusedExpertEntry], set[str]]:
-    entries: list[Llama4FusedExpertEntry] = []
+) -> tuple[list[WeightPlanEntry], set[str]]:
+    entries: list[WeightPlanEntry] = []
     names: set[str] = set()
     for checkpoint_name in catalog.names():
         parsed = _parse_fused_expert_name(checkpoint_name)
@@ -208,53 +226,78 @@ def _collect_fused_expert_entries(
             )
         expert_slices, expert_id = _local_expert_slice(routed_experts)
         record = catalog.get(checkpoint_name)
-        tail = (slice(None),) * (len(record.shape) - 1)
-        source_slices = None
-        if expert_slices is not None:
-            source_slices = (*expert_slices, *tail)
-        if proj_name == "gate_up_proj":
-            entries.extend(
-                [
-                    Llama4FusedExpertEntry(
-                        checkpoint_name=checkpoint_name,
-                        layer_id=layer_id,
-                        target_name=checkpoint_name.replace(
-                            ".experts.gate_up_proj.",
-                            ".experts.w13_",
-                        ),
-                        shard_id="w1",
-                        source_slices=source_slices,
-                        expert_id=expert_id,
-                        kind="gate_up",
-                    ),
-                    Llama4FusedExpertEntry(
-                        checkpoint_name=checkpoint_name,
-                        layer_id=layer_id,
-                        target_name=checkpoint_name.replace(
-                            ".experts.gate_up_proj.",
-                            ".experts.w13_",
-                        ),
-                        shard_id="w3",
-                        source_slices=source_slices,
-                        expert_id=expert_id,
-                        kind="gate_up",
-                    ),
-                ]
+        if len(record.shape) != 3:
+            raise RuntimeError(
+                "Llama4 UMA fused expert tensors must be 3D: "
+                f"{checkpoint_name} shape={record.shape}"
             )
-        else:
-            entries.append(
-                Llama4FusedExpertEntry(
-                    checkpoint_name=checkpoint_name,
-                    layer_id=layer_id,
-                    target_name=checkpoint_name.replace(
-                        ".experts.down_proj.",
-                        ".experts.w2_",
-                    ),
-                    shard_id="w2",
-                    source_slices=source_slices,
-                    expert_id=expert_id,
-                    kind="down",
+        expert_axis = expert_slices[0] if expert_slices is not None else slice(None)
+        if proj_name == "gate_up_proj":
+            if record.shape[-1] % 2 != 0:
+                raise RuntimeError(
+                    "Llama4 UMA fused gate_up tensor last dimension must be even: "
+                    f"{checkpoint_name} shape={record.shape}"
                 )
+            half = record.shape[-1] // 2
+            target_name = checkpoint_name.replace(
+                ".experts.gate_up_proj.",
+                ".experts.w13_",
+            )
+            for shard_id, start, stop in (
+                ("w1", 0, half),
+                ("w3", half, record.shape[-1]),
+            ):
+                segments, staging_shape = _llama4_gate_up_segments(
+                    expert_axis=expert_axis,
+                    record_shape=record.shape,
+                    start=start,
+                    stop=stop,
+                )
+                entries.extend(
+                    _fused_expert_plan_entry(
+                        checkpoint_name=checkpoint_name,
+                        target_name=target_name,
+                        source_slices=entry.source_slices,
+                        read_segments=entry.read_segments,
+                        staging_shape=entry.staging_shape,
+                        shard_id=entry.shard_id,
+                        expert_id=expert_id,
+                    )
+                    for entry in SliceRule(
+                        checkpoint_name,
+                        (
+                            SliceRuleEntry(
+                                target_name,
+                                read_segments=segments,
+                                staging_shape=staging_shape,
+                                shard_id=shard_id,
+                            ),
+                        ),
+                    ).to_weight_plan_entries()
+                )
+        else:
+            target_name = checkpoint_name.replace(
+                ".experts.down_proj.",
+                ".experts.w2_",
+            )
+            entries.extend(
+                _fused_expert_plan_entry(
+                    checkpoint_name=checkpoint_name,
+                    target_name=target_name,
+                    source_slices=entry.source_slices,
+                    shard_id=entry.shard_id,
+                    expert_id=expert_id,
+                )
+                for entry in SliceRule(
+                    checkpoint_name,
+                    (
+                        SliceRuleEntry(
+                            target_name,
+                            (expert_axis, slice(None), slice(None)),
+                            "w2",
+                        ),
+                    ),
+                ).to_weight_plan_entries()
             )
         names.add(checkpoint_name)
     return entries, names
@@ -270,10 +313,10 @@ def build_llama4_weight_plan(
         catalog,
         family_name="Llama4",
         parse_name=_parse_llama4_routed_expert_name,
-        map_projection=_routed_param_for_projection,
+        map_projection=_LLAMA4_ROUTED_PROJECTION_MAP.map,
         resolve_routed_experts=_resolve_routed_experts_for_layer,
         auto_skip_substr=".feed_forward.experts.",
-        mapper=_llama4_weight_mapper(),
+        mapper=_LLAMA4_STACKED_PROJECTIONS.as_weights_mapper(),
         name_transform=lambda name: _llama4_name_transform(model, catalog, name),
         skip_prefixes=(["lm_head."] if model.config.tie_word_embeddings else None),
         skip_predicate=lambda name: name in fused_names,
@@ -283,70 +326,7 @@ def build_llama4_weight_plan(
         for entry in weight_plan.entries
         if entry.checkpoint_name not in fused_names
     ]
-    return Llama4SourcePlan(
-        weight_plan=WeightPlan(tuple(entries)),
-        fused_expert_entries=tuple(fused_entries),
-    )
-
-
-def _read_fused_expert_tensor(
-    source: ODirectSafetensorsWeightSource,
-    entry: Llama4FusedExpertEntry,
-) -> torch.Tensor:
-    if entry.source_slices is None:
-        return source.read_full_cpu(entry.checkpoint_name)
-    return source.read_slice_cpu(entry.checkpoint_name, entry.source_slices)
-
-
-def _dispatch_fused_expert_entry(
-    model: nn.Module,
-    entry: Llama4FusedExpertEntry,
-    loaded_tensor: torch.Tensor,
-) -> str:
-    param = _resolve_attr(model, entry.target_name)
-    weight_loader = getattr(param, "weight_loader", None)
-    if not callable(weight_loader):
-        raise RuntimeError(
-            f"Llama4 UMA fused expert target {entry.target_name!r} "
-            "has no weight_loader"
-        )
-    tensor = loaded_tensor
-    if tensor.ndim == 3:
-        tensor = tensor.transpose(-1, -2)
-        if entry.kind == "gate_up":
-            shard_idx = 0 if entry.shard_id == "w1" else 1
-            tensor = tensor.chunk(2, dim=-2)[shard_idx]
-    _call_weight_loader(
-        weight_loader,
-        param,
-        tensor,
-        source_is_sharded=False,
-        kwargs={
-            "weight_name": entry.target_name,
-            "shard_id": entry.shard_id,
-            "expert_id": entry.expert_id,
-        },
-        entry_name=entry.checkpoint_name,
-    )
-    return entry.target_name
-
-
-def _load_fused_expert_entries(
-    model: nn.Module,
-    source: ODirectSafetensorsWeightSource,
-    entries: tuple[Llama4FusedExpertEntry, ...],
-) -> set[str]:
-    loaded: set[str] = set()
-    last_key: tuple[str, str] | None = None
-    last_tensor: torch.Tensor | None = None
-    for entry in entries:
-        key = (entry.checkpoint_name, repr(entry.source_slices))
-        if key != last_key:
-            last_tensor = _read_fused_expert_tensor(source, entry)
-            last_key = key
-        assert last_tensor is not None
-        loaded.add(_dispatch_fused_expert_entry(model, entry, last_tensor))
-    return loaded
+    return WeightPlan(tuple(entries) + tuple(fused_entries))
 
 
 def load_llama4_weights_from_source(
@@ -354,6 +334,4 @@ def load_llama4_weights_from_source(
     source: ODirectSafetensorsWeightSource,
     plan: Llama4SourcePlan,
 ) -> set[str]:
-    loaded = execute_weight_plan(model, source, plan.weight_plan)
-    loaded.update(_load_fused_expert_entries(model, source, plan.fused_expert_entries))
-    return loaded
+    return execute_weight_plan(model, source, plan)

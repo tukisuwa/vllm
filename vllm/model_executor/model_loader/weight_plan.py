@@ -366,6 +366,12 @@ def _transform_patch_embedding_reshape(
     return tensor.permute(0, 3, 1, 2).contiguous()
 
 
+def _transform_transpose_last_two(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.ndim < 2:
+        return tensor
+    return tensor.transpose(-1, -2)
+
+
 register_weight_transform("zero_mean", _transform_zero_mean, extra_staging_factor=1.0)
 register_weight_transform("squeeze", _transform_squeeze, extra_staging_factor=0.0)
 register_weight_transform(
@@ -381,6 +387,9 @@ register_weight_transform(
     "patch_embedding_reshape",
     _transform_patch_embedding_reshape,
     extra_staging_factor=1.0,
+)
+register_weight_transform(
+    "transpose_last_two", _transform_transpose_last_two, extra_staging_factor=0.0
 )
 
 

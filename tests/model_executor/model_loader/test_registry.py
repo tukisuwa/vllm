@@ -8629,22 +8629,44 @@ def test_llama4_source_plan_maps_dense_per_expert_and_fused_names(monkeypatch):
         tensor.view(2, 1, 2, 1).transpose(1, 2).reshape(4, 1),
     )
 
-    fused = plan.fused_expert_entries
+    fused = [
+        entry for entry in _routed_plan_entries(plan)
+        if entry.checkpoint_name == fused_gate_up
+    ]
     assert [(entry.target_name, entry.shard_id, entry.source_slices,
-             entry.expert_id) for entry in fused] == [
+             entry.expert_id, entry.transform_ops, entry.weight_name)
+            for entry in fused] == [
         (
             "model.layers.0.feed_forward.experts.w13_weight",
             "w1",
-            (slice(1, 3), slice(None), slice(None)),
+            None,
             1,
+            (TransformOp("transpose_last_two"),),
+            "model.layers.0.feed_forward.experts.w13_weight",
         ),
         (
             "model.layers.0.feed_forward.experts.w13_weight",
             "w3",
-            (slice(1, 3), slice(None), slice(None)),
+            None,
             1,
+            (TransformOp("transpose_last_two"),),
+            "model.layers.0.feed_forward.experts.w13_weight",
         ),
     ]
+    assert [entry.staging_shape for entry in fused] == [(2, 2, 3), (2, 2, 3)]
+    assert [entry.read_into_cpu for entry in fused] == [True, True]
+    assert fused[0].read_segments[0] == WeightPlanReadSegment(
+        (1, 0, slice(0, 3)),
+        (0, 0, slice(0, 3)),
+    )
+    assert fused[0].read_segments[-1] == WeightPlanReadSegment(
+        (2, 1, slice(0, 3)),
+        (1, 1, slice(0, 3)),
+    )
+    assert fused[1].read_segments[0] == WeightPlanReadSegment(
+        (1, 0, slice(3, 6)),
+        (0, 0, slice(0, 3)),
+    )
 
 
 def test_llama4_source_hook_loads_fused_expert_source_slices(monkeypatch):
@@ -8701,33 +8723,50 @@ def test_llama4_source_hook_loads_fused_expert_source_slices(monkeypatch):
         def __init__(self):
             self.catalog = catalog
             self.reads = []
+            self.data = torch.arange(48, dtype=torch.float32).reshape(4, 2, 6)
 
-        def read_slice_cpu(self, checkpoint_name, source_slices):
-            self.reads.append((checkpoint_name, source_slices))
-            return torch.arange(24, dtype=torch.float32).reshape(2, 2, 6)
+        def empty_cpu_shape(self, _checkpoint_name, shape):
+            return torch.empty(shape)
+
+        def read_into_cpu(self, checkpoint_name, dst, *, source_slices, target_slices):
+            self.reads.append((checkpoint_name, source_slices, target_slices))
+            dst[target_slices] = self.data[source_slices]
 
     model = FakeOuter()
     source = FakeSource()
-    plan = llama4_uma.Llama4SourcePlan(
-        weight_plan=WeightPlan(()),
-        fused_expert_entries=(
-            llama4_uma.Llama4FusedExpertEntry(
+    plan = WeightPlan(
+        (
+            WeightPlanEntry(
                 checkpoint_name=name,
-                layer_id=0,
                 target_name="model.layers.0.feed_forward.experts.w13_weight",
+                read_into_cpu=True,
+                read_segments=(
+                    WeightPlanReadSegment((1, 0, slice(0, 3)), (0, 0, slice(0, 3))),
+                    WeightPlanReadSegment((1, 1, slice(0, 3)), (0, 1, slice(0, 3))),
+                    WeightPlanReadSegment((2, 0, slice(0, 3)), (1, 0, slice(0, 3))),
+                    WeightPlanReadSegment((2, 1, slice(0, 3)), (1, 1, slice(0, 3))),
+                ),
+                staging_shape=(2, 2, 3),
+                transform_ops=(TransformOp("transpose_last_two"),),
                 shard_id="w1",
-                source_slices=(slice(1, 3), slice(None), slice(None)),
                 expert_id=1,
-                kind="gate_up",
+                weight_name="model.layers.0.feed_forward.experts.w13_weight",
             ),
-            llama4_uma.Llama4FusedExpertEntry(
+            WeightPlanEntry(
                 checkpoint_name=name,
-                layer_id=0,
                 target_name="model.layers.0.feed_forward.experts.w13_weight",
+                read_into_cpu=True,
+                read_segments=(
+                    WeightPlanReadSegment((1, 0, slice(3, 6)), (0, 0, slice(0, 3))),
+                    WeightPlanReadSegment((1, 1, slice(3, 6)), (0, 1, slice(0, 3))),
+                    WeightPlanReadSegment((2, 0, slice(3, 6)), (1, 0, slice(0, 3))),
+                    WeightPlanReadSegment((2, 1, slice(3, 6)), (1, 1, slice(0, 3))),
+                ),
+                staging_shape=(2, 2, 3),
+                transform_ops=(TransformOp("transpose_last_two"),),
                 shard_id="w3",
-                source_slices=(slice(1, 3), slice(None), slice(None)),
                 expert_id=1,
-                kind="gate_up",
+                weight_name="model.layers.0.feed_forward.experts.w13_weight",
             ),
         ),
     )
@@ -8737,7 +8776,17 @@ def test_llama4_source_hook_loads_fused_expert_source_slices(monkeypatch):
         source,
         plan,
     ) == {"model.layers.0.feed_forward.experts.w13_weight"}
-    _assert_same_reads(source.reads, [(name, (slice(1, 3), slice(None), slice(None)))])
+    assert len(source.reads) == 8
+    assert source.reads[0] == (
+        name,
+        (1, 0, slice(0, 3)),
+        (0, 0, slice(0, 3)),
+    )
+    assert source.reads[-1] == (
+        name,
+        (2, 1, slice(3, 6)),
+        (1, 1, slice(0, 3)),
+    )
     calls = model.routed_experts.w13_weight.calls
     assert [call[1] for call in calls] == ["w1", "w3"]
     assert [call[2] for call in calls] == [1, 1]
