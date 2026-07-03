@@ -1692,6 +1692,12 @@ The O_DIRECT unit coverage now includes one real `_ODirectFile` test on
 filesystems that support it.  It verifies window-backed unaligned record reads
 and fail-closed short-read handling without faking `pread()`.
 
+The shared memory/PSI gate is now factored into `_uma_memory_gate.py` and used
+by both `uma_safetensors` and `uma_odirect_safetensors`.  The loader-specific
+labels and error messages remain intact, while `/proc/meminfo`, memory PSI,
+swap-limit, and GiB formatting logic have a single implementation and unit
+coverage.
+
 Remaining lower-priority review items: possible fused-entry coalescing to
-reduce window-cache sweeps, shared gate/PSI helper cleanup, and adding a real
-segment-family checkpoint to the smoke matrix.
+reduce window-cache sweeps and adding a real segment-family checkpoint to the
+smoke matrix.

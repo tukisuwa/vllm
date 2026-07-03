@@ -17,6 +17,10 @@ from torch import nn
 from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader._uma_memory_gate import (
+    format_gib,
+    gate_uma_memory,
+)
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.weight_plan import (
     _DTYPE_NBYTES,
@@ -100,36 +104,8 @@ _LIBC.memmove.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
 _LIBC.memmove.restype = ctypes.c_void_p
 
 
-def _read_meminfo() -> dict[str, int]:
-    values: dict[str, int] = {}
-    with open("/proc/meminfo", encoding="utf-8") as f:
-        for line in f:
-            key, raw_value = line.split(":", 1)
-            parts = raw_value.strip().split()
-            if not parts:
-                continue
-            value = int(parts[0])
-            if len(parts) > 1 and parts[1] == "kB":
-                value *= 1024
-            values[key] = value
-    return values
-
-
-def _read_memory_psi_avg10() -> tuple[float, float]:
-    some_avg10 = 0.0
-    full_avg10 = 0.0
-    with open("/proc/pressure/memory", encoding="utf-8") as f:
-        for line in f:
-            fields = dict(field.split("=", 1) for field in line.split()[1:])
-            if line.startswith("some "):
-                some_avg10 = float(fields["avg10"])
-            elif line.startswith("full "):
-                full_avg10 = float(fields["avg10"])
-    return some_avg10, full_avg10
-
-
 def _format_gib(value: float) -> str:
-    return f"{value / 1024**3:.2f} GiB"
+    return format_gib(value)
 
 
 def _round_down(value: int, align: int) -> int:
@@ -1470,46 +1446,14 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
         return float(value)
 
     def _gate_memory(self, phase: str) -> None:
-        if sys.platform != "linux":
-            raise RuntimeError("uma_odirect_safetensors is Linux-only")
-
-        deadline = time.monotonic() + self._psi_gate_seconds
-        while True:
-            meminfo = _read_meminfo()
-            available = meminfo.get("MemAvailable", 0)
-            swap_used = meminfo.get("SwapTotal", 0) - meminfo.get("SwapFree", 0)
-            some_avg10, full_avg10 = _read_memory_psi_avg10()
-            min_available = self._min_available_gib * 1024**3
-            max_swap = self._max_swap_gib * 1024**3
-
-            if available < min_available:
-                raise RuntimeError(
-                    "uma_odirect_safetensors memory gate failed during "
-                    f"{phase}: MemAvailable {_format_gib(available)} < "
-                    f"{self._min_available_gib:.2f} GiB"
-                )
-            if swap_used > max_swap:
-                raise RuntimeError(
-                    "uma_odirect_safetensors swap gate failed during "
-                    f"{phase}: swap used {_format_gib(swap_used)} > "
-                    f"{self._max_swap_gib:.2f} GiB"
-                )
-            if some_avg10 == 0.0 and full_avg10 == 0.0:
-                return
-            if time.monotonic() >= deadline:
-                raise RuntimeError(
-                    "uma_odirect_safetensors PSI gate failed during "
-                    f"{phase}: memory PSI avg10 some={some_avg10:.2f}, "
-                    f"full={full_avg10:.2f}"
-                )
-            logger.warning(
-                "uma_odirect_safetensors waiting for memory PSI to clear "
-                "during %s: some=%.2f full=%.2f",
-                phase,
-                some_avg10,
-                full_avg10,
-            )
-            time.sleep(1.0)
+        gate_uma_memory(
+            loader_label="uma_odirect_safetensors",
+            phase=phase,
+            min_available_gib=self._min_available_gib,
+            psi_gate_seconds=self._psi_gate_seconds,
+            max_swap_gib=self._max_swap_gib,
+            logger=logger,
+        )
 
     def _prepare_files(self, model_name_or_path: str) -> list[str]:
         if not os.path.isdir(model_name_or_path):
