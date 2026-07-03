@@ -36,9 +36,6 @@ def _find_safetensors(model_dir: Path) -> list[str]:
     files = sorted(str(path) for path in model_dir.glob("*.safetensors"))
     if not files:
         raise SystemExit(f"No .safetensors files found in {model_dir}")
-    for path in files:
-        if os.path.islink(path):
-            raise SystemExit(f"Refusing symlinked weight file: {path}")
     return files
 
 

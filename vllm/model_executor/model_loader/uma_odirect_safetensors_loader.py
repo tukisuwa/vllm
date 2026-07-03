@@ -1490,11 +1490,6 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
             raise RuntimeError(
                 f"Cannot find any safetensors model weights in {model_name_or_path}"
             )
-        for path in files:
-            if os.path.islink(path):
-                raise RuntimeError(f"Refusing symlinked safetensors path: {path}")
-            if not os.path.isfile(path):
-                raise RuntimeError(f"Refusing non-file safetensors path: {path}")
         return files
 
     def _read_records(self, files: list[str]) -> list[_TensorRecord]:

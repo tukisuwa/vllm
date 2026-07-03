@@ -428,7 +428,18 @@ def test_uma_odirect_safetensors_rejects_symlink(tmp_path):
         LoadConfig(load_format="uma_odirect_safetensors")
     )
     with pytest.raises(RuntimeError, match="Refusing symlinked"):
-        loader._prepare_files(str(tmp_path))
+        loader._read_records(loader._prepare_files(str(tmp_path)))
+
+
+def test_tensor_catalog_rejects_non_file_safetensors_path(tmp_path):
+    path = tmp_path / "model.safetensors"
+    path.mkdir()
+
+    with pytest.raises(RuntimeError, match="Refusing non-file"):
+        TensorCatalog.from_safetensors_files(
+            [str(path)],
+            metadata_limit_bytes=1024 * 1024,
+        )
 
 
 @pytest.mark.parametrize(

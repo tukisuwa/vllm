@@ -235,12 +235,8 @@ Responsibilities:
 This started as a prototype inside `uma_odirect_safetensors_loader.py` and is
 now being extracted into neutral model-loader IR modules.
 
-Two known gaps in the current extraction:
+One known gap in the current extraction:
 
-- symlink rejection currently lives in the loader's `_prepare_files`, not in
-  `TensorCatalog.from_safetensors_files`; the catalog should own the check (or
-  take an explicit pre-validated-path contract) so its safety guarantees do
-  not depend on the caller;
 - the catalog rejects duplicate tensor names across all files.  That is
   correct for standard HF sharded checkpoints but wrong for pre-sharded
   per-rank checkpoints (`sharded_state`), where the same name legitimately
@@ -551,11 +547,14 @@ not report its loaded set.
 
 ### Safety validation split across layers
 
-The symlink rejection this document attributes to `TensorCatalog` actually
-lives in the loader's `_prepare_files`; the extracted
-`TensorCatalog.from_safetensors_files` does not perform it, so catalog safety
-currently depends on the caller.  Phase 1 moves the check (or an explicit
-validated-path contract) into the catalog.
+The symlink rejection this document attributes to `TensorCatalog` originally
+lived in the loader's `_prepare_files`; the extracted catalog therefore
+depended on caller discipline for one of its safety guarantees.
+
+Status: closed 2026-07-03.  `TensorCatalog.from_safetensors_files()` now
+rejects symlinked and non-file safetensors paths before metadata reads.  The
+O_DIRECT loader and metadata audit script only enumerate candidate files; path
+safety is centralized in the catalog.
 
 ## What This Means for the Current Branch
 
@@ -799,15 +798,13 @@ For this branch, the next useful work is, in priority order (items completed
 on 2026-07-03: the loaded-set completeness check, the routed-plan fold, moving
 TP slice inference into plan resolution, Phase 2.5 read-window reuse and read
 scheduling, build-side routed-plan unification, compatibility layer removal,
-and build-time routed target path derivation — see
+build-time routed target path derivation, named transform ops, golden plan
+snapshots, real-load smoke validation, and TensorCatalog path validation — see
 Implementation Notes):
 
-1. replace `transform` callables with named registry ops that declare their
-   staging factor;
-2. move symlink/path validation into `TensorCatalog` construction;
-3. begin `parse_name` spec-ification to stop further `*_uma.py` growth
+1. begin `parse_name` spec-ification to stop further `*_uma.py` growth
    (Phase 3);
-4. keep adding a short design note in each future model hook explaining which
+2. keep adding a short design note in each future model hook explaining which
    generic spec pattern it should eventually become.
 
 This lets the branch keep solving the immediate UMA safety problem while moving
@@ -1169,3 +1166,85 @@ target name, required/skipped state, slices, read segments, transform ops,
 routed metadata, loader target, and skip reason.  This is the safety net for
 Phase 3 parse-name spec migration: a declarative rewrite should either keep
 these snapshots byte-for-byte equivalent or produce a small, reviewable diff.
+
+### 2026-07-03 Mistral qscale shape and transform-track closeout
+
+A review of the transform op migration found one legacy semantic difference
+between Llama4 and Mistral: 1-D Mistral `qscale_weight` tensors used
+`_permute_mistral_weight(..., attn_out=1)` and returned a 2-D `(attn_in, 1)`
+tensor, while Llama4's rotary permutation squeezed 1-D scale tensors back to
+1-D.  The registry now exposes two explicit ops:
+
+- `qk_rope_permute(n_heads)` preserves the Llama4 1-D-in/1-D-out behavior;
+- `qk_rope_permute_2d(n_heads)` preserves the Mistral qscale 1-D-in/2-D-out
+  behavior.
+
+Mistral qscale entries use the 2-D op and are covered at three levels:
+generic transform unit tests, the Mistral registry test against the legacy
+method, and the Mistral golden snapshot.  `TensorCatalog.numel(name)` replaced
+the duplicated local `_tensor_numel` helpers, and Mistral's catalog argument is
+now required so qscale transform selection cannot silently skip shape checks.
+
+DGX Spark real-load smoke after stage 4, golden snapshots, and the Mistral
+qscale fix:
+
+```text
+Model                         Expected   Actual   Amplification  Load time
+tiny-random-qwen3.5 MoE        0.01 GiB  0.01 GiB         1.00x     0.41 s
+PrimeIntellect tiny MoE        1.25 GiB  1.25 GiB         1.00x     0.77 s
+Qwen3.6 35B NVFP4             22.86 GiB 22.86 GiB         1.05x    24.20 s
+```
+
+All three runs used the model WeightSource path, matched scheduled reads
+exactly, emitted no actual-vs-expected amplification warning, kept swap at 0,
+and kept memory PSI at 0.  The vLLM engine failed later during profile/JIT in
+the local host environment (`Python.h`/`ninja` unavailable), after model-load
+completion, so these runs validate the loader path but not end-to-end serving.
+
+### 2026-07-03 TensorCatalog path validation
+
+`TensorCatalog.from_safetensors_files()` now rejects symlinked and non-file
+`.safetensors` paths before reading metadata.  The O_DIRECT loader's
+`_prepare_files()` and the metadata audit script only enumerate candidates;
+the catalog owns the path safety guarantee together with metadata validation,
+duplicate-name checks, overlap checks, dtype checks, and byte-range checks.
+
+### 2026-07-03 Phase 3 parse-name spec investigation
+
+The current UMA hook layer has 25 `*_uma.py` files plus the shared
+`routed_moe_uma.py` helper, about 5k lines total.  The repeated structure is
+clear enough to introduce a declarative spec in stages, starting with standard
+routed MoE families and leaving fused/paired tensor cases as explicit
+extensions until the DSL proves itself.
+
+The proposed first-pass spec should cover these primitives:
+
+- `NameRewrite`: ordered literal replacements plus optional skip rules, e.g.
+  Param2MoE/OpenPangu/HunYuan checkpoint names and rotary-cache/MTP skips.
+- `StackedAlias`: existing mapper-style rules for q/k/v and gate/up stacking,
+  including shard IDs (`q`, `k`, `v`, `w1`, `w2`, `w3`).
+- `RoutedExpertPattern`: tokenized path pattern with bindings for
+  `layer_id`, `expert_id`, `projection`, and `suffix`, plus a projection map
+  to `(param_name, shard_id)`.
+- `LayerResolver`: declarative path from model root to layer list and routed
+  expert module, with PPMissingLayer skip behavior and fail-closed loader
+  presence checks.
+- `TransformRule`: checkpoint-name predicates plus `TransformOp` tuples, using
+  catalog shape predicates where needed.
+- `SliceRule`: metadata-derived source slices for fused qkv/gate-up/shared
+  expert tensors.  This should be a second layer on top of the simple routed
+  pattern because it needs catalog shapes, TP rank/size, or local expert maps.
+
+Families that should be migrated first:
+
+1. Qwen/Mixtral/Jamba/Laguna/Sarvam/Bailing/Ernie45/AFMoE/EXAONE/Nemotron-H:
+   standard routed expert pattern plus small name transform or transform op.
+2. MiMoV2/Param2MoE/OpenPangu/HunYuan: standard routed pattern plus stacked
+   aliases, skips, and one or two metadata-derived slice rules.
+3. DeepSeek/GLM4/Granite/Llama4: shared/fused expert sources and local expert
+   slicing; migrate after the simpler spec is covered by golden snapshots.
+
+Golden snapshots should be added or expanded before each family moves.  The
+first implementation target should be Qwen or Mixtral because their parser is
+almost pure `RoutedExpertPattern`; Mistral/Bagel already exercise transform
+ops but are not routed-pattern migrations.

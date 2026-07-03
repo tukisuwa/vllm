@@ -515,6 +515,10 @@ class TensorCatalog:
         records: list[TensorMeta] = []
         seen_names: dict[str, str] = {}
         for path in files:
+            if os.path.islink(path):
+                raise RuntimeError(f"Refusing symlinked safetensors path: {path}")
+            if not os.path.isfile(path):
+                raise RuntimeError(f"Refusing non-file safetensors path: {path}")
             file_size = os.path.getsize(path)
             with open(path, "rb", buffering=0) as f:
                 raw_size = f.read(8)
