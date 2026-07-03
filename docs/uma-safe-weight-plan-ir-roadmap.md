@@ -1722,3 +1722,24 @@ coverage.
 Remaining lower-priority review items: possible fused-entry coalescing to
 reduce window-cache sweeps and adding a real segment-family checkpoint to the
 smoke matrix.
+
+### 2026-07-04 truncated segment fixtures
+
+Before downloading full HunYuan/Llama4/TeleChat2 checkpoints, the segment byte
+boundaries are now covered by lightweight real-safetensors fixtures.  These
+tests write tiny safetensors files with the same tensor ranks and segment
+layout assumptions as the real families, then read them through the real
+`_ODirectFile` path instead of a fake source:
+
+- TeleChat2 interleaved `key_value.weight` splits into K and V staging tensors.
+- HunYuan interleaved fused QKV uses a `num_heads=4, num_kv_heads=2` fixture so
+  the Q/K/V reads cross multiple KV groups, not just one contiguous block.
+- Llama4 fused `gate_up_proj` reads the local expert slice into separate w1/w3
+  staging tensors.
+
+This is not a substitute for a real checkpoint smoke: it does not validate full
+model construction, quantization metadata, or end-to-end `weight_loader`
+contracts.  It does catch the highest-risk off-by-one and source/target slice
+boundary mistakes before spending time and RAM on multi-hundred-GB checkpoints.
+OpenPangu remains outside this specific segment fixture set because its current
+UMA path uses stacked/source-slice entries rather than `read_segments`.

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import errno
+import os
 
 import pytest
 import torch
@@ -322,6 +324,45 @@ class CustomModelLoader(BaseModelLoader):
 def _write_safetensors(path, metadata: dict, payload: bytes) -> None:
     metadata_raw = json.dumps(metadata).encode("utf-8")
     path.write_bytes(len(metadata_raw).to_bytes(8, "little") + metadata_raw + payload)
+
+
+def _write_single_tensor_safetensors(path, name: str, tensor: torch.Tensor) -> None:
+    payload = tensor.contiguous().numpy().tobytes()
+    metadata = {
+        name: {
+            "dtype": "F32",
+            "shape": list(tensor.shape),
+            "data_offsets": [0, len(payload)],
+        },
+    }
+    _write_safetensors(path, metadata, payload)
+
+
+def _real_odirect_source(tmp_path, monkeypatch, name: str, tensor: torch.Tensor):
+    if not hasattr(os, "O_DIRECT"):
+        pytest.skip("O_DIRECT is not available on this platform")
+    _write_single_tensor_safetensors(tmp_path / "model.safetensors", name, tensor)
+    loader = UmaODirectSafetensorsModelLoader(
+        LoadConfig(
+            load_format="uma_odirect_safetensors",
+            model_loader_extra_config={
+                "chunk_size": 4096,
+                "window_size": 4096,
+                "gate_interval_mib": 1,
+            },
+        )
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _phase: None)
+    return ODirectSafetensorsWeightSource(loader, str(tmp_path))
+
+
+def _read_segments_or_skip(source, name, dst, segments) -> None:
+    try:
+        source.read_segments_into_cpu(name, dst, segments)
+    except OSError as exc:
+        if exc.errno in {errno.EINVAL, errno.EOPNOTSUPP}:
+            pytest.skip("test filesystem does not support O_DIRECT")
+        raise
 
 
 def test_register_model_loader():
@@ -1848,6 +1889,31 @@ def test_uma_odirect_telechat2_plan_uses_segmented_key_value_reads():
         WeightPlanReadSegment((slice(6, 8), slice(None)), (slice(2, 4), slice(None))),
     )
     assert skipped_entries[0].checkpoint_name == "lm_head.weight"
+
+
+def test_uma_odirect_telechat2_segments_read_real_safetensors_bytes(
+    tmp_path, monkeypatch
+):
+    name = "transformer.h.0.self_attention.key_value.weight"
+    data = torch.arange(24, dtype=torch.float32).reshape(8, 3)
+    source = _real_odirect_source(tmp_path, monkeypatch, name, data)
+    plan = telechat2._telechat2_uma_weight_plan(
+        nn.Module(),
+        source.catalog,
+        mapper=telechat2.TeleChat2ForCausalLM.hf_to_vllm_mapper,
+        total_num_heads=2,
+        head_dim=2,
+    )
+    entries = [entry for entry in plan if entry.checkpoint_name == name]
+    k_entry, v_entry = entries
+
+    k = torch.empty(k_entry.staging_shape, dtype=torch.float32)
+    v = torch.empty(v_entry.staging_shape, dtype=torch.float32)
+    _read_segments_or_skip(source, name, k, k_entry.read_segments)
+    _read_segments_or_skip(source, name, v, v_entry.read_segments)
+
+    assert torch.equal(k, torch.cat((data[0:2], data[4:6]), dim=0))
+    assert torch.equal(v, torch.cat((data[2:4], data[6:8]), dim=0))
 
 
 def test_uma_odirect_execute_weight_plan_infers_output_tp_slice(
@@ -8558,6 +8624,47 @@ def test_hunyuan_v1_source_hook_loads_fused_qkv_segments():
     assert [tuple(call[1].shape) for call in calls] == [(4, 4), (2, 4), (2, 4)]
 
 
+def test_hunyuan_v1_fused_qkv_segments_read_real_safetensors_bytes(
+    tmp_path, monkeypatch
+):
+    name = "model.layers.0.self_attn.qkv_proj.weight"
+    data = torch.arange(24, dtype=torch.float32).reshape(8, 3)
+    source = _real_odirect_source(tmp_path, monkeypatch, name, data)
+
+    class FakeConfig:
+        num_attention_heads = 4
+        num_key_value_heads = 2
+        head_dim = 1
+        hidden_size = 4
+        tie_word_embeddings = False
+        num_experts = 1
+
+    class FakeOuter(nn.Module):
+        config = FakeConfig()
+
+        def children(self):
+            return []
+
+    plan = hunyuan_v1_uma.build_hunyuan_v1_weight_plan(FakeOuter(), source.catalog)
+    entries = [
+        entry
+        for entry in plan.weight_plan.entries
+        if entry.checkpoint_name == name
+    ]
+    q_entry, k_entry, v_entry = entries
+
+    q = torch.empty(q_entry.staging_shape, dtype=torch.float32)
+    k = torch.empty(k_entry.staging_shape, dtype=torch.float32)
+    v = torch.empty(v_entry.staging_shape, dtype=torch.float32)
+    _read_segments_or_skip(source, name, q, q_entry.read_segments)
+    _read_segments_or_skip(source, name, k, k_entry.read_segments)
+    _read_segments_or_skip(source, name, v, v_entry.read_segments)
+
+    assert torch.equal(q, torch.cat((data[0:2], data[4:6]), dim=0))
+    assert torch.equal(k, torch.cat((data[2:3], data[6:7]), dim=0))
+    assert torch.equal(v, torch.cat((data[3:4], data[7:8]), dim=0))
+
+
 def test_openpangu_source_plan_maps_dense_and_routed_names_before_read():
     local_name = "model.layers.0.mlp.experts.1.gate_proj.weight"
     remote_name = "model.layers.0.mlp.experts.2.down_proj.weight"
@@ -8939,6 +9046,34 @@ def test_llama4_source_hook_loads_fused_expert_source_slices(monkeypatch):
     assert [call[1] for call in calls] == ["w1", "w3"]
     assert [call[2] for call in calls] == [1, 1]
     assert [tuple(call[3].shape) for call in calls] == [(2, 3, 2), (2, 3, 2)]
+
+
+def test_llama4_fused_gate_up_segments_read_real_safetensors_bytes(
+    tmp_path, monkeypatch
+):
+    name = "model.layers.0.feed_forward.experts.gate_up_proj.weight"
+    data = torch.arange(48, dtype=torch.float32).reshape(4, 2, 6)
+    source = _real_odirect_source(tmp_path, monkeypatch, name, data)
+    w1_segments, w1_shape = llama4_uma._llama4_gate_up_segments(
+        expert_axis=slice(1, 3),
+        record_shape=list(data.shape),
+        start=0,
+        stop=3,
+    )
+    w3_segments, w3_shape = llama4_uma._llama4_gate_up_segments(
+        expert_axis=slice(1, 3),
+        record_shape=list(data.shape),
+        start=3,
+        stop=6,
+    )
+
+    w1 = torch.empty(w1_shape, dtype=torch.float32)
+    w3 = torch.empty(w3_shape, dtype=torch.float32)
+    _read_segments_or_skip(source, name, w1, w1_segments)
+    _read_segments_or_skip(source, name, w3, w3_segments)
+
+    assert torch.equal(w1, data[1:3, :, 0:3])
+    assert torch.equal(w3, data[1:3, :, 3:6])
 
 
 def test_qwen_moe_source_plan_handles_nested_language_model_before_read():
