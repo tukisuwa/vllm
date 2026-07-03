@@ -794,22 +794,25 @@ Working stance until an upstream RFC exists:
 
 ## Practical Next Steps
 
-For this branch, the next useful work is, in priority order (items completed
-on 2026-07-03: the loaded-set completeness check, the routed-plan fold, moving
-TP slice inference into plan resolution, Phase 2.5 read-window reuse and read
-scheduling, build-side routed-plan unification, compatibility layer removal,
-build-time routed target path derivation, named transform ops, golden plan
-snapshots, real-load smoke validation, and TensorCatalog path validation — see
-Implementation Notes):
+For this branch, Phase 3 is closed as of 2026-07-03.  The completed set now
+includes the loaded-set completeness check, the routed-plan fold, TP slice
+inference in plan resolution, Phase 2.5 read-window reuse and read scheduling,
+build-side routed-plan unification, compatibility layer removal, build-time
+routed target path derivation, named transform ops, golden plan snapshots,
+TensorCatalog path validation, Phase 3 declarative routed specs, composite
+routed side-path removal, and real-load smoke validation.
 
-1. begin `parse_name` spec-ification to stop further `*_uma.py` growth
-   (Phase 3);
-2. keep adding a short design note in each future model hook explaining which
-   generic spec pattern it should eventually become.
+The next useful work is, in priority order:
 
-This lets the branch keep solving the immediate UMA safety problem while moving
-toward a loader architecture that does not grow a new special-case path for
-every model and every load format.
+1. review and refine the upstream RFC draft in
+   `docs/uma-safe-weight-plan-upstream-rfc.md`;
+2. keep `read_segments` real-checkpoint validation as a TODO for TeleChat2,
+   HunYuan, or Llama4 when a suitable checkpoint is available;
+3. treat FlashInfer/CUDA JIT ready-start memory spikes as a separate runtime
+   track, not a loader-IR blocker.
+
+This lets the branch move from proving the UMA-safe loader architecture to
+preparing the neutral `WeightPlan` IR for upstream discussion.
 
 ## Implementation Notes
 
@@ -1639,3 +1642,16 @@ at 0.  The 35B run peaked at `39.95GiB` used+buff/cache with
 `82.53GiB` minimum local available RAM.  This validates the Phase 3 routed IR
 loader path for the existing smoke set, while leaving end-to-end `ready`
 blocked on the separate FlashInfer/CUDA JIT memory spike.
+
+### 2026-07-03 upstream RFC draft
+
+The upstream-facing RFC draft is now in
+`docs/uma-safe-weight-plan-upstream-rfc.md`.  It frames the work as a neutral
+`WeightPlan` IR proposal rather than an O_DIRECT-specific feature: motivation,
+IR shape, entry/segment/transform responsibilities, read-accounting validation,
+incremental adoption, compatibility, open questions, and a first PR sequence.
+
+Remaining validation note for the RFC: the standard three-model smoke does not
+exercise real `read_segments` checkpoint bytes.  TeleChat2, HunYuan, or Llama4
+should be added to the smoke matrix when a suitable checkpoint is available;
+registry and golden tests cover the segment shape in the meantime.
