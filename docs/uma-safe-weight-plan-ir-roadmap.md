@@ -1376,3 +1376,45 @@ families that only need tokenized path matching plus projection-map data.  The
 remaining handwritten parsers mostly involve name rewrites, fused/shared
 expert entries, or source-slice rules and should move after those primitives
 are explicit.
+
+### 2026-07-03 Phase 3 stage 2 design: three orthogonal deviation primitives
+
+A cross-family survey of the nine remaining handwritten parsers
+(Param2MoE, OpenPangu, HunYuan v1, GLM4 MoE, MiMo V2, MiniMax M2, LongCat,
+DeepSeek, Llama4) shows their deviations from `RoutedExpertPattern` decompose
+into three orthogonal axes. They should be modeled as three independent
+optional fields on a family spec — not one mega-primitive — so each is
+testable alone and explainable separately in the upstream RFC.
+
+| Axis | What it expresses | Families |
+| --- | --- | --- |
+| `NameRewrite` | literal substitutions applied before pattern matching (`.attention.` → `.self_attn.`, `gate_proj_bias` → `gate_proj.bias`, `model.` prefix) | Param2MoE, HunYuan, OpenPangu, MiniMax M2, DeepSeek |
+| `StackedProjection` | two source projections folded into one fused target param with a shard index (`gate_proj`/`up_proj` → `gate_up_proj` 0/1, `q_a_proj`/`kv_a_proj_with_mqa` → `fused_qkv_a_proj` 0/1) | GLM4, LongCat, OpenPangu, HunYuan, DeepSeek |
+| `SliceRule` | one checkpoint tensor fissioned into N entries with `source_slices` (fused qkv row split, `gate_and_up_proj` halves, MiMo attention-sink head slice) | Param2MoE, HunYuan, MiMo V2, (Llama4 `fused_expert_entries`) |
+
+Design decisions:
+
+- `NameRewrite` is an ordered tuple of `(old, new, count=1)` literal
+  substitutions — pure data, serializable. Substitution strings must be
+  anchored with surrounding dots (or an explicit prefix/suffix position) to
+  avoid mid-token matches; bare-token replacements are a spec violation.
+  Param2MoE's parser already calls its name transform before pattern
+  matching, proving rewrite→pattern composition works.
+- `StackedProjection` extends `RoutedProjectionMap` with a
+  `(fused_target, source_projection, shard_index)` table. It is the same
+  shape as upstream vLLM's `stacked_params_mapping`, so naming should mirror
+  it for RFC credibility. GLM4/DeepSeek gate shared-expert fusion on
+  `rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()`; that runtime
+  branch stays in the builder and selects between specs — plan output remains
+  concrete data either way.
+- `SliceRule` maps one source name to `[(target, shard_id, slices)]` where
+  slice boundaries come from config-derived sizes (q_split/kv_split/half)
+  resolved to concrete values at build time. Plans are built per-rank, so
+  MiMo's TP-dependent head slicing fits the same shape. Golden-plan tests pin
+  the concrete values.
+
+Migration order: (1) `NameRewrite` — cheapest, immediately unblocks Param2MoE
+and MiniMax M2 with the existing pattern; (2) `StackedProjection` — highest
+leverage (five families) and the strongest upstream-RFC story; (3)
+`SliceRule` — hardest, config-dependent; (4) fold Llama4's
+`fused_expert_entries` composite last, once slices are declarative.
