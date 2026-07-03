@@ -1335,3 +1335,25 @@ This is the intended granularity for the first declarative pass: parser and
 projection-map boilerplate become data, while transform, skip, mapper, and
 layer-resolution policy stay as explicit Python until their own spec
 primitives are introduced.
+
+### 2026-07-03 Phase 3 stage 1d: mapper-backed standard patterns
+
+`afmoe_uma.py`, `exaone_moe_uma.py`, and `nemotron_h_uma.py` have joined the
+same declarative parser/projection-map path.  AFMoE and EXAONE use the
+standard `mlp.experts` + `gate_proj`/`up_proj`/`down_proj` pattern while
+keeping their mapper and skip options outside the primitive.  Nemotron-H uses
+the same parser with a different module path and a two-projection map:
+
+```python
+RoutedExpertPattern(
+    module_path=("mixer", "experts"),
+    projections=("up_proj", "down_proj"),
+)
+RoutedProjectionMap((
+    RoutedProjectionRule("up_proj", "w13", "w1"),
+    RoutedProjectionRule("down_proj", "w2", "w2"),
+))
+```
+
+This leaves dense-layer rejection in AFMoE and mapper replay in Nemotron-H as
+family policy while removing the repeated checkpoint-token parser from both.

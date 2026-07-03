@@ -15,8 +15,11 @@ from vllm.model_executor.model_loader.weight_plan import (
 )
 
 from .routed_moe_uma import (
+    RoutedExpertPattern,
     RoutedExpertsResolution,
     RoutedMoeEntry,
+    RoutedProjectionMap,
+    RoutedProjectionRule,
     build_routed_moe_weight_plan,
     load_routed_moe_weights_from_source,
 )
@@ -27,36 +30,16 @@ NemotronHMoeRoutedEntry = RoutedMoeEntry
 NemotronHMoeSourcePlan = WeightPlan
 
 
-def _parse_nemotron_h_routed_expert_name(
-    name: str,
-) -> tuple[int, int, str, str] | None:
-    parts = name.split(".")
-    for idx in range(len(parts) - 6):
-        if parts[idx] != "layers":
-            continue
-        if (
-            not parts[idx + 1].isdigit()
-            or parts[idx + 2] != "mixer"
-            or parts[idx + 3] != "experts"
-            or not parts[idx + 4].isdigit()
-        ):
-            continue
-        proj_name = parts[idx + 5]
-        if proj_name not in ("up_proj", "down_proj"):
-            continue
-        suffix = ".".join(parts[idx + 6 :])
-        if not suffix:
-            return None
-        return int(parts[idx + 1]), int(parts[idx + 4]), proj_name, suffix
-    return None
-
-
-def _routed_param_for_projection(proj_name: str, suffix: str) -> tuple[str, str]:
-    if proj_name == "up_proj":
-        return f"w13_{suffix}", "w1"
-    if proj_name == "down_proj":
-        return f"w2_{suffix}", "w2"
-    raise ValueError(f"Unsupported Nemotron-H MoE projection {proj_name!r}")
+_NEMOTRON_H_ROUTED_EXPERT_PATTERN = RoutedExpertPattern(
+    module_path=("mixer", "experts"),
+    projections=("up_proj", "down_proj"),
+)
+_NEMOTRON_H_ROUTED_PROJECTION_MAP = RoutedProjectionMap(
+    (
+        RoutedProjectionRule("up_proj", "w13", "w1"),
+        RoutedProjectionRule("down_proj", "w2", "w2"),
+    )
+)
 
 
 def _resolve_routed_experts_for_layer(
@@ -99,8 +82,8 @@ def build_nemotron_h_moe_weight_plan(
         model,
         catalog,
         family_name="Nemotron-H MoE",
-        parse_name=_parse_nemotron_h_routed_expert_name,
-        map_projection=_routed_param_for_projection,
+        parse_name=_NEMOTRON_H_ROUTED_EXPERT_PATTERN.parse,
+        map_projection=_NEMOTRON_H_ROUTED_PROJECTION_MAP.map,
         resolve_routed_experts=_resolve_routed_experts_for_layer,
         auto_skip_substr=".mixer.experts.",
         mapper=mapper,
