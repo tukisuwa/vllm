@@ -1680,7 +1680,15 @@ track moves forward:
 - `return_success` refusal checks now cover shard-only loader calls as well as
   expert-routed calls.
 
-Lower-priority review items remain separate follow-ups: PSI gate batching for
-very large segment counts, possible fused-entry coalescing to reduce
-window-cache sweeps, shared gate/PSI helper cleanup, broader real O_DIRECT
-tests, and adding a real segment-family checkpoint to the smoke matrix.
+The first lower-priority follow-up is also closed: O_DIRECT segmented staging
+now batches forced memory gates at the entry level.  Individual segment reads
+still feed byte counts into the normal interval gate, but the expensive
+`/proc/meminfo` and PSI reads no longer run before and after every tiny
+segment.  This protects Llama4-style per-row segment plans from millions of
+forced gate probes while preserving pre/post safety checks around the whole
+staging read.
+
+Remaining lower-priority review items: possible fused-entry coalescing to
+reduce window-cache sweeps, shared gate/PSI helper cleanup, broader real
+O_DIRECT tests, and adding a real segment-family checkpoint to the smoke
+matrix.

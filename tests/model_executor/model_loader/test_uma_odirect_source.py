@@ -4,6 +4,8 @@
 
 import types
 
+import torch
+
 from vllm.model_executor.model_loader import uma_odirect_safetensors_loader as L
 
 
@@ -96,6 +98,50 @@ def test_open_file_reopens_after_close(monkeypatch):
     assert first is not second
     assert second.closed is False
     assert source._stats.files_opened == 2
+
+
+def test_read_segments_into_cpu_batches_forced_gates(monkeypatch):
+    source = _make_source(monkeypatch)
+    source.catalog = L.TensorCatalog(
+        [
+            L.TensorMeta("model.safetensors", "kv", torch.float32, [2, 2], 0, 16),
+        ]
+    )
+    source._loader._gate_interval_bytes = 1024 * 1024
+    gates = []
+    source._loader._gate_memory = lambda reason: gates.append(reason)
+
+    class FakeReadFile:
+        def read_record_into_tensor(self, tensor, offset, size, gate=None):
+            assert size == tensor.numel() * tensor.element_size()
+            tensor.fill_(offset // 8)
+            if gate is not None:
+                gate(size)
+
+    monkeypatch.setattr(source, "_open_file", lambda _path: FakeReadFile())
+    dst = torch.empty((2, 2), dtype=torch.float32)
+
+    source.read_segments_into_cpu(
+        "kv",
+        dst,
+        (
+            L.WeightPlanReadSegment(
+                (slice(0, 1), slice(None)),
+                (slice(0, 1), slice(None)),
+            ),
+            L.WeightPlanReadSegment(
+                (slice(1, 2), slice(None)),
+                (slice(1, 2), slice(None)),
+            ),
+        ),
+    )
+
+    assert gates == [
+        "before reading kv[segments]",
+        "after reading kv[segments]",
+    ]
+    assert dst.tolist() == [[0.0, 0.0], [1.0, 1.0]]
+    assert source._stats.tensors_read == 2
 
 
 def test_log_stats_warns_when_actual_reads_exceed_expected(caplog, monkeypatch):

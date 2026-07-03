@@ -393,28 +393,36 @@ def execute_weight_plan(
                     f"{entry.checkpoint_name}"
                 )
             tensor = empty_cpu_shape(entry.checkpoint_name, entry.staging_shape)
-            for segment in entry.read_segments:
-                source_shape = _weight_plan_entry_target_shape(
-                    record,
-                    segment.source_slices,
-                )
-                target = _select_contiguous_target_view(
-                    tensor,
-                    segment.target_slices,
+            read_segments_into_cpu = getattr(source, "read_segments_into_cpu", None)
+            if callable(read_segments_into_cpu):
+                read_segments_into_cpu(
                     entry.checkpoint_name,
+                    tensor,
+                    entry.read_segments,
                 )
-                if tuple(target.shape) != source_shape:
-                    raise RuntimeError(
-                        "WeightPlanEntry.read_segments target shape mismatch for "
-                        f"{entry.checkpoint_name}: target={list(target.shape)}, "
-                        f"source_slice={list(source_shape)}"
+            else:
+                for segment in entry.read_segments:
+                    source_shape = _weight_plan_entry_target_shape(
+                        record,
+                        segment.source_slices,
                     )
-                source.read_into_cpu(
-                    entry.checkpoint_name,
-                    tensor,
-                    source_slices=segment.source_slices,
-                    target_slices=segment.target_slices,
-                )
+                    target = _select_contiguous_target_view(
+                        tensor,
+                        segment.target_slices,
+                        entry.checkpoint_name,
+                    )
+                    if tuple(target.shape) != source_shape:
+                        raise RuntimeError(
+                            "WeightPlanEntry.read_segments target shape mismatch for "
+                            f"{entry.checkpoint_name}: target={list(target.shape)}, "
+                            f"source_slice={list(source_shape)}"
+                        )
+                    source.read_into_cpu(
+                        entry.checkpoint_name,
+                        tensor,
+                        source_slices=segment.source_slices,
+                        target_slices=segment.target_slices,
+                    )
         elif entry.read_into_cpu:
             tensor = source.empty_cpu(
                 entry.checkpoint_name,
@@ -723,6 +731,7 @@ class ODirectSafetensorsWeightSource:
         *,
         source_slices: tuple[slice | int, ...] | None = None,
         target_slices: tuple[slice | int, ...] | None = None,
+        force_gate: bool = True,
     ) -> None:
         record = self.catalog.get(name)
         if dst.device.type != "cpu":
@@ -746,7 +755,12 @@ class ODirectSafetensorsWeightSource:
                     f"read_into_cpu shape mismatch for {name}: "
                     f"dst={list(target.shape)}, source={record.shape}"
                 )
-            self._read_record_into_cpu(record, target, sliced=False)
+            self._read_record_into_cpu(
+                record,
+                target,
+                sliced=False,
+                force_gate=force_gate,
+            )
             return
 
         try:
@@ -766,7 +780,12 @@ class ODirectSafetensorsWeightSource:
                     f"read_into_cpu shape mismatch for {name}: "
                     f"dst={list(target.shape)}, source_slice={strided[4]}"
                 )
-            self._read_strided_slice_into_cpu(record, strided, target)
+            self._read_strided_slice_into_cpu(
+                record,
+                strided,
+                target,
+                force_gate=force_gate,
+            )
             return
 
         if list(target.shape) != output_shape:
@@ -783,7 +802,29 @@ class ODirectSafetensorsWeightSource:
             offset=record.offset + element_offset * element_size,
             size=element_count * element_size,
         )
-        self._read_record_into_cpu(slice_record, target, sliced=True)
+        self._read_record_into_cpu(
+            slice_record,
+            target,
+            sliced=True,
+            force_gate=force_gate,
+        )
+
+    def read_segments_into_cpu(
+        self,
+        name: str,
+        dst: torch.Tensor,
+        segments: tuple[WeightPlanReadSegment, ...],
+    ) -> None:
+        self._maybe_gate(f"before reading {name}[segments]", force=True)
+        for segment in segments:
+            self.read_into_cpu(
+                name,
+                dst,
+                source_slices=segment.source_slices,
+                target_slices=segment.target_slices,
+                force_gate=False,
+            )
+        self._maybe_gate(f"after reading {name}[segments]", force=True)
 
     def _read_strided_slice_cpu(
         self,
@@ -852,6 +893,8 @@ class ODirectSafetensorsWeightSource:
         record: TensorMeta,
         strided: tuple[int, int, int, int, list[int]],
         dst: torch.Tensor,
+        *,
+        force_gate: bool = True,
     ) -> None:
         outer_count, source_dim, start, length, output_shape = strided
         element_size = _DTYPE_NBYTES[record.dtype]
@@ -874,7 +917,8 @@ class ODirectSafetensorsWeightSource:
                 f"output={output_shape}, expected_elements={expected_elements}"
             )
 
-        self._maybe_gate(f"before reading {record.name}[strided-slice]", force=True)
+        if force_gate:
+            self._maybe_gate(f"before reading {record.name}[strided-slice]", force=True)
         flat = dst.reshape(-1)
         t0 = time.perf_counter()
         odirect_file = self._open_file(record.file_path)
@@ -898,7 +942,8 @@ class ODirectSafetensorsWeightSource:
         self._stats.bytes_tensor_payload += selected_bytes
         self._stats.bytes_sliced_tensor_payload += selected_bytes
         self._stats.time_read += time_read
-        self._maybe_gate(f"after reading {record.name}[strided-slice]", force=True)
+        if force_gate:
+            self._maybe_gate(f"after reading {record.name}[strided-slice]", force=True)
 
     def _read_record_cpu(self, record: TensorMeta, *, sliced: bool) -> torch.Tensor:
         self._maybe_gate(f"before reading {record.name}", force=True)
@@ -956,8 +1001,10 @@ class ODirectSafetensorsWeightSource:
         dst: torch.Tensor,
         *,
         sliced: bool,
+        force_gate: bool = True,
     ) -> None:
-        self._maybe_gate(f"before reading {record.name}", force=True)
+        if force_gate:
+            self._maybe_gate(f"before reading {record.name}", force=True)
         if tuple(dst.shape) != record.shape:
             raise RuntimeError(
                 f"Destination shape mismatch for {record.name}: "
@@ -981,7 +1028,8 @@ class ODirectSafetensorsWeightSource:
             self._stats.tensors_read_full += 1
             self._stats.bytes_full_tensor_payload += record.size
         self._stats.time_read += time_read
-        self._maybe_gate(f"after reading {record.name}", force=True)
+        if force_gate:
+            self._maybe_gate(f"after reading {record.name}", force=True)
 
     def skip(self, name: str, reason: str) -> None:
         self._stats.tensors_skipped += 1
