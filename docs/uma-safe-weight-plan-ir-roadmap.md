@@ -1915,3 +1915,61 @@ checkpoint file themselves. vLLM's 2-node case needs the same shape of fix.
 Detailed `RemoteODirectSafetensorsWeightSource` design (message shapes, error
 handling, and phased implementation plan) is tracked separately in
 `docs/uma-safe-2node-remote-weight-source-design.md`.
+
+### 2026-07-04 TeleChat2-35B real-checkpoint `read_segments` smoke
+
+`chuhac/TeleChat2-35B` was downloaded to
+`/data/shared/models/hf/vllm-loader-test/TeleChat2-35B` and used as the first
+full-size real-checkpoint validation of the `read_segments` path. Metadata was
+audited before load: `config.n_head=48`, `hidden_size=6144`, `head_dim=128`,
+`hidden_size % n_head == 0`, and all 64
+`transformer.h.*.self_attention.key_value.weight` tensors had shape
+`(12288, 6144)` as expected.
+
+The model-load smoke used `uma_odirect_safetensors`, `--skip-tokenizer-init`,
+`--attention-backend FLASH_ATTN`, `VLLM_USE_FLASHINFER_SAMPLER=0`, and stopped
+after the loader reported `Model loading took`. FlashInfer was explicitly
+avoided for this smoke because the host already had a root-owned
+`~/.cache/flashinfer/0.6.13` directory that caused import-time log-file
+permission failures before weight loading.
+
+Results:
+
+- model path: `TeleChat2ForCausalLM`
+- weight plan: `707` entries, `707` required, `0` skipped
+- full reads: `579`, `read_into`: `128`
+- full payload: `57.00 GiB`
+- `read_into` / segmented payload: `9.00 GiB`
+- total payload: `66.00 GiB`
+- read schedule: `read_ranges=6723`,
+  `expected_direct_reads=6344`, `expected_window_loads=200`,
+  `expected_window_hits=6529`
+- expected bytes read: `72.64 GiB`
+- actual bytes read: `72.64 GiB`
+- expected read amplification: `1.10x`
+- model load: `66.01 GiB`, `24.353924s`
+- source stats matched the schedule exactly:
+  `tensors_read=6723`, `tensors_read_full=579`,
+  `tensors_read_sliced=6144`, `direct_reads=6344`,
+  `window_loads=200`, `window_hits=6529`
+
+Memory/cache safety:
+
+- local first available: `108.62 GiB`; min available: `37.51 GiB`
+- local peak used: `82.12 GiB`
+- local first `buff/cache`: `2.73 GiB`; peak `buff/cache`: `2.92 GiB`
+- local `buff/cache` delta, first to peak: `0.19 GiB`
+- local peak used + `buff/cache`: `85.03 GiB`
+- swap stayed `0.00 GiB`
+- memory PSI some/full avg10 stayed `0.00/0.00`
+- IO PSI was visible during direct reads: max some/full avg10
+  `36.52/36.27`
+- `dgx-spark1` stayed idle: min available `112.32 GiB`, peak used +
+  `buff/cache` `10.94 GiB`, memory PSI `0.00/0.00`
+
+This closes the highest-risk real-checkpoint gap for the segmented read path:
+TeleChat2's interleaved `key_value.weight` tensors are now validated with real
+safetensors headers and payload bytes, not only the small O_DIRECT fixtures.
+It does not validate Llama4 fused experts or a real Hunyuan fused-QKV
+checkpoint; those remain lower-priority segment-family smokes when suitable
+checkpoints are available.
