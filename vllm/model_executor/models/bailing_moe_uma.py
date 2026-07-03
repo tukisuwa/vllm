@@ -18,8 +18,11 @@ from vllm.model_executor.model_loader.weight_plan import (
 )
 
 from .routed_moe_uma import (
+    RoutedExpertPattern,
     RoutedExpertsResolution,
     RoutedMoeEntry,
+    RoutedProjectionMap,
+    RoutedProjectionRule,
     build_routed_moe_weight_plan,
     load_routed_moe_weights_from_source,
 )
@@ -32,6 +35,18 @@ NameTransform = Callable[
     [str], tuple[str, tuple[TransformOp, ...] | None] | None
 ]
 
+_BAILING_ROUTED_EXPERT_PATTERN = RoutedExpertPattern(
+    module_path=("mlp", "experts"),
+    projections=("gate_proj", "down_proj", "up_proj"),
+)
+_BAILING_ROUTED_PROJECTION_MAP = RoutedProjectionMap(
+    (
+        RoutedProjectionRule("gate_proj", "w13", "w1"),
+        RoutedProjectionRule("up_proj", "w13", "w3"),
+        RoutedProjectionRule("down_proj", "w2", "w2"),
+    )
+)
+
 
 class _BailingSourceMapper:
     mapper = WeightsMapper(
@@ -43,43 +58,6 @@ class _BailingSourceMapper:
 
     def _map_name_with_shard(self, name: str) -> tuple[str, str | int | None] | None:
         return self.mapper._map_name_with_shard(name)
-
-
-def _parse_bailing_routed_expert_name(
-    name: str,
-) -> tuple[int, int, str, str] | None:
-    parts = name.split(".")
-    for idx in range(len(parts) - 6):
-        if parts[idx] != "layers":
-            continue
-        if (
-            not parts[idx + 1].isdigit()
-            or parts[idx + 2] != "mlp"
-            or parts[idx + 3] != "experts"
-            or not parts[idx + 4].isdigit()
-        ):
-            continue
-        proj_name = parts[idx + 5]
-        if proj_name not in ("gate_proj", "down_proj", "up_proj"):
-            continue
-        suffix = ".".join(parts[idx + 6 :])
-        if not suffix:
-            return None
-        return int(parts[idx + 1]), int(parts[idx + 4]), proj_name, suffix
-    return None
-
-
-def _routed_param_for_projection(
-    proj_name: str,
-    suffix: str,
-) -> tuple[str, str]:
-    if proj_name == "gate_proj":
-        return f"w13_{suffix}", "w1"
-    if proj_name == "up_proj":
-        return f"w13_{suffix}", "w3"
-    if proj_name == "down_proj":
-        return f"w2_{suffix}", "w2"
-    raise ValueError(f"Unsupported Bailing routed expert projection {proj_name!r}")
 
 
 def _resolve_routed_experts_for_layer(
@@ -160,8 +138,8 @@ def build_bailing_moe_weight_plan(
         model,
         catalog,
         family_name="Bailing MoE",
-        parse_name=_parse_bailing_routed_expert_name,
-        map_projection=_routed_param_for_projection,
+        parse_name=_BAILING_ROUTED_EXPERT_PATTERN.parse,
+        map_projection=_BAILING_ROUTED_PROJECTION_MAP.map,
         resolve_routed_experts=_resolve_routed_experts_for_layer,
         auto_skip_substr=".mlp.experts.",
         mapper=_BailingSourceMapper(),

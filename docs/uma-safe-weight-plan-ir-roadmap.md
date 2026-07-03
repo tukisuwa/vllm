@@ -1317,3 +1317,21 @@ The existing Mixtral, Jamba, and Laguna plan tests still exercise the actual
 plan paths, and the generic routed-pattern unit test now covers Qwen-style
 `mlp.experts`, Mixtral-style `block_sparse_moe.experts`, and Jamba-style
 `feed_forward.experts` names.
+
+### 2026-07-03 Phase 3 stage 1c: standard pattern with transforms/mappers
+
+`sarvam_uma.py`, `bailing_moe_uma.py`, and `ernie45_moe_uma.py` now also use
+`RoutedExpertPattern(module_path=("mlp", "experts"), ...)` plus the standard
+gate/up/down projection map.  Their family-specific behavior remains outside
+the pattern primitive:
+
+- Sarvam keeps the `zero_mean` gate-bias transform;
+- Bailing keeps its auto-path `gate_up_proj` mapper and optional
+  `l2_normalize` head transform;
+- Ernie 4.5 keeps its QKV/gate-up mapper, `squeeze` gate-bias transform, MTP
+  skip, and tied-head skip.
+
+This is the intended granularity for the first declarative pass: parser and
+projection-map boilerplate become data, while transform, skip, mapper, and
+layer-resolution policy stay as explicit Python until their own spec
+primitives are introduced.
