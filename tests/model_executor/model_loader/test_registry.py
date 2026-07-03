@@ -4668,10 +4668,15 @@ def test_mistral_build_weight_plan_remaps_names_and_permute_transform(tmp_path):
             "shape": [4, 4],
             "data_offsets": [0, 64],
         },
-        "output.weight": {"dtype": "F32", "shape": [1], "data_offsets": [64, 68]},
+        "layers.0.attention.wq.qscale_weight": {
+            "dtype": "F32",
+            "shape": [4],
+            "data_offsets": [64, 80],
+        },
+        "output.weight": {"dtype": "F32", "shape": [1], "data_offsets": [80, 84]},
     }
     path = tmp_path / "model.safetensors"
-    _write_safetensors(path, metadata, b"\0" * 68)
+    _write_safetensors(path, metadata, b"\0" * 84)
     catalog = TensorCatalog.from_safetensors_files(
         [str(path)],
         metadata_limit_bytes=1024 * 1024,
@@ -4709,6 +4714,15 @@ def test_mistral_build_weight_plan_remaps_names_and_permute_transform(tmp_path):
     assert torch.equal(
         apply_transform_ops(wq.transform_ops, tensor),
         fake._permute_mistral_weight(tensor, 2, 4),
+    )
+    wq_scale = entries["layers.0.attention.wq.qscale_weight"]
+    assert wq_scale.target_name == "model.layers.0.self_attn.qkv_proj.weight_scale"
+    assert wq_scale.shard_id == "q"
+    assert wq_scale.transform_ops == (TransformOp("qk_rope_permute_2d", (2,)),)
+    qscale_tensor = torch.arange(4, dtype=torch.float32)
+    assert torch.equal(
+        apply_transform_ops(wq_scale.transform_ops, qscale_tensor),
+        fake._permute_mistral_weight(qscale_tensor, 2, 1),
     )
     output = entries["output.weight"]
     assert output.required is False

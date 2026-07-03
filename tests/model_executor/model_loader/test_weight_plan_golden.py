@@ -187,10 +187,18 @@ def test_mistral_weight_plan_golden():
             ),
             TensorMeta(
                 "model.safetensors",
+                "layers.0.attention.wq.qscale_weight",
+                torch.float32,
+                [4],
+                64,
+                16,
+            ),
+            TensorMeta(
+                "model.safetensors",
                 "output.weight",
                 torch.float32,
                 [1],
-                64,
+                80,
                 4,
             ),
         ]
@@ -222,6 +230,12 @@ def test_mistral_weight_plan_golden():
             "checkpoint_name": "layers.0.attention.wq.weight",
             "target_name": "model.layers.0.self_attn.qkv_proj.weight",
             "transform_ops": [{"op": "qk_rope_permute", "args": [2]}],
+            "shard_id": "q",
+        },
+        {
+            "checkpoint_name": "layers.0.attention.wq.qscale_weight",
+            "target_name": "model.layers.0.self_attn.qkv_proj.weight_scale",
+            "transform_ops": [{"op": "qk_rope_permute_2d", "args": [2]}],
             "shard_id": "q",
         },
         {

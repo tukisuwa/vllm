@@ -38,13 +38,6 @@ from .auto_uma import build_auto_uma_weight_plan, load_auto_uma_weights_from_sou
 from .utils import AutoWeightsLoader
 
 
-def _tensor_numel(shape: list[int]) -> int:
-    numel = 1
-    for dim in shape:
-        numel *= dim
-    return numel
-
-
 class MistralMLP(nn.Module):
     def __init__(
         self,
@@ -373,7 +366,7 @@ class MistralForCausalLM(LlamaForCausalLM):
     def _mistral_source_name_transform(
         self,
         name: str,
-        catalog: TensorCatalog | None = None,
+        catalog: TensorCatalog,
     ) -> tuple[str, tuple[TransformOp, ...] | None]:
         modules = name.split(".")
         transform_ops: tuple[TransformOp, ...] | None = None
@@ -385,13 +378,10 @@ class MistralForCausalLM(LlamaForCausalLM):
             "wk" in modules
             and modules[-1] == "qscale_weight"
             and self.config.num_key_value_heads > 0
-            and (
-                catalog is None
-                or _tensor_numel(catalog.get(name).shape) > 1
-            )
+            and catalog.numel(name) > 1
         ):
             transform_ops = (
-                TransformOp("qk_rope_permute", (self.config.num_key_value_heads,)),
+                TransformOp("qk_rope_permute_2d", (self.config.num_key_value_heads,)),
             )
         elif "wq" in modules and modules[-1] == "weight":
             transform_ops = (
@@ -401,13 +391,10 @@ class MistralForCausalLM(LlamaForCausalLM):
             "wq" in modules
             and modules[-1] == "qscale_weight"
             and self.config.num_attention_heads > 0
-            and (
-                catalog is None
-                or _tensor_numel(catalog.get(name).shape) > 1
-            )
+            and catalog.numel(name) > 1
         ):
             transform_ops = (
-                TransformOp("qk_rope_permute", (self.config.num_attention_heads,)),
+                TransformOp("qk_rope_permute_2d", (self.config.num_attention_heads,)),
             )
         return self._remap_mistral_name(name), transform_ops
 

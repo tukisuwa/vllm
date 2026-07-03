@@ -62,13 +62,6 @@ def _llama4_weight_mapper() -> WeightsMapper:
     )
 
 
-def _tensor_numel(shape: list[int]) -> int:
-    numel = 1
-    for dim in shape:
-        numel *= dim
-    return numel
-
-
 def _llama4_name_transform(
     model: Any,
     catalog: TensorCatalog,
@@ -77,9 +70,7 @@ def _llama4_name_transform(
     modules = checkpoint_name.split(".")
     leaf = modules[-1]
     is_weight = leaf in ("weight", "weight_packed")
-    is_weight_scale = leaf == "weight_scale" and _tensor_numel(
-        catalog.get(checkpoint_name).shape
-    ) > 1
+    is_weight_scale = leaf == "weight_scale" and catalog.numel(checkpoint_name) > 1
     is_k_proj = "wk" in modules or "k_proj" in modules
     is_q_proj = "wq" in modules or "q_proj" in modules
     if not ((is_weight or is_weight_scale) and (is_k_proj or is_q_proj)):

@@ -335,6 +335,22 @@ def _transform_qk_rope_permute(
     return tensor
 
 
+def _transform_qk_rope_permute_2d(
+    tensor: torch.Tensor,
+    n_heads: int,
+) -> torch.Tensor:
+    if n_heads <= 0:
+        raise ValueError(f"qk_rope_permute_2d requires n_heads > 0, got {n_heads}")
+    if tensor.ndim == 1:
+        tensor = tensor.unsqueeze(-1)
+    f_out, f_in = tensor.shape
+    return (
+        tensor.view(n_heads, f_out // n_heads // 2, 2, f_in)
+        .transpose(1, 2)
+        .reshape(f_out, f_in)
+    )
+
+
 def _transform_patch_embedding_reshape(
     tensor: torch.Tensor,
     patch_size: int,
@@ -357,6 +373,9 @@ register_weight_transform(
 )
 register_weight_transform(
     "qk_rope_permute", _transform_qk_rope_permute, extra_staging_factor=1.0
+)
+register_weight_transform(
+    "qk_rope_permute_2d", _transform_qk_rope_permute_2d, extra_staging_factor=1.0
 )
 register_weight_transform(
     "patch_embedding_reshape",
@@ -611,6 +630,12 @@ class TensorCatalog:
 
     def get(self, name: str) -> TensorMeta:
         return self._by_name[name]
+
+    def numel(self, name: str) -> int:
+        elements = 1
+        for dim in self.get(name).shape:
+            elements *= dim
+        return elements
 
     def total_bytes(self) -> int:
         return sum(record.size for record in self._records)

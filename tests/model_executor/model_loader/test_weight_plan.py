@@ -328,6 +328,10 @@ def test_builtin_transform_ops_match_family_semantics():
         .reshape(4, 1)
         .squeeze(-1),
     )
+    assert torch.equal(
+        apply_transform_ops((TransformOp("qk_rope_permute_2d", (2,)),), qk_scale),
+        qk_scale.view(2, 1, 2, 1).transpose(1, 2).reshape(4, 1),
+    )
 
     patch = torch.arange(24, dtype=torch.float32).reshape(2, 12)
     patch_reshaped = apply_transform_ops(
