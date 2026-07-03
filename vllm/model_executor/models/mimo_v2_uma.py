@@ -24,8 +24,15 @@ from vllm.model_executor.model_loader.weight_plan import (
 from vllm.model_executor.models.utils import WeightsMapper
 
 from .routed_moe_uma import (
+    RoutedExpertPattern,
     RoutedExpertsResolution,
     RoutedMoeEntry,
+    RoutedProjectionMap,
+    RoutedProjectionRule,
+    SliceRule,
+    SliceRuleEntry,
+    StackedProjectionMap,
+    StackedProjectionRule,
     build_routed_moe_weight_plan,
     load_routed_moe_weights_from_source,
 )
@@ -34,17 +41,30 @@ from .utils import PPMissingLayer
 
 MimoV2MoeRoutedEntry = RoutedMoeEntry
 
+_MIMO_V2_STACKED_PROJECTIONS = StackedProjectionMap(
+    (
+        StackedProjectionRule(".q_proj", ".qkv_proj", "q"),
+        StackedProjectionRule(".k_proj", ".qkv_proj", "k"),
+        StackedProjectionRule(".v_proj", ".qkv_proj", "v"),
+        StackedProjectionRule(".gate_proj", ".gate_up_proj", 0),
+        StackedProjectionRule(".up_proj", ".gate_up_proj", 1),
+    )
+)
+_MIMO_V2_ROUTED_EXPERT_PATTERN = RoutedExpertPattern(
+    module_path=("mlp", "experts"),
+    projections=("gate_proj", "down_proj", "up_proj"),
+)
+_MIMO_V2_ROUTED_PROJECTION_MAP = RoutedProjectionMap(
+    (
+        RoutedProjectionRule("gate_proj", "w13", "w1"),
+        RoutedProjectionRule("up_proj", "w13", "w3"),
+        RoutedProjectionRule("down_proj", "w2", "w2"),
+    )
+)
+
 
 def _mimo_v2_weight_mapper() -> WeightsMapper:
-    return WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        }
-    )
+    return _MIMO_V2_STACKED_PROJECTIONS.as_weights_mapper()
 
 
 def _mimo_v2_name_transform(name: str) -> tuple[str, None] | None:
@@ -61,38 +81,7 @@ def _mimo_v2_name_transform(name: str) -> tuple[str, None] | None:
 def _parse_mimo_v2_routed_expert_name(
     name: str,
 ) -> tuple[int, int, str, str] | None:
-    parts = name.split(".")
-    for idx in range(len(parts) - 6):
-        if parts[idx] != "layers":
-            continue
-        if (
-            not parts[idx + 1].isdigit()
-            or parts[idx + 2] != "mlp"
-            or parts[idx + 3] != "experts"
-            or not parts[idx + 4].isdigit()
-        ):
-            continue
-        proj_name = parts[idx + 5]
-        if proj_name not in ("gate_proj", "down_proj", "up_proj"):
-            continue
-        suffix = ".".join(parts[idx + 6 :])
-        if not suffix:
-            return None
-        return int(parts[idx + 1]), int(parts[idx + 4]), proj_name, suffix
-    return None
-
-
-def _routed_param_for_projection(
-    proj_name: str,
-    suffix: str,
-) -> tuple[str, str]:
-    if proj_name == "gate_proj":
-        return f"w13_{suffix}", "w1"
-    if proj_name == "up_proj":
-        return f"w13_{suffix}", "w3"
-    if proj_name == "down_proj":
-        return f"w2_{suffix}", "w2"
-    raise ValueError(f"Unsupported MiMoV2 expert projection {proj_name!r}")
+    return _MIMO_V2_ROUTED_EXPERT_PATTERN.parse(name)
 
 
 def _resolve_routed_experts_for_layer(
@@ -167,12 +156,23 @@ def _apply_attention_sink_slices(
                 )
             heads_per_rank = record.shape[0] // tp_size
             head_start = tp_rank * heads_per_rank
+            sliced_entry = SliceRule(
+                entry.checkpoint_name,
+                (
+                    SliceRuleEntry(
+                        entry.target_name,
+                        (slice(head_start, head_start + heads_per_rank),),
+                        entry.shard_id,
+                    ),
+                ),
+            ).to_weight_plan_entries()[0]
             entries.append(
                 WeightPlanEntry(
-                    checkpoint_name=entry.checkpoint_name,
-                    target_name=entry.target_name,
+                    checkpoint_name=sliced_entry.checkpoint_name,
+                    target_name=sliced_entry.target_name,
                     required=entry.required,
-                    source_slices=(slice(head_start, head_start + heads_per_rank),),
+                    source_slices=sliced_entry.source_slices,
+                    shard_id=sliced_entry.shard_id,
                     transform_ops=entry.transform_ops,
                     ignore_missing=entry.ignore_missing,
                 )
@@ -192,7 +192,7 @@ def build_mimo_v2_weight_plan(
         catalog,
         family_name="MiMoV2",
         parse_name=_parse_mimo_v2_routed_expert_name,
-        map_projection=_routed_param_for_projection,
+        map_projection=_MIMO_V2_ROUTED_PROJECTION_MAP.map,
         resolve_routed_experts=_resolve_routed_experts_for_layer,
         auto_skip_substr=".mlp.experts.",
         mapper=_mimo_v2_weight_mapper(),

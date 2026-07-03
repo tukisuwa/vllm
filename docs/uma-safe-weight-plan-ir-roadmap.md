@@ -1466,3 +1466,33 @@ to `RoutedExpertPattern` and `RoutedProjectionMap`.  DeepSeek has the same
 projection vocabulary, but its mapper also checks target parameter existence
 and controls shared-expert fallback behavior, so it is intentionally left for
 a dedicated pass rather than mixed into the first StackedProjection commit.
+
+### 2026-07-03 Phase 3 stage 2c: SliceRule primitive
+
+`routed_moe_uma.py` now has the first concrete slice primitive:
+
+- `SliceRuleEntry(target_name, source_slices, shard_id=None)`;
+- `SliceRule(checkpoint_name, entries).to_weight_plan_entries()`.
+
+This deliberately represents **resolved** slices, not shape formulas.  Family
+builders still compute q/k/v split sizes, half points, and TP rank-local head
+ranges from config/catalog state, then emit serializable concrete slice
+entries.  That keeps the `WeightPlan` snapshot stable and avoids embedding
+model-specific shape algebra in the executor.
+
+Initial migrations:
+
+- Param2MoE fused qkv row split now emits three concrete `SliceRuleEntry`
+  records for q/k/v;
+- HunYuan `gate_and_up_proj` half split now emits two concrete entries for
+  gate/up shards.  HunYuan fused qkv remains an explicit full-read reshape
+  path because it is not a simple source slice yet;
+- MiMoV2 attention-sink TP head slicing now uses a one-entry `SliceRule` after
+  the rank-local head range is computed.  MiMoV2's routed parser and stacked
+  projection table were moved to the existing declarative primitives at the
+  same time.
+
+The remaining slice work is to decide whether HunYuan fused qkv and Llama4
+fused expert entries should become simple `SliceRule`s or a slightly richer
+variant that can express reshape/reorder semantics without hiding extra
+staging memory.

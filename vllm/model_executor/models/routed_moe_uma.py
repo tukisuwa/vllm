@@ -162,6 +162,30 @@ class StackedProjectionMap:
         )
 
 
+@dataclass(frozen=True)
+class SliceRuleEntry:
+    target_name: str
+    source_slices: tuple[slice | int, ...]
+    shard_id: ShardId | None = None
+
+
+@dataclass(frozen=True)
+class SliceRule:
+    checkpoint_name: str
+    entries: tuple[SliceRuleEntry, ...]
+
+    def to_weight_plan_entries(self) -> tuple[WeightPlanEntry, ...]:
+        return tuple(
+            WeightPlanEntry(
+                checkpoint_name=self.checkpoint_name,
+                target_name=entry.target_name,
+                source_slices=entry.source_slices,
+                shard_id=entry.shard_id,
+            )
+            for entry in self.entries
+        )
+
+
 RoutedNameParser = Callable[[str], tuple[int, int, str, str] | None]
 RoutedProjectionMapper = Callable[[str, str], tuple[str, str]]
 RoutedExpertResolver = Callable[[nn.Module, int], RoutedExpertsResolution]

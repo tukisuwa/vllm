@@ -37,6 +37,8 @@ from vllm.model_executor.models.routed_moe_uma import (
     RoutedExpertPattern,
     RoutedProjectionMap,
     RoutedProjectionRule,
+    SliceRule,
+    SliceRuleEntry,
     StackedProjectionMap,
     StackedProjectionRule,
 )
@@ -254,6 +256,38 @@ def test_stacked_projection_map_builds_weights_mapper():
     assert mapper._map_name_with_shard(
         "model.layers.0.mlp.down_proj.weight"
     ) == ("model.layers.0.mlp.down_proj.weight", None)
+
+
+def test_slice_rule_builds_concrete_weight_plan_entries():
+    entries = SliceRule(
+        "model.layers.0.self_attn.qkv_proj.weight",
+        (
+            SliceRuleEntry(
+                "model.layers.0.self_attn.qkv_proj.weight",
+                (slice(0, 4), slice(None)),
+                "q",
+            ),
+            SliceRuleEntry(
+                "model.layers.0.self_attn.qkv_proj.weight",
+                (slice(4, 6), slice(None)),
+                "k",
+            ),
+        ),
+    ).to_weight_plan_entries()
+
+    assert [(entry.target_name, entry.shard_id, entry.source_slices)
+            for entry in entries] == [
+        (
+            "model.layers.0.self_attn.qkv_proj.weight",
+            "q",
+            (slice(0, 4), slice(None)),
+        ),
+        (
+            "model.layers.0.self_attn.qkv_proj.weight",
+            "k",
+            (slice(4, 6), slice(None)),
+        ),
+    ]
 
 
 def _entry_local_required(entry):

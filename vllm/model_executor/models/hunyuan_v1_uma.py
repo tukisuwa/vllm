@@ -29,6 +29,8 @@ from .routed_moe_uma import (
     RoutedMoeEntry,
     RoutedProjectionMap,
     RoutedProjectionRule,
+    SliceRule,
+    SliceRuleEntry,
     StackedProjectionMap,
     StackedProjectionRule,
     build_routed_moe_weight_plan,
@@ -178,20 +180,21 @@ def _collect_fused_plan_entries(
             target_name = name.replace(".gate_and_up_proj.", ".gate_up_proj.")
             rest = (slice(None),) * (len(record.shape) - 1)
             entries.extend(
-                [
-                    WeightPlanEntry(
-                        checkpoint_name=checkpoint_name,
-                        target_name=target_name,
-                        source_slices=(slice(0, half), *rest),
-                        shard_id=1,
+                SliceRule(
+                    checkpoint_name,
+                    (
+                        SliceRuleEntry(
+                            target_name,
+                            (slice(0, half), *rest),
+                            1,
+                        ),
+                        SliceRuleEntry(
+                            target_name,
+                            (slice(half, record.shape[0]), *rest),
+                            0,
+                        ),
                     ),
-                    WeightPlanEntry(
-                        checkpoint_name=checkpoint_name,
-                        target_name=target_name,
-                        source_slices=(slice(half, record.shape[0]), *rest),
-                        shard_id=0,
-                    ),
-                ]
+                ).to_weight_plan_entries()
             )
             skip_auto.add(checkpoint_name)
             continue

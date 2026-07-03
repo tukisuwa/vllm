@@ -25,6 +25,8 @@ from .routed_moe_uma import (
     RoutedMoeEntry,
     RoutedProjectionMap,
     RoutedProjectionRule,
+    SliceRule,
+    SliceRuleEntry,
     build_routed_moe_weight_plan,
     load_routed_moe_weights_from_source,
 )
@@ -144,29 +146,26 @@ def _qkv_split_entries(model: nn.Module, catalog: TensorCatalog) -> tuple[
         names.add(checkpoint_name)
         rest = (slice(None),) * (len(record.shape) - 1)
         entries.extend(
-            [
-                WeightPlanEntry(
-                    checkpoint_name=checkpoint_name,
-                    target_name=target_name,
-                    source_slices=(slice(0, q_split), *rest),
-                    shard_id="q",
-                ),
-                WeightPlanEntry(
-                    checkpoint_name=checkpoint_name,
-                    target_name=target_name,
-                    source_slices=(slice(q_split, q_split + kv_split), *rest),
-                    shard_id="k",
-                ),
-                WeightPlanEntry(
-                    checkpoint_name=checkpoint_name,
-                    target_name=target_name,
-                    source_slices=(
-                        slice(q_split + kv_split, q_split + 2 * kv_split),
-                        *rest,
+            SliceRule(
+                checkpoint_name,
+                (
+                    SliceRuleEntry(
+                        target_name,
+                        (slice(0, q_split), *rest),
+                        "q",
                     ),
-                    shard_id="v",
+                    SliceRuleEntry(
+                        target_name,
+                        (slice(q_split, q_split + kv_split), *rest),
+                        "k",
+                    ),
+                    SliceRuleEntry(
+                        target_name,
+                        (slice(q_split + kv_split, q_split + 2 * kv_split), *rest),
+                        "v",
+                    ),
                 ),
-            ]
+            ).to_weight_plan_entries()
         )
     return entries, names
 
