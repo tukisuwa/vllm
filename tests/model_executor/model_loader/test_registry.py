@@ -338,7 +338,15 @@ def _write_single_tensor_safetensors(path, name: str, tensor: torch.Tensor) -> N
     _write_safetensors(path, metadata, payload)
 
 
-def _real_odirect_source(tmp_path, monkeypatch, name: str, tensor: torch.Tensor):
+def _real_odirect_source(
+    tmp_path,
+    monkeypatch,
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    chunk_size: int = 4096,
+    window_size: int = 4096,
+):
     if not hasattr(os, "O_DIRECT"):
         pytest.skip("O_DIRECT is not available on this platform")
     _write_single_tensor_safetensors(tmp_path / "model.safetensors", name, tensor)
@@ -346,8 +354,8 @@ def _real_odirect_source(tmp_path, monkeypatch, name: str, tensor: torch.Tensor)
         LoadConfig(
             load_format="uma_odirect_safetensors",
             model_loader_extra_config={
-                "chunk_size": 4096,
-                "window_size": 4096,
+                "chunk_size": chunk_size,
+                "window_size": window_size,
                 "gate_interval_mib": 1,
             },
         )
@@ -9074,6 +9082,72 @@ def test_llama4_fused_gate_up_segments_read_real_safetensors_bytes(
 
     assert torch.equal(w1, data[1:3, :, 0:3])
     assert torch.equal(w3, data[1:3, :, 3:6])
+
+
+def test_uma_odirect_execute_weight_plan_coalesces_segment_entry_reads(
+    tmp_path, monkeypatch
+):
+    name = "model.layers.0.self_attn.qkv_proj.weight"
+    row_width = 1024
+    data = torch.arange(8 * row_width, dtype=torch.float32).reshape(8, row_width)
+    source = _real_odirect_source(
+        tmp_path,
+        monkeypatch,
+        name,
+        data,
+        chunk_size=4096,
+        window_size=12288,
+    )
+
+    class FakeParam:
+        def __init__(self):
+            self.calls = []
+
+        def weight_loader(self, param, tensor, shard_id):
+            assert param is self
+            self.calls.append((shard_id, tensor.clone()))
+
+    class FakeModel:
+        param = FakeParam()
+
+    def entry(shard_id, first_row, second_row):
+        return WeightPlanEntry(
+            name,
+            "param",
+            read_into_cpu=True,
+            staging_shape=(2, row_width),
+            read_segments=(
+                WeightPlanReadSegment(
+                    (slice(first_row, first_row + 1), slice(None)),
+                    (slice(0, 1), slice(None)),
+                ),
+                WeightPlanReadSegment(
+                    (slice(second_row, second_row + 1), slice(None)),
+                    (slice(1, 2), slice(None)),
+                ),
+            ),
+            shard_id=shard_id,
+        )
+
+    model = FakeModel()
+    loaded = execute_weight_plan(
+        model,
+        source,
+        WeightPlan((
+            entry("q", 0, 4),
+            entry("k", 2, 6),
+            entry("v", 3, 7),
+        )),
+    )
+
+    assert loaded == {"param"}
+    assert [call[0] for call in model.param.calls] == ["q", "k", "v"]
+    assert torch.equal(model.param.calls[0][1], torch.stack((data[0], data[4])))
+    assert torch.equal(model.param.calls[1][1], torch.stack((data[2], data[6])))
+    assert torch.equal(model.param.calls[2][1], torch.stack((data[3], data[7])))
+    stats = source.stats_snapshot()
+    assert stats["window_loads"] == 4
+    assert stats["window_hits"] == 6
 
 
 def test_qwen_moe_source_plan_handles_nested_language_model_before_read():

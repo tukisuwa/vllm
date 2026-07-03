@@ -1424,13 +1424,39 @@ def schedule_weight_plan_reads(
     scheduled_entries = sorted(required, key=lambda item: item.first_read_key)
     scheduled_required = [item.entry for item in scheduled_entries]
     scheduled_plan = WeightPlan(tuple([*scheduled_required, *skipped]))
-    ranges: list[_PlanReadRange] = []
     payload_bytes = 0
     read_ranges = 0
-    for scheduled_entry in scheduled_entries:
-        ranges.extend(scheduled_entry.ranges)
-        read_ranges += sum(item.range_count for item in scheduled_entry.ranges)
-        payload_bytes += sum(item.payload_bytes for item in scheduled_entry.ranges)
+    ranges: list[_PlanReadRange] = []
+    index = 0
+    while index < len(scheduled_entries):
+        scheduled_entry = scheduled_entries[index]
+        group = [scheduled_entry]
+        next_index = index + 1
+        if scheduled_entry.entry.read_segments is not None:
+            while next_index < len(scheduled_entries):
+                next_entry = scheduled_entries[next_index]
+                if (
+                    next_entry.entry.read_segments is None
+                    or next_entry.entry.checkpoint_name
+                    != scheduled_entry.entry.checkpoint_name
+                ):
+                    break
+                group.append(next_entry)
+                next_index += 1
+        group_ranges = [
+            read_range
+            for group_entry in group
+            for read_range in group_entry.ranges
+        ]
+        if len(group) > 1:
+            group_ranges = sorted(
+                group_ranges,
+                key=lambda item: (item.file_path, item.first_offset),
+            )
+        ranges.extend(group_ranges)
+        read_ranges += sum(item.range_count for item in group_ranges)
+        payload_bytes += sum(item.payload_bytes for item in group_ranges)
+        index = next_index
     direct_reads, window_loads, window_hits, bytes_read = _simulate_odirect_reads(
         tuple(ranges),
         file_sizes=_file_sizes_from_catalog(catalog),

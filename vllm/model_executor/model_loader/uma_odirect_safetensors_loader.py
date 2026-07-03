@@ -144,6 +144,21 @@ def _select_contiguous_target_view(
     return target
 
 
+def _segment_source_sort_key(
+    record: TensorMeta,
+    segment: WeightPlanReadSegment,
+) -> tuple[int, int] | None:
+    try:
+        element_offset, element_count, _output_shape = _normalize_slice_selection(
+            record.shape,
+            segment.source_slices,
+        )
+    except ValueError:
+        return None
+    element_size = _DTYPE_NBYTES[record.dtype]
+    return record.offset + element_offset * element_size, element_count * element_size
+
+
 def _source_tensor_shape(
     record: TensorMeta,
     source_slices: tuple[slice | int, ...] | None,
@@ -292,20 +307,22 @@ def execute_weight_plan(
     )
 
     loaded: set[str] = set()
-    for entry in schedule.plan:
+    scheduled_entries = tuple(schedule.plan)
+
+    def prepare_entry(entry: WeightPlanEntry):
         if not entry.required:
             source.skip(
                 entry.checkpoint_name,
                 entry.skip_reason or "weight plan marked not required",
             )
-            continue
+            return None
 
         try:
             param = _resolve_attr(model, entry.target_name)
         except RuntimeError:
             if entry.ignore_missing:
                 source.skip(entry.checkpoint_name, "weight plan target is ignored")
-                continue
+                return None
             raise
 
         weight_loader = getattr(param, "weight_loader", None)
@@ -347,10 +364,6 @@ def execute_weight_plan(
             else:
                 weight_loader = default_weight_loader
 
-        # The plan was resolved above; executing without further semantic
-        # inference keeps the logged summary equal to the actual reads.
-        source_slices = entry.source_slices
-        source_is_sharded = entry.source_is_sharded
         record = source.catalog.get(entry.checkpoint_name)
 
         if entry.target_slices is not None and not entry.read_into_cpu:
@@ -361,6 +374,13 @@ def execute_weight_plan(
         if entry.read_segments is not None:
             validate_weight_plan_read_segments(record, entry)
 
+        return entry, param, weight_loader, record
+
+    def read_entry_tensor(prepared) -> torch.Tensor:
+        entry, _param, _weight_loader, record = prepared
+        # The plan was resolved above; executing without further semantic
+        # inference keeps the logged summary equal to the actual reads.
+        source_slices = entry.source_slices
         if entry.read_segments is not None:
             empty_cpu_shape = getattr(source, "empty_cpu_shape", None)
             if not callable(empty_cpu_shape):
@@ -416,6 +436,10 @@ def execute_weight_plan(
             tensor = source.read_full_cpu(entry.checkpoint_name)
         else:
             tensor = source.read_slice_cpu(entry.checkpoint_name, source_slices)
+        return tensor
+
+    def load_entry_tensor(prepared, tensor: torch.Tensor) -> None:
+        entry, param, weight_loader, _record = prepared
         if entry.transform_ops:
             tensor = apply_transform_ops(entry.transform_ops, tensor)
 
@@ -430,11 +454,63 @@ def execute_weight_plan(
             weight_loader,
             param,
             tensor,
-            source_is_sharded=source_is_sharded,
+            source_is_sharded=entry.source_is_sharded,
             kwargs=kwargs,
             entry_name=entry.checkpoint_name,
         )
         loaded.add(entry.target_name)
+
+    index = 0
+    while index < len(scheduled_entries):
+        entry = scheduled_entries[index]
+        prepared = prepare_entry(entry)
+        if prepared is None:
+            index += 1
+            continue
+
+        read_segment_group_into_cpu = getattr(source, "read_segment_group_into_cpu", None)
+        if entry.read_segments is not None and callable(read_segment_group_into_cpu):
+            group = [prepared]
+            next_index = index + 1
+            while next_index < len(scheduled_entries):
+                next_entry = scheduled_entries[next_index]
+                if (
+                    not next_entry.required
+                    or next_entry.read_segments is None
+                    or next_entry.checkpoint_name != entry.checkpoint_name
+                ):
+                    break
+                next_prepared = prepare_entry(next_entry)
+                if next_prepared is not None:
+                    group.append(next_prepared)
+                next_index += 1
+
+            if len(group) > 1:
+                requests = []
+                tensors = []
+                empty_cpu_shape = getattr(source, "empty_cpu_shape", None)
+                if not callable(empty_cpu_shape):
+                    raise RuntimeError(
+                        "WeightSource does not support segmented CPU staging for "
+                        f"{entry.checkpoint_name}"
+                    )
+                for group_prepared in group:
+                    group_entry = group_prepared[0]
+                    tensor = empty_cpu_shape(
+                        group_entry.checkpoint_name,
+                        group_entry.staging_shape,
+                    )
+                    tensors.append(tensor)
+                    requests.append((tensor, group_entry.read_segments))
+                read_segment_group_into_cpu(entry.checkpoint_name, tuple(requests))
+                for group_prepared, tensor in zip(group, tensors):
+                    load_entry_tensor(group_prepared, tensor)
+                index = next_index
+                continue
+
+        tensor = read_entry_tensor(prepared)
+        load_entry_tensor(prepared, tensor)
+        index += 1
     return loaded
 
 
@@ -791,8 +867,43 @@ class ODirectSafetensorsWeightSource:
         dst: torch.Tensor,
         segments: tuple[WeightPlanReadSegment, ...],
     ) -> None:
+        self.read_segment_group_into_cpu(name, ((dst, segments),))
+
+    def read_segment_group_into_cpu(
+        self,
+        name: str,
+        requests: tuple[
+            tuple[torch.Tensor, tuple[WeightPlanReadSegment, ...]],
+            ...,
+        ],
+    ) -> None:
         self._maybe_gate(f"before reading {name}[segments]", force=True)
-        for segment in segments:
+        record = self.catalog.get(name)
+        sortable: list[
+            tuple[tuple[int, int], int, torch.Tensor, WeightPlanReadSegment]
+        ] = []
+        unsorted: list[tuple[int, torch.Tensor, WeightPlanReadSegment]] = []
+        order = 0
+        for dst, segments in requests:
+            for segment in segments:
+                sort_key = _segment_source_sort_key(record, segment)
+                if sort_key is None:
+                    unsorted.append((order, dst, segment))
+                else:
+                    sortable.append((sort_key, order, dst, segment))
+                order += 1
+        read_items = [
+            (dst, segment)
+            for _sort_key, _order, dst, segment in sorted(
+                sortable,
+                key=lambda item: (item[0], item[1]),
+            )
+        ]
+        read_items.extend(
+            (dst, segment)
+            for _order, dst, segment in sorted(unsorted, key=lambda item: item[0])
+        )
+        for dst, segment in read_items:
             self.read_into_cpu(
                 name,
                 dst,

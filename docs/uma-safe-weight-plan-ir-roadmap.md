@@ -1743,3 +1743,25 @@ contracts.  It does catch the highest-risk off-by-one and source/target slice
 boundary mistakes before spending time and RAM on multi-hundred-GB checkpoints.
 OpenPangu remains outside this specific segment fixture set because its current
 UMA path uses stacked/source-slice entries rather than `read_segments`.
+
+### 2026-07-04 Stage A fused-source coalescing
+
+Stage A is implemented without changing the `WeightPlan` IR.  Consecutive
+required `read_segments` entries that share the same checkpoint tensor are read
+as one source group: each entry still owns its own staging tensor, but the
+O_DIRECT source flattens all group segments and reads them in source-offset
+order.  After the grouped read completes, the executor dispatches the existing
+per-entry `weight_loader` calls in the scheduled entry order, so loader
+semantics and loaded-weight accounting remain unchanged.
+
+The read scheduler mirrors the same grouped range order before simulating
+O_DIRECT windows, keeping expected and actual byte accounting aligned.  A small
+real-safetensors fixture fixes the regression case: q/k/v entries sharing one
+fused tensor would previously sweep rows in entry order; with coalescing, the
+same values are loaded into the same staging tensors while window loads drop
+from the entry-order pattern to the source-order pattern.
+
+This remains an executor scheduling optimization, not a new serialized plan
+primitive.  A grouped fused-source IR node is still reserved for a later stage
+only if real checkpoint smokes show amplification that cannot be removed by
+range scheduling alone.

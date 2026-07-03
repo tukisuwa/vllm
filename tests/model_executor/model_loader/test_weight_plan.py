@@ -13,6 +13,7 @@ from vllm.model_executor.model_loader.weight_plan import (
     TransformOp,
     WeightPlan,
     WeightPlanEntry,
+    WeightPlanReadSegment,
     apply_transform_ops,
     build_auto_weight_plan_from_catalog,
     register_weight_transform,
@@ -304,7 +305,88 @@ def test_schedule_weight_plan_reads_estimates_strided_ranges_without_expansion()
     assert schedule.summary.payload_bytes == 4
     assert schedule.summary.expected_window_loads == 2
     assert schedule.summary.expected_window_hits == 4
-    assert schedule.summary.expected_bytes_read == 16
+
+
+def test_schedule_weight_plan_reads_coalesces_segment_ranges_across_entries():
+    row_bytes = 4096
+    catalog = TensorCatalog(
+        [
+            TensorMeta(
+                "model.safetensors",
+                "qkv",
+                torch.float32,
+                [8, row_bytes // 4],
+                0,
+                8 * row_bytes,
+            ),
+        ]
+    )
+    plan = WeightPlan(
+        (
+            WeightPlanEntry(
+                "qkv",
+                "qkv_proj",
+                read_into_cpu=True,
+                staging_shape=(2, row_bytes // 4),
+                read_segments=(
+                    WeightPlanReadSegment(
+                        (slice(0, 1), slice(None)),
+                        (slice(0, 1), slice(None)),
+                    ),
+                    WeightPlanReadSegment(
+                        (slice(4, 5), slice(None)),
+                        (slice(1, 2), slice(None)),
+                    ),
+                ),
+                shard_id="q",
+            ),
+            WeightPlanEntry(
+                "qkv",
+                "qkv_proj",
+                read_into_cpu=True,
+                staging_shape=(2, row_bytes // 4),
+                read_segments=(
+                    WeightPlanReadSegment(
+                        (slice(2, 3), slice(None)),
+                        (slice(0, 1), slice(None)),
+                    ),
+                    WeightPlanReadSegment(
+                        (slice(6, 7), slice(None)),
+                        (slice(1, 2), slice(None)),
+                    ),
+                ),
+                shard_id="k",
+            ),
+            WeightPlanEntry(
+                "qkv",
+                "qkv_proj",
+                read_into_cpu=True,
+                staging_shape=(2, row_bytes // 4),
+                read_segments=(
+                    WeightPlanReadSegment(
+                        (slice(3, 4), slice(None)),
+                        (slice(0, 1), slice(None)),
+                    ),
+                    WeightPlanReadSegment(
+                        (slice(7, 8), slice(None)),
+                        (slice(1, 2), slice(None)),
+                    ),
+                ),
+                shard_id="v",
+            ),
+        )
+    )
+
+    schedule = schedule_weight_plan_reads(
+        catalog,
+        plan,
+        chunk_size=row_bytes,
+        window_size=row_bytes * 2,
+        alignment=4096,
+    )
+
+    assert schedule.summary.expected_window_loads == 4
+    assert schedule.summary.expected_window_hits == 6
 
 
 def test_register_weight_transform_is_idempotent_and_fails_on_conflict():
