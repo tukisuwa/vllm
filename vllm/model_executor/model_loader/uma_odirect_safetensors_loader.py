@@ -752,7 +752,7 @@ class ODirectSafetensorsWeightSource:
         target = _select_contiguous_target_view(dst, target_slices, name)
 
         if source_slices is None:
-            if list(target.shape) != record.shape:
+            if tuple(target.shape) != record.shape:
                 raise RuntimeError(
                     f"read_into_cpu shape mismatch for {name}: "
                     f"dst={list(target.shape)}, source={record.shape}"
@@ -969,7 +969,7 @@ class ODirectSafetensorsWeightSource:
         sliced: bool,
     ) -> None:
         self._maybe_gate(f"before reading {record.name}", force=True)
-        if list(dst.shape) != record.shape:
+        if tuple(dst.shape) != record.shape:
             raise RuntimeError(
                 f"Destination shape mismatch for {record.name}: "
                 f"dst={list(dst.shape)}, source={record.shape}"

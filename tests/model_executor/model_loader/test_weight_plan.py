@@ -25,6 +25,13 @@ from vllm.model_executor.model_loader.weight_plan import (
 )
 
 
+def test_tensor_meta_shape_is_immutable_tuple():
+    meta = TensorMeta("model.safetensors", "w", torch.float32, [2, 3], 0, 24)
+
+    assert meta.shape == (2, 3)
+    assert isinstance(meta.shape, tuple)
+
+
 def test_weight_plan_summary_without_odirect_loader():
     catalog = TensorCatalog(
         [

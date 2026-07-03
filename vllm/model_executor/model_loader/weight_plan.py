@@ -4,7 +4,7 @@
 import json
 import math
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Protocol
 
@@ -51,14 +51,14 @@ def _round_up(value: int, align: int) -> int:
     return (value + align - 1) // align * align
 
 
-def _tensor_nbytes(shape: list[int], dtype: torch.dtype) -> int:
+def _tensor_nbytes(shape: Sequence[int], dtype: torch.dtype) -> int:
     elements = 1
     for dim in shape:
         elements *= dim
     return elements * _DTYPE_NBYTES[dtype]
 
 
-def _row_major_strides(shape: list[int]) -> list[int]:
+def _row_major_strides(shape: Sequence[int]) -> list[int]:
     strides: list[int] = []
     current = 1
     for dim in reversed(shape):
@@ -68,7 +68,7 @@ def _row_major_strides(shape: list[int]) -> list[int]:
 
 
 def _normalize_slice_selection(
-    shape: list[int],
+    shape: Sequence[int],
     selection: tuple[slice | int, ...],
 ) -> tuple[int, int, list[int]]:
     """Return byte-independent element offset/count/shape for a contiguous slice.
@@ -127,7 +127,7 @@ def _normalize_slice_selection(
 
 
 def _normalize_single_dim_slice_selection(
-    shape: list[int],
+    shape: Sequence[int],
     selection: tuple[slice | int, ...],
 ) -> tuple[int, int, int, int, list[int]] | None:
     """Return a strided row-major selection for one partially-sliced dimension.
@@ -195,9 +195,12 @@ class TensorMeta:
     file_path: str
     name: str
     dtype: torch.dtype
-    shape: list[int]
+    shape: tuple[int, ...]
     offset: int
     size: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "shape", tuple(self.shape))
 
 
 _TensorRecord = TensorMeta
@@ -584,7 +587,7 @@ class TensorCatalog:
                         f"Invalid safetensors shape for {name}: {shape_raw!r}"
                     )
                 start, end = data_offsets
-                shape = list(shape_raw)
+                shape = tuple(shape_raw)
                 if (
                     not isinstance(start, int)
                     or not isinstance(end, int)
