@@ -1558,3 +1558,20 @@ and calling `_split_fused_qkv_shards`, the builder emits three segmented
 side-channel is gone, so HunYuan load execution is now a single ordinary
 `execute_weight_plan()` call and the fused qkv staging/read volume is visible
 to plan summary and scheduler accounting.
+
+### 2026-07-03 Phase 3 stage 2f: DeepSeek conditional stacked specs
+
+DeepSeek now uses the shared declaration primitives for the portions that are
+pure data:
+
+- `StackedProjectionMap` tables for gate/up, wk/weights, MHA q/k/v, and MLA
+  q_a/kv_a fusion;
+- `RoutedExpertPattern` for ordinary routed experts;
+- `RoutedProjectionMap` for routed/shared expert projection names.
+
+The DeepSeek-specific target-existence checks remain in the builder-side
+wrapper where they belong.  If an MLA fused target is absent, mapping falls
+back to the original name; if a shared expert target exists as a normal model
+parameter, the shared-expert fallback entries are not emitted.  This follows
+the same shape as GLM4's rocm_aiter gate: conditions stay in Python, while the
+resulting plan remains concrete data.

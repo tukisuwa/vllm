@@ -22,8 +22,13 @@ from vllm.model_executor.model_loader.weight_plan import (
 )
 
 from .routed_moe_uma import (
-    RoutedMoeEntry,
+    RoutedExpertPattern,
     RoutedExpertsResolution,
+    RoutedMoeEntry,
+    RoutedProjectionMap,
+    RoutedProjectionRule,
+    StackedProjectionMap,
+    StackedProjectionRule,
     build_routed_moe_weight_plan,
     load_routed_moe_weights_from_source,
     routed_entry_requires_local_read,
@@ -43,70 +48,78 @@ class DeepseekMoeSourcePlan:
     routed_plan: WeightPlan
     fp8_indexer_wk_entries: tuple[DeepseekFp8IndexerWkEntry, ...] = ()
 
+_DEEPSEEK_BASE_STACKED_PROJECTIONS = StackedProjectionMap(
+    (
+        StackedProjectionRule(".gate_proj", ".gate_up_proj", 0),
+        StackedProjectionRule(".up_proj", ".gate_up_proj", 1),
+        StackedProjectionRule(".wk.", ".wk_weights_proj.", 0),
+        StackedProjectionRule(".weights_proj", ".wk_weights_proj", 1),
+    )
+)
+_DEEPSEEK_MHA_STACKED_PROJECTIONS = StackedProjectionMap(
+    (
+        StackedProjectionRule(".q_proj", ".qkv_proj", "q"),
+        StackedProjectionRule(".k_proj", ".qkv_proj", "k"),
+        StackedProjectionRule(".v_proj", ".qkv_proj", "v"),
+    )
+)
+_DEEPSEEK_MLA_STACKED_PROJECTIONS = StackedProjectionMap(
+    (
+        StackedProjectionRule(".q_a_proj", ".fused_qkv_a_proj", 0),
+        StackedProjectionRule(".kv_a_proj_with_mqa", ".fused_qkv_a_proj", 1),
+    )
+)
+_DEEPSEEK_ROUTED_EXPERT_PATTERN = RoutedExpertPattern(
+    module_path=("mlp", "experts"),
+    projections=("gate_proj", "down_proj", "up_proj"),
+)
+_DEEPSEEK_ROUTED_PROJECTION_MAP = RoutedProjectionMap(
+    (
+        RoutedProjectionRule("gate_proj", "w13", "w1"),
+        RoutedProjectionRule("up_proj", "w13", "w3"),
+        RoutedProjectionRule("down_proj", "w2", "w2"),
+    )
+)
+
 
 class _DeepseekSourceMapper:
     def __init__(self, model: nn.Module):
         self._params = dict(model.named_parameters())
-        self._mappings: list[tuple[str, str, int | str]] = [
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-            ("wk_weights_proj", "wk", 0),
-            ("wk_weights_proj", "weights_proj", 1),
-        ]
+        self._mapper = _DEEPSEEK_BASE_STACKED_PROJECTIONS.as_weights_mapper()
         if getattr(model, "use_mha", False):
-            self._mappings.extend(
-                [
-                    ("qkv_proj", "q_proj", "q"),
-                    ("qkv_proj", "k_proj", "k"),
-                    ("qkv_proj", "v_proj", "v"),
-                ]
+            self._mapper = (
+                self._mapper
+                | _DEEPSEEK_MHA_STACKED_PROJECTIONS.as_weights_mapper()
             )
         else:
-            self._mappings.extend(
-                [
-                    ("fused_qkv_a_proj", "q_a_proj", 0),
-                    ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
-                ]
+            self._mapper = (
+                self._mapper
+                | _DEEPSEEK_MLA_STACKED_PROJECTIONS.as_weights_mapper()
             )
 
     def _map_name_with_shard(self, name: str) -> tuple[str, int | str | None] | None:
-        for param_name, weight_name, shard_id in self._mappings:
-            if weight_name not in name:
-                continue
-            mapped_name = name.replace(weight_name, param_name, 1)
-            if (
-                param_name == "fused_qkv_a_proj"
-                and mapped_name not in self._params
-            ):
-                continue
-            if mapped_name.endswith(".bias") and mapped_name not in self._params:
-                return mapped_name, shard_id
+        mapped = self._mapper._map_name_with_shard(name)
+        if mapped is None:
+            return None
+        mapped_name, shard_id = mapped
+        if (
+            "fused_qkv_a_proj" in mapped_name
+            and mapped_name not in self._params
+        ):
+            return name, None
+        if mapped_name.endswith(".bias") and mapped_name not in self._params:
             return mapped_name, shard_id
-        return name, None
+        return mapped_name, shard_id
+
+    def target_exists(self, name: str) -> bool:
+        mapped = self._mapper._map_name_with_shard(name)
+        return mapped is not None and mapped[0] in self._params
 
 
 def _parse_deepseek_routed_expert_name(
     name: str,
 ) -> tuple[int, int, str, str] | None:
-    parts = name.split(".")
-    for idx in range(len(parts) - 6):
-        if parts[idx] != "layers":
-            continue
-        if (
-            not parts[idx + 1].isdigit()
-            or parts[idx + 2] != "mlp"
-            or parts[idx + 3] != "experts"
-            or not parts[idx + 4].isdigit()
-        ):
-            continue
-        proj_name = parts[idx + 5]
-        if proj_name not in ("gate_proj", "down_proj", "up_proj"):
-            continue
-        suffix = ".".join(parts[idx + 6 :])
-        if not suffix:
-            return None
-        return int(parts[idx + 1]), int(parts[idx + 4]), proj_name, suffix
-    return None
+    return _DEEPSEEK_ROUTED_EXPERT_PATTERN.parse(name)
 
 
 def _parse_deepseek_shared_expert_name(
@@ -125,21 +138,11 @@ def _parse_deepseek_shared_expert_name(
         proj_name = parts[idx + 4]
         if proj_name not in ("gate_proj", "down_proj", "up_proj"):
             continue
-        suffix = ".".join(parts[idx + 5 :])
+        suffix = ".".join(parts[idx + 5:])
         if not suffix:
             return None
         return int(parts[idx + 1]), proj_name, suffix
     return None
-
-
-def _routed_param_for_projection(proj_name: str, suffix: str) -> tuple[str, str]:
-    if proj_name == "gate_proj":
-        return f"w13_{suffix}", "w1"
-    if proj_name == "up_proj":
-        return f"w13_{suffix}", "w3"
-    if proj_name == "down_proj":
-        return f"w2_{suffix}", "w2"
-    raise ValueError(f"Unsupported DeepSeek routed expert projection {proj_name!r}")
 
 
 def _resolve_routed_experts_for_layer(
@@ -175,8 +178,7 @@ def _deepseek_shared_expert_target_exists(
     mapper: _DeepseekSourceMapper,
     name: str,
 ) -> bool:
-    mapped = mapper._map_name_with_shard(name)
-    return mapped is not None and mapped[0] in mapper._params
+    return mapper.target_exists(name)
 
 
 def _build_deepseek_shared_expert_entries(
@@ -228,7 +230,7 @@ def _build_deepseek_shared_expert_entries(
                 f"divisible by n_shared_experts={n_shared_experts}"
             )
         chunk_size = total // n_shared_experts
-        param_name, shard_id = _routed_param_for_projection(proj_name, suffix)
+        param_name, shard_id = _DEEPSEEK_ROUTED_PROJECTION_MAP.map(proj_name, suffix)
         weight_name = f"{routed_experts.layer_name}.{param_name}"
         for shared_idx in range(n_shared_experts):
             source_slices: list[slice | int] = [
@@ -345,7 +347,7 @@ def build_deepseek_moe_weight_plan(
             catalog,
             family_name="DeepSeek MoE",
             parse_name=_parse_deepseek_routed_expert_name,
-            map_projection=_routed_param_for_projection,
+            map_projection=_DEEPSEEK_ROUTED_PROJECTION_MAP.map,
             resolve_routed_experts=_resolve_routed_experts_for_layer,
             auto_skip_substr=".mlp.experts.",
             mapper=mapper,
