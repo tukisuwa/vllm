@@ -870,10 +870,10 @@ check that a model implements both hooks or neither.  The O_DIRECT loader now
 uses this neutral helper instead of open-coding the hook detection.
 
 The neutral module also defines the initial `ExecutorCapability` dataclass and
-an `ExecutorCapability.uma_odirect()` constructor.  This is not wired into read
-scheduling yet, but it gives future schedule validation a model-independent
-place to express fail-closed behavior, mmap policy, alignment requirements, and
-staging limits.
+an `ExecutorCapability.for_aligned_direct_io()` constructor.  This is not wired
+into read scheduling yet, but it gives future schedule validation a
+model-independent place to express fail-closed behavior, mmap policy,
+alignment requirements, and staging limits.
 
 ### 2026-07-03 design review
 
@@ -1655,3 +1655,32 @@ Remaining validation note for the RFC: the standard three-model smoke does not
 exercise real `read_segments` checkpoint bytes.  TeleChat2, HunYuan, or Llama4
 should be added to the smoke matrix when a suitable checkpoint is available;
 registry and golden tests cover the segment shape in the meantime.
+
+### 2026-07-03 review hardening
+
+The high/medium issues from the branch review are addressed before the RFC
+track moves forward:
+
+- Routed and shared-expert plan building now applies explicit skip predicates
+  before parsing routed names.  This keeps DeepSeek MTP/nextn checkpoint
+  tensors in the auto skipped-entry path instead of resolving out-of-range
+  model layers.
+- `read_segments` now has an executor-level final guard: segment targets must
+  cover the staging tensor exactly once, with no overlaps or unwritten gaps.
+  The same validation is used by summary, scheduling, and execution.
+- TP output-dim slice inference now fails closed if the private
+  `_get_shard_size_mapping()` helper raises, instead of silently falling back
+  to a full-tensor read.
+- The neutral capability helper is named
+  `ExecutorCapability.for_aligned_direct_io()` instead of using the fork-only
+  UMA/O_DIRECT name.
+- DeepSeek FP8 `indexer.wk` manual two-source dequantization is still a
+  model-side postprocess, but its weight and scale reads are represented by a
+  supplemental `WeightPlan` for expected-byte accounting.
+- `return_success` refusal checks now cover shard-only loader calls as well as
+  expert-routed calls.
+
+Lower-priority review items remain separate follow-ups: PSI gate batching for
+very large segment counts, possible fused-entry coalescing to reduce
+window-cache sweeps, shared gate/PSI helper cleanup, broader real O_DIRECT
+tests, and adding a real segment-family checkpoint to the smoke matrix.

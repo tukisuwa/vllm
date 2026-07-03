@@ -45,6 +45,7 @@ from vllm.model_executor.model_loader.weight_plan import (
     resolve_weight_plan_source_hooks,
     schedule_weight_plan_reads,
     summarize_weight_plan,
+    validate_weight_plan_read_segments,
     verify_loaded_weights,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -221,10 +222,12 @@ def _call_weight_loader(
                 # convention.
                 if "loaded_shard_id" in params:
                     extra_args.append(call_kwargs.pop("shard_id"))
-            if "expert_id" in call_kwargs and "return_success" in params:
-                # Expert loaders report refusal (for example a non-local
-                # expert) through return_success.  The plan already decided
-                # this entry is local and required, so a refusal means the
+            if (
+                ("expert_id" in call_kwargs or "shard_id" in call_kwargs)
+                and "return_success" in params
+            ):
+                # Some loaders report refusal through return_success.  The plan
+                # already decided this entry is required, so a refusal means the
                 # plan and the loader disagree and the load must fail closed.
                 call_kwargs["return_success"] = True
                 expects_success = True
@@ -380,21 +383,7 @@ def execute_weight_plan(
                 f"read_into_cpu=True: {entry.checkpoint_name}"
             )
         if entry.read_segments is not None:
-            if not entry.read_into_cpu:
-                raise RuntimeError(
-                    "WeightPlanEntry.read_segments is only supported with "
-                    f"read_into_cpu=True: {entry.checkpoint_name}"
-                )
-            if entry.staging_shape is None:
-                raise RuntimeError(
-                    "WeightPlanEntry.read_segments requires staging_shape: "
-                    f"{entry.checkpoint_name}"
-                )
-            if entry.source_slices is not None or entry.target_slices is not None:
-                raise RuntimeError(
-                    "WeightPlanEntry.read_segments cannot be combined with "
-                    f"source_slices/target_slices: {entry.checkpoint_name}"
-                )
+            validate_weight_plan_read_segments(record, entry)
 
         if entry.read_segments is not None:
             empty_cpu_shape = getattr(source, "empty_cpu_shape", None)

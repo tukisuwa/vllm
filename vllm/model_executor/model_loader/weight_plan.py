@@ -416,6 +416,77 @@ class WeightPlanEntry:
     skip_reason: str | None = None
 
 
+def validate_weight_plan_read_segments(
+    record: TensorMeta,
+    entry: WeightPlanEntry,
+) -> None:
+    """Validate segmented staging covers the destination exactly once."""
+
+    if entry.read_segments is None:
+        return
+    if not entry.read_into_cpu:
+        raise RuntimeError(
+            "WeightPlanEntry.read_segments is only supported with "
+            f"read_into_cpu=True: {entry.checkpoint_name}"
+        )
+    if entry.staging_shape is None:
+        raise RuntimeError(
+            "WeightPlanEntry.read_segments requires staging_shape: "
+            f"{entry.checkpoint_name}"
+        )
+    if entry.source_slices is not None or entry.target_slices is not None:
+        raise RuntimeError(
+            "WeightPlanEntry.read_segments cannot be combined with "
+            f"source_slices/target_slices: {entry.checkpoint_name}"
+        )
+    if not entry.read_segments:
+        raise RuntimeError(
+            "WeightPlanEntry.read_segments must be non-empty: "
+            f"{entry.checkpoint_name}"
+        )
+
+    intervals: list[tuple[int, int]] = []
+    total_elements = math.prod(entry.staging_shape)
+    for segment in entry.read_segments:
+        source_shape = _weight_plan_entry_target_shape(record, segment.source_slices)
+        try:
+            target_offset, target_count, target_shape = _normalize_slice_selection(
+                entry.staging_shape,
+                segment.target_slices,
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "WeightPlanEntry.read_segments target_slices must be contiguous "
+                f"in staging_shape: {entry.checkpoint_name}"
+            ) from exc
+        if tuple(target_shape) != source_shape:
+            raise RuntimeError(
+                "WeightPlanEntry.read_segments target shape mismatch for "
+                f"{entry.checkpoint_name}: target={target_shape}, "
+                f"source_slice={list(source_shape)}"
+            )
+        intervals.append((target_offset, target_offset + target_count))
+
+    cursor = 0
+    for start, end in sorted(intervals):
+        if start != cursor:
+            if start < cursor:
+                raise RuntimeError(
+                    "WeightPlanEntry.read_segments overlap in staging tensor: "
+                    f"{entry.checkpoint_name}"
+                )
+            raise RuntimeError(
+                "WeightPlanEntry.read_segments leave an unwritten staging gap: "
+                f"{entry.checkpoint_name}"
+            )
+        cursor = end
+    if cursor != total_elements:
+        raise RuntimeError(
+            "WeightPlanEntry.read_segments leave an unwritten staging gap: "
+            f"{entry.checkpoint_name}"
+        )
+
+
 @dataclass(frozen=True)
 class WeightPlan:
     entries: tuple[WeightPlanEntry, ...]
@@ -692,7 +763,7 @@ class ExecutorCapability:
     max_staging_bytes: int | None = None
 
     @classmethod
-    def uma_odirect(
+    def for_aligned_direct_io(
         cls,
         *,
         max_staging_bytes: int | None = None,
@@ -872,8 +943,12 @@ def _infer_output_dim_local_shard_size(
     if callable(get_size):
         try:
             shard_size = get_size(shard_id)
-        except Exception:
-            shard_size = None
+        except Exception as exc:
+            raise RuntimeError(
+                "WeightPlan TP slice inference failed while querying "
+                f"_get_shard_size_mapping({shard_id!r}) for {record.name}; "
+                "refusing to silently fall back to a full tensor read"
+            ) from exc
         if isinstance(shard_size, int) and shard_size > 0:
             if shard_size <= param_output_size:
                 return shard_size
@@ -1110,16 +1185,7 @@ def summarize_weight_plan(
         required_entries += 1
         record = catalog.get(entry.checkpoint_name)
         if entry.read_segments is not None:
-            if not entry.read_into_cpu:
-                raise RuntimeError(
-                    "WeightPlanEntry.read_segments is only supported with "
-                    f"read_into_cpu=True: {entry.checkpoint_name}"
-                )
-            if entry.source_slices is not None or entry.target_slices is not None:
-                raise RuntimeError(
-                    "WeightPlanEntry.read_segments cannot be combined with "
-                    f"source_slices/target_slices: {entry.checkpoint_name}"
-                )
+            validate_weight_plan_read_segments(record, entry)
             read_into_entries += 1
             payload_size = sum(
                 _weight_plan_entry_payload_size(record, segment.source_slices)
@@ -1172,6 +1238,7 @@ def _weight_plan_read_ranges(
         return ()
     record = catalog.get(entry.checkpoint_name)
     if entry.read_segments is not None:
+        validate_weight_plan_read_segments(record, entry)
         ranges: list[_PlanReadRange] = []
         for segment in entry.read_segments:
             ranges.extend(

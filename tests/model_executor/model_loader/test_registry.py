@@ -1646,6 +1646,91 @@ def test_uma_odirect_execute_weight_plan_rejects_bad_read_segments():
             ),
         )
 
+    with pytest.raises(RuntimeError, match="unwritten staging gap"):
+        summarize_weight_plan(
+            catalog,
+            WeightPlan(
+                (
+                    WeightPlanEntry(
+                        "kv",
+                        "param",
+                        read_into_cpu=True,
+                        staging_shape=(2, 2),
+                        read_segments=(
+                            WeightPlanReadSegment(
+                                (slice(0, 1), slice(None)),
+                                (slice(0, 1), slice(None)),
+                            ),
+                        ),
+                    ),
+                )
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match="overlap in staging tensor"):
+        summarize_weight_plan(
+            catalog,
+            WeightPlan(
+                (
+                    WeightPlanEntry(
+                        "kv",
+                        "param",
+                        read_into_cpu=True,
+                        staging_shape=(2, 2),
+                        read_segments=(
+                            WeightPlanReadSegment(
+                                (slice(0, 2), slice(None)),
+                                (slice(0, 2), slice(None)),
+                            ),
+                            WeightPlanReadSegment(
+                                (slice(0, 1), slice(None)),
+                                (slice(1, 2), slice(None)),
+                            ),
+                        ),
+                    ),
+                )
+            ),
+        )
+
+
+def test_uma_odirect_execute_weight_plan_rejects_shard_loader_refusal():
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", "q", torch.float32, [1], 0, 4),
+        ]
+    )
+
+    class FakeSource:
+        def __init__(self):
+            self.catalog = catalog
+
+        def read_full_cpu(self, name):
+            assert name == "q"
+            return torch.ones(1)
+
+    class FakeParam:
+        def weight_loader(
+            self,
+            param,
+            loaded_weight,
+            shard_id,
+            return_success=False,
+        ):
+            assert param is self
+            assert shard_id == "q"
+            assert loaded_weight.tolist() == [1.0]
+            return False if return_success else None
+
+    class FakeModel:
+        param = FakeParam()
+
+    with pytest.raises(RuntimeError, match="weight_loader refused"):
+        execute_weight_plan(
+            FakeModel(),
+            FakeSource(),
+            WeightPlan((WeightPlanEntry("q", "param", shard_id="q"),)),
+        )
+
 
 def test_uma_odirect_execute_weight_plan_rejects_target_slices_without_read_into(
     tmp_path,
@@ -7016,6 +7101,7 @@ def test_deepseek_moe_source_plan_loads_fp8_indexer_wk_pair(monkeypatch):
             self.catalog = catalog
             self.reads = []
             self.skips = []
+            self.expected = None
 
         def read_full_cpu(self, name):
             self.reads.append(name)
@@ -7027,6 +7113,9 @@ def test_deepseek_moe_source_plan_loads_fp8_indexer_wk_pair(monkeypatch):
 
         def skip(self, name, reason):
             self.skips.append((name, reason))
+
+        def set_expected_read_summary(self, summary):
+            self.expected = summary
 
     def fake_scaled_dequantize(weight, scale, *, group_shape, out_dtype):
         assert weight.dtype == torch.float8_e4m3fn
@@ -7048,6 +7137,10 @@ def test_deepseek_moe_source_plan_loads_fp8_indexer_wk_pair(monkeypatch):
     assert [entry.weight_name for entry in plan.fp8_indexer_wk_entries] == [
         weight_name
     ]
+    assert [entry.checkpoint_name for entry in plan.fp8_indexer_wk_plan.entries] == [
+        weight_name,
+        scale_name,
+    ]
     assert len(_auto_plan_entries(plan.routed_plan)) == 2
 
     loaded = model.load_weights_from_source(source, plan)
@@ -7058,8 +7151,63 @@ def test_deepseek_moe_source_plan_loads_fp8_indexer_wk_pair(monkeypatch):
     ]
     _assert_same_reads(source.reads, [weight_name, scale_name])
     assert loaded == {target_name}
+    assert source.expected is not None
+    assert source.expected.expected_bytes_read == 8
     assert model.target.loaded[0][0].tolist() == [[3, 3], [3, 3]]
     assert model.target.loaded[0][1] == 0
+
+
+def test_deepseek_moe_source_plan_skips_mtp_routed_names_before_resolve():
+    routed_name = "model.layers.1.mlp.experts.0.gate_proj.weight"
+    shared_name = "model.layers.1.mlp.shared_experts.gate_proj.weight"
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", routed_name, torch.float32, [1], 0, 4),
+            TensorMeta("model.safetensors", shared_name, torch.float32, [1], 4, 4),
+        ]
+    )
+
+    class FakeConfig:
+        tie_word_embeddings = False
+        num_nextn_predict_layers = 1
+        n_routed_experts = 1
+        n_shared_experts = 1
+
+    class FakeLayers:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, idx):
+            raise AssertionError(f"layer resolution should be skipped: {idx}")
+
+    class FakeInnerModel:
+        layers = FakeLayers()
+
+    class FakeDeepseek(nn.Module):
+        use_mha = True
+        config = FakeConfig()
+
+        def __init__(self):
+            super().__init__()
+            self.model = FakeInnerModel()
+
+        def named_parameters(self, *args, **kwargs):
+            return iter(())
+
+        def children(self):
+            return []
+
+    plan = deepseek_uma.build_deepseek_moe_weight_plan(
+        FakeDeepseek(),
+        catalog,
+        skip_predicate=lambda name: name.startswith("model.layers.1."),
+    )
+
+    assert [entry.checkpoint_name for entry in plan.routed_plan.entries] == [
+        routed_name,
+        shared_name,
+    ]
+    assert all(not entry.required for entry in plan.routed_plan.entries)
 
 
 def test_granite_moe_source_plan_slices_fused_expert_tensors_before_read():

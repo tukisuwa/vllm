@@ -274,6 +274,14 @@ def build_routed_moe_weight_plan(
 ) -> WeightPlan:
     routed_entries: list[RoutedMoeEntry] = []
     for name in catalog.names():
+        if skip_predicate is not None and skip_predicate(name):
+            continue
+        if skip_prefixes is not None and any(
+            name.startswith(prefix) for prefix in skip_prefixes
+        ):
+            continue
+        if skip_substrs is not None and any(substr in name for substr in skip_substrs):
+            continue
         parsed = parse_name(name)
         if parsed is None:
             continue

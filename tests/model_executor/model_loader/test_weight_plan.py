@@ -133,6 +133,31 @@ def test_resolve_weight_plan_fills_tp_source_slices():
     assert summary.full_payload_bytes == 0
 
 
+def test_resolve_weight_plan_fails_closed_on_shard_size_mapping_error():
+    class Owner:
+        def _get_shard_size_mapping(self, _shard_id):
+            raise RuntimeError("mapping changed")
+
+        def weight_loader(self, *_args, **_kwargs):
+            pass
+
+    param = torch.nn.Parameter(torch.zeros(4, 4), requires_grad=False)
+    param.output_dim = 0
+    param.tp_rank = 1
+    param.tp_size = 2
+    param.weight_loader = Owner().weight_loader
+    model = types.SimpleNamespace(w=param)
+    catalog = TensorCatalog(
+        [
+            TensorMeta("model.safetensors", "w", torch.float32, [8, 4], 0, 128),
+        ]
+    )
+    plan = WeightPlan((WeightPlanEntry("w", "w", shard_id="q"),))
+
+    with pytest.raises(RuntimeError, match="refusing to silently fall back"):
+        resolve_weight_plan(model, catalog, plan)
+
+
 def test_resolve_weight_plan_leaves_expert_and_explicit_entries_untouched():
     param = torch.nn.Parameter(torch.zeros(4, 4), requires_grad=False)
     param.output_dim = 0
@@ -176,8 +201,8 @@ def test_verify_loaded_weights_exempts_postprocess_quant_modules():
     verify_loaded_weights(model, set())
 
 
-def test_executor_capability_uma_odirect_defaults_fail_closed():
-    capability = ExecutorCapability.uma_odirect(max_staging_bytes=1024)
+def test_executor_capability_aligned_direct_io_defaults_fail_closed():
+    capability = ExecutorCapability.for_aligned_direct_io(max_staging_bytes=1024)
 
     assert capability.supports_partial_read is True
     assert capability.supports_strided_read is True

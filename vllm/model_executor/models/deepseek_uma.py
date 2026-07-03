@@ -3,7 +3,7 @@
 """UMA-safe WeightSource helpers for DeepSeek V2/V3-style MoE models."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -19,6 +19,8 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
     WeightPlan,
+    WeightPlanEntry,
+    schedule_weight_plan_reads,
 )
 
 from .routed_moe_uma import (
@@ -47,6 +49,9 @@ class DeepseekFp8IndexerWkEntry:
 class DeepseekMoeSourcePlan:
     routed_plan: WeightPlan
     fp8_indexer_wk_entries: tuple[DeepseekFp8IndexerWkEntry, ...] = ()
+    fp8_indexer_wk_plan: WeightPlan = field(
+        default_factory=lambda: WeightPlan(())
+    )
 
 _DEEPSEEK_BASE_STACKED_PROJECTIONS = StackedProjectionMap(
     (
@@ -185,11 +190,14 @@ def _build_deepseek_shared_expert_entries(
     model: nn.Module,
     catalog: TensorCatalog,
     mapper: _DeepseekSourceMapper,
+    skip_predicate: Callable[[str], bool] | None = None,
 ) -> list[RoutedMoeEntry]:
     entries: list[RoutedMoeEntry] = []
     n_routed_experts = getattr(getattr(model, "config", None), "n_routed_experts", None)
     n_shared_experts = getattr(getattr(model, "config", None), "n_shared_experts", None)
     for name in catalog.names():
+        if skip_predicate is not None and skip_predicate(name):
+            continue
         parsed = _parse_deepseek_shared_expert_name(name)
         if parsed is None:
             continue
@@ -262,7 +270,7 @@ def _build_deepseek_shared_expert_entries(
 def _build_deepseek_fp8_indexer_wk_entries(
     model: nn.Module,
     catalog: TensorCatalog,
-) -> list[DeepseekFp8IndexerWkEntry]:
+) -> tuple[list[DeepseekFp8IndexerWkEntry], WeightPlan]:
     params = dict(model.named_parameters())
     indexer_present_prefixes = {
         name.rsplit(".indexer.", 1)[0]
@@ -270,6 +278,7 @@ def _build_deepseek_fp8_indexer_wk_entries(
         if ".indexer." in name
     }
     entries: list[DeepseekFp8IndexerWkEntry] = []
+    plan_entries: list[WeightPlanEntry] = []
     for name in catalog.names():
         if "indexer.wk." not in name or "wk_weights" in name:
             continue
@@ -300,7 +309,21 @@ def _build_deepseek_fp8_indexer_wk_entries(
                 target_name=target_name,
             )
         )
-    return entries
+        plan_entries.extend(
+            (
+                WeightPlanEntry(
+                    checkpoint_name=name,
+                    target_name=target_name,
+                    weight_name=target_name,
+                ),
+                WeightPlanEntry(
+                    checkpoint_name=scale_name,
+                    target_name=target_name,
+                    weight_name=f"{target_name}:scale_inv",
+                ),
+            )
+        )
+    return entries, WeightPlan(tuple(plan_entries))
 
 
 def build_deepseek_moe_weight_plan(
@@ -315,8 +338,11 @@ def build_deepseek_moe_weight_plan(
         model,
         catalog,
         mapper,
+        skip_predicate,
     )
-    fp8_indexer_wk_entries = _build_deepseek_fp8_indexer_wk_entries(model, catalog)
+    fp8_indexer_wk_entries, fp8_indexer_wk_plan = (
+        _build_deepseek_fp8_indexer_wk_entries(model, catalog)
+    )
     fp8_indexer_names = {
         name
         for entry in fp8_indexer_wk_entries
@@ -356,6 +382,7 @@ def build_deepseek_moe_weight_plan(
             extra_routed_entries=shared_expert_entries,
         ),
         fp8_indexer_wk_entries=tuple(fp8_indexer_wk_entries),
+        fp8_indexer_wk_plan=fp8_indexer_wk_plan,
     )
 
 
@@ -394,4 +421,15 @@ def load_deepseek_moe_weights_from_source(
         param = params[entry.target_name]
         param.weight_loader(param, weight_bf16, 0)
         loaded.add(entry.target_name)
+    set_expected_read_summary = getattr(source, "set_expected_read_summary", None)
+    if callable(set_expected_read_summary) and plan.fp8_indexer_wk_plan.entries:
+        loader = getattr(source, "_loader", None)
+        schedule = schedule_weight_plan_reads(
+            source.catalog,
+            WeightPlan((*plan.routed_plan.entries, *plan.fp8_indexer_wk_plan.entries)),
+            chunk_size=getattr(loader, "_chunk_size", 8 * 1024 * 1024),
+            window_size=getattr(loader, "_window_size", 128 * 1024 * 1024),
+            alignment=getattr(loader, "_alignment", 4096),
+        )
+        set_expected_read_summary(schedule.summary)
     return loaded
