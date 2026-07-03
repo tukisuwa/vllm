@@ -1418,3 +1418,23 @@ and MiniMax M2 with the existing pattern; (2) `StackedProjection` — highest
 leverage (five families) and the strongest upstream-RFC story; (3)
 `SliceRule` — hardest, config-dependent; (4) fold Llama4's
 `fused_expert_entries` composite last, once slices are declarative.
+
+### 2026-07-03 Phase 3 stage 2a: NameRewrite primitive
+
+`routed_moe_uma.py` now includes the first deviation primitive:
+
+- `NameRewriteRule(old, new, count=1)` for one literal substitution;
+- `NameRewriter(rules)` for ordered composition.
+
+Rules fail closed unless `old` is boundary-aware: either dot-anchored for
+internal replacements (for example `.attention.`) or explicit prefix-style
+(`model.` / `model.word_embeddings.`).  Prefix-style rules only apply at the
+start of a checkpoint name, so a middle-token occurrence such as
+`prefix.model.word_embeddings.weight` is not rewritten.
+
+Param2MoE now uses `NameRewriter` for its attention/embedding checkpoint
+spelling changes before applying `RoutedExpertPattern`.  MiniMax M2 uses the
+same primitive for its `model.` prefix strip before routed pattern parsing and
+auto-plan mapping.  Family-specific transform behavior still remains outside
+the rewrite primitive: Param2MoE's expert-bias `zero_mean` transform is kept in
+its existing `name_transform`.

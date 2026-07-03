@@ -32,6 +32,8 @@ from vllm.model_executor.model_loader.weight_plan import (
     summarize_weight_plan,
 )
 from vllm.model_executor.models.routed_moe_uma import (
+    NameRewriteRule,
+    NameRewriter,
     RoutedExpertPattern,
     RoutedProjectionMap,
     RoutedProjectionRule,
@@ -204,6 +206,28 @@ def test_routed_expert_pattern_parses_standard_moe_names():
     assert jamba_pattern.parse(
         "model.layers.1.feed_forward.experts.7.gate_proj.weight"
     ) == (1, 7, "gate_proj", "weight")
+
+
+def test_name_rewriter_applies_ordered_anchored_rewrites():
+    rewriter = NameRewriter(
+        (
+            NameRewriteRule("model.word_embeddings.", "model.embed_tokens."),
+            NameRewriteRule(".attention.", ".self_attn."),
+        )
+    )
+
+    assert rewriter.apply(
+        "model.word_embeddings.weight"
+    ) == "model.embed_tokens.weight"
+    assert rewriter.apply(
+        "model.layers.0.attention.dense.weight"
+    ) == "model.layers.0.self_attn.dense.weight"
+    assert rewriter.apply(
+        "prefix.model.word_embeddings.weight"
+    ) == "prefix.model.word_embeddings.weight"
+
+    with pytest.raises(ValueError, match="dot-anchored"):
+        NameRewriteRule("attention", "self_attn")
 
 
 def _entry_local_required(entry):

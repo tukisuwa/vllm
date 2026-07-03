@@ -40,6 +40,45 @@ class RoutedMoeEntry:
 
 
 @dataclass(frozen=True)
+class NameRewriteRule:
+    old: str
+    new: str
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if not self.old:
+            raise ValueError("NameRewriteRule.old must be non-empty")
+        if self.count < 1:
+            raise ValueError("NameRewriteRule.count must be positive")
+        if not (
+            self.old.startswith(".")
+            or self.old.endswith(".")
+            or self.old.startswith("model.")
+        ):
+            raise ValueError(
+                "NameRewriteRule.old must be dot-anchored or explicitly "
+                f"prefix-anchored, got {self.old!r}"
+            )
+
+    def apply(self, name: str) -> str:
+        if not self.old.startswith("."):
+            if not name.startswith(self.old):
+                return name
+            return name.replace(self.old, self.new, 1)
+        return name.replace(self.old, self.new, self.count)
+
+
+@dataclass(frozen=True)
+class NameRewriter:
+    rules: tuple[NameRewriteRule, ...]
+
+    def apply(self, name: str) -> str:
+        for rule in self.rules:
+            name = rule.apply(name)
+        return name
+
+
+@dataclass(frozen=True)
 class RoutedExpertPattern:
     """Declarative parser for common per-expert checkpoint names.
 

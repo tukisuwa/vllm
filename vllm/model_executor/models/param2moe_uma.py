@@ -4,7 +4,6 @@
 
 from typing import Any
 
-import torch
 from torch import nn
 
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
@@ -19,8 +18,13 @@ from vllm.model_executor.model_loader.weight_plan import (
 from vllm.model_executor.models.utils import WeightsMapper
 
 from .routed_moe_uma import (
+    NameRewriteRule,
+    NameRewriter,
+    RoutedExpertPattern,
     RoutedExpertsResolution,
     RoutedMoeEntry,
+    RoutedProjectionMap,
+    RoutedProjectionRule,
     build_routed_moe_weight_plan,
     load_routed_moe_weights_from_source,
 )
@@ -30,14 +34,31 @@ from .utils import PPMissingLayer
 Param2MoeRoutedEntry = RoutedMoeEntry
 Param2MoeSourcePlan = WeightPlan
 
+_PARAM2MOE_NAME_REWRITER = NameRewriter(
+    (
+        NameRewriteRule("model.word_embeddings.", "model.embed_tokens."),
+        NameRewriteRule(".attention.query_key_value.", ".self_attn.qkv_proj."),
+        NameRewriteRule(".attention.dense.", ".self_attn.o_proj."),
+        NameRewriteRule(".attention.query_layernorm.", ".self_attn.q_layernorm."),
+        NameRewriteRule(".attention.key_layernorm.", ".self_attn.k_layernorm."),
+        NameRewriteRule(".attention.", ".self_attn."),
+    )
+)
+_PARAM2MOE_ROUTED_EXPERT_PATTERN = RoutedExpertPattern(
+    module_path=("mlp", "experts"),
+    projections=("gate_proj", "down_proj", "up_proj"),
+)
+_PARAM2MOE_ROUTED_PROJECTION_MAP = RoutedProjectionMap(
+    (
+        RoutedProjectionRule("gate_proj", "w13", "w1"),
+        RoutedProjectionRule("up_proj", "w13", "w3"),
+        RoutedProjectionRule("down_proj", "w2", "w2"),
+    )
+)
+
 
 def _param2moe_name_transform(name: str):
-    name = name.replace("model.word_embeddings.", "model.embed_tokens.")
-    name = name.replace(".attention.query_key_value.", ".self_attn.qkv_proj.")
-    name = name.replace(".attention.dense.", ".self_attn.o_proj.")
-    name = name.replace(".attention.query_layernorm.", ".self_attn.q_layernorm.")
-    name = name.replace(".attention.key_layernorm.", ".self_attn.k_layernorm.")
-    name = name.replace(".attention.", ".self_attn.")
+    name = _PARAM2MOE_NAME_REWRITER.apply(name)
     if name.endswith(".mlp.gate.expert_bias"):
         name = name.replace(
             ".mlp.gate.expert_bias",
@@ -62,39 +83,7 @@ def _parse_param2moe_routed_expert_name(
     transformed = _param2moe_name_transform(name)
     if transformed is None:
         return None
-    name = transformed[0]
-    parts = name.split(".")
-    for idx in range(len(parts) - 6):
-        if parts[idx] != "layers":
-            continue
-        if (
-            not parts[idx + 1].isdigit()
-            or parts[idx + 2] != "mlp"
-            or parts[idx + 3] != "experts"
-            or not parts[idx + 4].isdigit()
-        ):
-            continue
-        proj_name = parts[idx + 5]
-        if proj_name not in ("gate_proj", "down_proj", "up_proj"):
-            continue
-        suffix = ".".join(parts[idx + 6 :])
-        if not suffix:
-            return None
-        return int(parts[idx + 1]), int(parts[idx + 4]), proj_name, suffix
-    return None
-
-
-def _routed_param_for_projection(
-    proj_name: str,
-    suffix: str,
-) -> tuple[str, str]:
-    if proj_name == "gate_proj":
-        return f"w13_{suffix}", "w1"
-    if proj_name == "up_proj":
-        return f"w13_{suffix}", "w3"
-    if proj_name == "down_proj":
-        return f"w2_{suffix}", "w2"
-    raise ValueError(f"Unsupported Param2MoE expert projection {proj_name!r}")
+    return _PARAM2MOE_ROUTED_EXPERT_PATTERN.parse(transformed[0])
 
 
 def _resolve_routed_experts_for_layer(
@@ -192,7 +181,7 @@ def build_param2moe_weight_plan(
         catalog,
         family_name="Param2MoE",
         parse_name=_parse_param2moe_routed_expert_name,
-        map_projection=_routed_param_for_projection,
+        map_projection=_PARAM2MOE_ROUTED_PROJECTION_MAP.map,
         resolve_routed_experts=_resolve_routed_experts_for_layer,
         auto_skip_substr=".mlp.experts.",
         mapper=_param2moe_weight_mapper(),
