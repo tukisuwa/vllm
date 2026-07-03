@@ -474,6 +474,27 @@ This keeps range coalescing model-independent.  It also avoids treating
 read scheduling is the architectural layer that prevents repeated large reads
 for many small tensors.
 
+There are two levels of coalescing:
+
+1. Range scheduling without new IR.  The executor can flatten required entry
+   ranges, group them by checkpoint file/name, and read source offsets in
+   ascending order when the destination staging tensors are independent.  This
+   is the preferred first step because it preserves the existing `WeightPlan`
+   schema and only changes executor scheduling.
+2. A fused-source read primitive.  If range scheduling cannot remove repeated
+   sweeps for entries that share one large checkpoint tensor, add an explicit
+   grouped-read IR node whose children are ordinary `WeightPlanEntry` targets.
+   This is higher risk because it changes the serialized plan shape and must be
+   justified in the upstream RFC.
+
+The first concrete target is fused checkpoint tensors split into multiple
+entries: HunYuan q/k/v from one interleaved QKV tensor, TeleChat2 k/v from one
+interleaved tensor, and Llama4 gate/up splits.  The failure mode is repeated
+single-window sweeps over the same large tensor when each logical entry is
+executed independently.  This should be visible as expected read amplification
+before implementation; actual checkpoint validation is still required because
+the standard Qwen smoke set does not exercise real `read_segments` bytes.
+
 Placement and scheduling should remain separate.  Placement describes what this
 rank needs and where it goes; scheduling describes how an executor groups,
 orders, gates, and releases concrete reads.

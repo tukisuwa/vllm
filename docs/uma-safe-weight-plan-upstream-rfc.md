@@ -365,6 +365,23 @@ Existing models can keep their current `load_weights` path until they opt into
 plan construction.  Existing loaders can ignore `WeightPlan` until an executor
 is added for them.
 
+## Future Work
+
+Fused-source coalescing is the next read-amplification target.  Some model
+families split one large checkpoint tensor into multiple logical plan entries,
+for example interleaved QKV tensors that produce separate Q/K/V targets or
+fused expert tensors that produce separate gate/up targets.  An executor that
+processes one logical entry at a time can sweep the same source tensor more
+than once even though the plan already knows all byte ranges up front.
+
+The first implementation should avoid changing the IR: flatten required read
+ranges across entries, group compatible ranges by source file and checkpoint
+tensor, and execute those ranges in source-offset order while dispatching into
+the existing per-entry staging tensors.  If that is insufficient, a later
+proposal can add an explicit grouped fused-source read primitive, but that
+should be justified by measured amplification because it changes the serialized
+plan shape.
+
 ## Open Questions
 
 - Which module should own the neutral IR long-term:
