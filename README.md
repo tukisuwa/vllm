@@ -19,6 +19,14 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
 ---
 
+## Fork Notice: UMA-Safe Weight Source
+
+This branch is a fork-local experiment for UMA-safe safetensors loading on
+systems such as DGX Spark.  See
+[docs/uma-safe-weight-source-readme.md](docs/uma-safe-weight-source-readme.md)
+for the supported loader format, safety model, validation status, and known
+gaps.  The upstream vLLM README continues below.
+
 ## About
 
 vLLM is a fast and easy-to-use library for LLM inference and serving.
