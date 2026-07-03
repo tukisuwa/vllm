@@ -19,6 +19,7 @@ from vllm.model_executor.model_loader.weight_plan import (
     WeightPlanEntry,
     build_auto_weight_plan_for_module,
 )
+from vllm.model_executor.models.utils import ShardId, WeightsMapper
 
 
 @dataclass(frozen=True)
@@ -61,7 +62,7 @@ class NameRewriteRule:
             )
 
     def apply(self, name: str) -> str:
-        if not self.old.startswith("."):
+        if self.old.startswith("model."):
             if not name.startswith(self.old):
                 return name
             return name.replace(self.old, self.new, 1)
@@ -139,6 +140,26 @@ class RoutedProjectionMap:
             if rule.projection == projection:
                 return f"{rule.param_prefix}_{suffix}", rule.shard_id
         raise ValueError(f"Unsupported routed expert projection {projection!r}")
+
+
+@dataclass(frozen=True)
+class StackedProjectionRule:
+    source_projection: str
+    fused_target: str
+    shard_id: ShardId
+
+
+@dataclass(frozen=True)
+class StackedProjectionMap:
+    rules: tuple[StackedProjectionRule, ...]
+
+    def as_weights_mapper(self) -> WeightsMapper:
+        return WeightsMapper(
+            orig_to_new_stacked={
+                rule.source_projection: (rule.fused_target, rule.shard_id)
+                for rule in self.rules
+            }
+        )
 
 
 RoutedNameParser = Callable[[str], tuple[int, int, str, str] | None]

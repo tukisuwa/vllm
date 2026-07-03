@@ -37,6 +37,8 @@ from vllm.model_executor.models.routed_moe_uma import (
     RoutedExpertPattern,
     RoutedProjectionMap,
     RoutedProjectionRule,
+    StackedProjectionMap,
+    StackedProjectionRule,
 )
 from vllm.model_executor.models import (
     AXK1,
@@ -213,6 +215,7 @@ def test_name_rewriter_applies_ordered_anchored_rewrites():
         (
             NameRewriteRule("model.word_embeddings.", "model.embed_tokens."),
             NameRewriteRule(".attention.", ".self_attn."),
+            NameRewriteRule(".gate_proj_bias", ".gate_proj.bias"),
         )
     )
 
@@ -225,9 +228,32 @@ def test_name_rewriter_applies_ordered_anchored_rewrites():
     assert rewriter.apply(
         "prefix.model.word_embeddings.weight"
     ) == "prefix.model.word_embeddings.weight"
+    assert rewriter.apply(
+        "model.layers.0.mlp.experts.1.gate_proj_bias"
+    ) == "model.layers.0.mlp.experts.1.gate_proj.bias"
 
     with pytest.raises(ValueError, match="dot-anchored"):
         NameRewriteRule("attention", "self_attn")
+
+
+def test_stacked_projection_map_builds_weights_mapper():
+    mapper = StackedProjectionMap(
+        (
+            StackedProjectionRule(".gate_proj", ".gate_up_proj", 0),
+            StackedProjectionRule(".up_proj", ".gate_up_proj", 1),
+            StackedProjectionRule(".q_a_proj", ".fused_qkv_a_proj", "q"),
+        )
+    ).as_weights_mapper()
+
+    assert mapper._map_name_with_shard(
+        "model.layers.0.mlp.gate_proj.weight"
+    ) == ("model.layers.0.mlp.gate_up_proj.weight", 0)
+    assert mapper._map_name_with_shard(
+        "model.layers.0.self_attn.q_a_proj.weight"
+    ) == ("model.layers.0.self_attn.fused_qkv_a_proj.weight", "q")
+    assert mapper._map_name_with_shard(
+        "model.layers.0.mlp.down_proj.weight"
+    ) == ("model.layers.0.mlp.down_proj.weight", None)
 
 
 def _entry_local_required(entry):

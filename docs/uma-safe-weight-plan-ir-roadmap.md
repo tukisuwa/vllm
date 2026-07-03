@@ -1438,3 +1438,31 @@ same primitive for its `model.` prefix strip before routed pattern parsing and
 auto-plan mapping.  Family-specific transform behavior still remains outside
 the rewrite primitive: Param2MoE's expert-bias `zero_mean` transform is kept in
 its existing `name_transform`.
+
+### 2026-07-03 Phase 3 stage 2b: StackedProjection primitive
+
+`routed_moe_uma.py` now has `StackedProjectionRule` and
+`StackedProjectionMap`.  The map converts directly to a `WeightsMapper` with
+`orig_to_new_stacked`, deliberately mirroring upstream vLLM's
+`stacked_params_mapping` shape: source projection token, fused target token,
+and shard id.
+
+Initial migrations:
+
+- OpenPangu: standard QKV + gate/up stacking, plus optional MLA
+  `q_a_proj`/`kv_a_proj_with_mqa` fusion selected by the existing builder
+  branch;
+- GLM4 MoE: standard QKV + gate/up stacking, plus optional MLA fusion selected
+  by the existing `include_mla` flag; fused shared expert slicing remains
+  explicit until `SliceRule`;
+- LongCat Flash: MLA and dense-`mlps` gate/up stacking; the existing guard that
+  avoids applying dense stacking to routed `mlp` remains in the wrapper;
+- HunYuan v1: standard QKV + gate/up stacking, plus NameRewrite-backed
+  `gate_proj_bias`/`up_proj_bias`/`mlp.gate.wg` spelling fixes.  Fused qkv and
+  `gate_and_up_proj` splitting remain explicit until `SliceRule`.
+
+These migrations also move the corresponding routed expert parser boilerplate
+to `RoutedExpertPattern` and `RoutedProjectionMap`.  DeepSeek has the same
+projection vocabulary, but its mapper also checks target parameter existence
+and controls shared-expert fallback behavior, so it is intentionally left for
+a dedicated pass rather than mixed into the first StackedProjection commit.

@@ -13,11 +13,15 @@ from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
     WeightPlan,
 )
-from vllm.model_executor.models.utils import WeightsMapper
 
 from .routed_moe_uma import (
+    RoutedExpertPattern,
     RoutedExpertsResolution,
     RoutedMoeEntry,
+    RoutedProjectionMap,
+    RoutedProjectionRule,
+    StackedProjectionMap,
+    StackedProjectionRule,
     build_routed_moe_weight_plan,
     load_routed_moe_weights_from_source,
 )
@@ -26,6 +30,33 @@ from .utils import PPMissingLayer
 
 OpenPanguRoutedEntry = RoutedMoeEntry
 OpenPanguSourcePlan = WeightPlan
+
+_OPENPANGU_STANDARD_STACKED_PROJECTIONS = StackedProjectionMap(
+    (
+        StackedProjectionRule(".q_proj", ".qkv_proj", "q"),
+        StackedProjectionRule(".k_proj", ".qkv_proj", "k"),
+        StackedProjectionRule(".v_proj", ".qkv_proj", "v"),
+        StackedProjectionRule(".gate_proj", ".gate_up_proj", 0),
+        StackedProjectionRule(".up_proj", ".gate_up_proj", 1),
+    )
+)
+_OPENPANGU_MLA_STACKED_PROJECTIONS = StackedProjectionMap(
+    (
+        StackedProjectionRule(".q_a_proj", ".fused_qkv_a_proj", 0),
+        StackedProjectionRule(".kv_a_proj_with_mqa", ".fused_qkv_a_proj", 1),
+    )
+)
+_OPENPANGU_ROUTED_EXPERT_PATTERN = RoutedExpertPattern(
+    module_path=("mlp", "experts"),
+    projections=("gate_proj", "down_proj", "up_proj"),
+)
+_OPENPANGU_ROUTED_PROJECTION_MAP = RoutedProjectionMap(
+    (
+        RoutedProjectionRule("gate_proj", "w13", "w1"),
+        RoutedProjectionRule("up_proj", "w13", "w3"),
+        RoutedProjectionRule("down_proj", "w2", "w2"),
+    )
+)
 
 
 def _openpangu_name_transform(name: str) -> tuple[str, None] | None:
@@ -41,21 +72,12 @@ class _OpenPanguWeightsMapper:
 
     def __init__(self, model: nn.Module):
         self._params = dict(model.named_parameters())
-        orig_to_new_stacked = {
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        }
+        self._mapper = _OPENPANGU_STANDARD_STACKED_PROJECTIONS.as_weights_mapper()
         if getattr(model, "fuse_qkv_a_proj", False):
-            orig_to_new_stacked.update(
-                {
-                    ".q_a_proj": (".fused_qkv_a_proj", 0),
-                    ".kv_a_proj_with_mqa": (".fused_qkv_a_proj", 1),
-                }
+            self._mapper = (
+                self._mapper
+                | _OPENPANGU_MLA_STACKED_PROJECTIONS.as_weights_mapper()
             )
-        self._mapper = WeightsMapper(orig_to_new_stacked=orig_to_new_stacked)
 
     def _map_name_with_shard(self, name: str):
         mapped = self._mapper._map_name_with_shard(name)
@@ -73,39 +95,7 @@ def _parse_openpangu_routed_expert_name(
     transformed = _openpangu_name_transform(name)
     if transformed is None:
         return None
-    name = transformed[0]
-    parts = name.split(".")
-    for idx in range(len(parts) - 6):
-        if parts[idx] != "layers":
-            continue
-        if (
-            not parts[idx + 1].isdigit()
-            or parts[idx + 2] != "mlp"
-            or parts[idx + 3] != "experts"
-            or not parts[idx + 4].isdigit()
-        ):
-            continue
-        proj_name = parts[idx + 5]
-        if proj_name not in ("gate_proj", "down_proj", "up_proj"):
-            continue
-        suffix = ".".join(parts[idx + 6 :])
-        if not suffix:
-            return None
-        return int(parts[idx + 1]), int(parts[idx + 4]), proj_name, suffix
-    return None
-
-
-def _routed_param_for_projection(
-    proj_name: str,
-    suffix: str,
-) -> tuple[str, str]:
-    if proj_name == "gate_proj":
-        return f"w13_{suffix}", "w1"
-    if proj_name == "up_proj":
-        return f"w13_{suffix}", "w3"
-    if proj_name == "down_proj":
-        return f"w2_{suffix}", "w2"
-    raise ValueError(f"Unsupported OpenPangu expert projection {proj_name!r}")
+    return _OPENPANGU_ROUTED_EXPERT_PATTERN.parse(transformed[0])
 
 
 def _resolve_routed_experts_for_layer(
@@ -167,7 +157,7 @@ def build_openpangu_weight_plan(
         catalog,
         family_name="OpenPangu",
         parse_name=_parse_openpangu_routed_expert_name,
-        map_projection=_routed_param_for_projection,
+        map_projection=_OPENPANGU_ROUTED_PROJECTION_MAP.map,
         resolve_routed_experts=_resolve_routed_experts_for_layer,
         auto_skip_substr=".mlp.experts.",
         mapper=_OpenPanguWeightsMapper(model),
