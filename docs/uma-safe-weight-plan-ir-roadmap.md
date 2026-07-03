@@ -1496,3 +1496,48 @@ The remaining slice work is to decide whether HunYuan fused qkv and Llama4
 fused expert entries should become simple `SliceRule`s or a slightly richer
 variant that can express reshape/reorder semantics without hiding extra
 staging memory.
+
+### 2026-07-03 Phase 3 stage 2d design: no reshape/reorder primitive — segments
+
+Decision for the question left open by stage 2c: HunYuan fused qkv (and the
+Llama4 fused expert composite) do NOT need a reshape/reorder primitive, and we
+deliberately will not add one.
+
+The HunYuan `_split_fused_qkv_shards` path — full read, then
+`reshape(num_kv_heads, groups + 2, head_dim, hidden)` + `split(dim=1)` — is
+not an element reorder. It is a strided row gather: q takes, per kv head, a
+block of `groups * head_dim` rows at stride `(groups + 2) * head_dim`; k and v
+take one `head_dim`-row block each at fixed offsets inside the same stride.
+Row gathers are exactly what the IR's existing
+`WeightPlanReadSegment(source_slices, target_slices)` expresses:
+
+- the executor already supports segment entries (with mandatory
+  `staging_shape`, fail-closed shape verification);
+- the read scheduler already accounts for strided segments in closed form
+  (`_PlanReadRange(offset, size, repeat, stride)`), so expected/actual byte
+  accounting stays exact — unlike the current full-read path, whose staging
+  cost lives outside the accounting;
+- `telechat2.py` already builds interleaved K/V row-gather entries from a
+  fused qkv checkpoint via `read_segments`, so this is precedent, not new
+  machinery.
+
+Division of responsibility, final: **segments say which bytes land where;
+`TransformOp` does element math** (rope permute etc.). Every remaining family
+is a composition of the two. A general reshape/reorder primitive would
+duplicate both responsibilities and muddy the byte-accounting story the
+upstream RFC depends on.
+
+Plan:
+
+1. extend `SliceRule` with a segments form (`SliceRuleEntry` gains optional
+   `segments` + `staging_shape`, or a sibling `SegmentRule`), plus a shared
+   interleaved-row-gather generator
+   (`group_count`, per-group row counts → segment tuples) reused by telechat2
+   and HunYuan;
+2. migrate HunYuan fused qkv off the full-read path — this also brings its
+   staging under scheduler accounting;
+3. DeepSeek: the mapper's target-existence check and shared-expert fallback
+   control become builder-side conditional spec selection (same pattern as
+   GLM4's rocm_aiter gate) — the branch stays in code, the plan output stays
+   concrete data;
+4. Llama4 `fused_expert_entries` folds last, once the segments form exists.
