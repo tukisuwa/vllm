@@ -8237,14 +8237,38 @@ def test_hunyuan_v1_source_plan_maps_fused_and_routed_names_before_read():
     assert _entry_param_name(routed[remote_name]) == "w2_weight"
     assert routed[remote_name].shard_id == "w2"
     assert _entry_local_required(routed[remote_name]) is False
-    assert plan.fused_qkv_names == (qkv_name,)
-
     auto_entries = {entry.checkpoint_name: [] for entry in _auto_plan_entries(plan)}
     for entry in _auto_plan_entries(plan):
         auto_entries[entry.checkpoint_name].append(entry)
-    assert qkv_name not in auto_entries
     assert local_name not in auto_entries
     assert remote_name not in auto_entries
+
+    qkv_entries = auto_entries[qkv_name]
+    assert [(entry.shard_id, entry.staging_shape, entry.source_slices)
+            for entry in qkv_entries] == [
+        ("q", (4, 4), None),
+        ("k", (2, 4), None),
+        ("v", (2, 4), None),
+    ]
+    assert [entry.read_into_cpu for entry in qkv_entries] == [True, True, True]
+    assert qkv_entries[0].read_segments == (
+        WeightPlanReadSegment(
+            (slice(0, 4), slice(None)),
+            (slice(0, 4), slice(None)),
+        ),
+    )
+    assert qkv_entries[1].read_segments == (
+        WeightPlanReadSegment(
+            (slice(4, 6), slice(None)),
+            (slice(0, 2), slice(None)),
+        ),
+    )
+    assert qkv_entries[2].read_segments == (
+        WeightPlanReadSegment(
+            (slice(6, 8), slice(None)),
+            (slice(0, 2), slice(None)),
+        ),
+    )
 
     gate_entries = auto_entries[gate_and_up_name]
     assert [(entry.target_name, entry.shard_id, entry.source_slices)
@@ -8268,7 +8292,7 @@ def test_hunyuan_v1_source_plan_maps_fused_and_routed_names_before_read():
     assert bias_entry.shard_id == 0
 
 
-def test_hunyuan_v1_source_hook_dispatches_fused_qkv_once():
+def test_hunyuan_v1_source_hook_loads_fused_qkv_segments():
     qkv_name = "model.layers.0.self_attn.qkv_proj.weight"
     catalog = TensorCatalog([
         TensorMeta("model.safetensors", qkv_name, torch.float32, [8, 4], 0, 128),
@@ -8313,10 +8337,14 @@ def test_hunyuan_v1_source_hook_dispatches_fused_qkv_once():
         def __init__(self):
             self.catalog = catalog
             self.reads = []
+            self.data = torch.arange(32, dtype=torch.float32).reshape(8, 4)
 
-        def read_full_cpu(self, name):
-            self.reads.append(name)
-            return torch.arange(32, dtype=torch.float32).reshape(8, 4)
+        def empty_cpu_shape(self, _name, shape):
+            return torch.empty(shape)
+
+        def read_into_cpu(self, name, dst, *, source_slices=None, target_slices=None):
+            self.reads.append((name, source_slices, target_slices))
+            dst[target_slices] = self.data[source_slices]
 
         def skip(self, *_args):
             raise AssertionError("unexpected skip")
@@ -8324,16 +8352,59 @@ def test_hunyuan_v1_source_hook_dispatches_fused_qkv_once():
     model = FakeOuter()
     source = FakeSource()
     plan = hunyuan_v1_uma.HunyuanV1SourcePlan(
-        weight_plan=WeightPlan(()),
-        fused_qkv_names=(qkv_name,),
+        weight_plan=WeightPlan((
+            WeightPlanEntry(
+                checkpoint_name=qkv_name,
+                target_name="model.layers.0.self_attn.qkv_proj.weight",
+                read_into_cpu=True,
+                read_segments=(
+                    WeightPlanReadSegment(
+                        (slice(0, 4), slice(None)),
+                        (slice(0, 4), slice(None)),
+                    ),
+                ),
+                staging_shape=(4, 4),
+                shard_id="q",
+            ),
+            WeightPlanEntry(
+                checkpoint_name=qkv_name,
+                target_name="model.layers.0.self_attn.qkv_proj.weight",
+                read_into_cpu=True,
+                read_segments=(
+                    WeightPlanReadSegment(
+                        (slice(4, 6), slice(None)),
+                        (slice(0, 2), slice(None)),
+                    ),
+                ),
+                staging_shape=(2, 4),
+                shard_id="k",
+            ),
+            WeightPlanEntry(
+                checkpoint_name=qkv_name,
+                target_name="model.layers.0.self_attn.qkv_proj.weight",
+                read_into_cpu=True,
+                read_segments=(
+                    WeightPlanReadSegment(
+                        (slice(6, 8), slice(None)),
+                        (slice(0, 2), slice(None)),
+                    ),
+                ),
+                staging_shape=(2, 4),
+                shard_id="v",
+            ),
+        )),
     )
 
     assert hunyuan_v1_uma.load_hunyuan_v1_weights_from_source(
         model,
         source,
         plan,
-    ) == {qkv_name}
-    _assert_same_reads(source.reads, [qkv_name])
+    ) == {"model.layers.0.self_attn.qkv_proj.weight"}
+    assert [read[1:] for read in source.reads] == [
+        ((slice(0, 4), slice(None)), (slice(0, 4), slice(None))),
+        ((slice(4, 6), slice(None)), (slice(0, 2), slice(None))),
+        ((slice(6, 8), slice(None)), (slice(0, 2), slice(None))),
+    ]
     calls = getattr(model.model.layers, "0").self_attn.qkv_proj.weight.calls
     assert [call[0] for call in calls] == ["q", "k", "v"]
     assert [tuple(call[1].shape) for call in calls] == [(4, 4), (2, 4), (2, 4)]

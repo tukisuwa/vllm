@@ -17,6 +17,7 @@ from vllm.model_executor.model_loader.weight_plan import (
     TransformOp,
     WeightPlan,
     WeightPlanEntry,
+    WeightPlanReadSegment,
     build_auto_weight_plan_for_module,
 )
 from vllm.model_executor.models.utils import ShardId, WeightsMapper
@@ -165,8 +166,19 @@ class StackedProjectionMap:
 @dataclass(frozen=True)
 class SliceRuleEntry:
     target_name: str
-    source_slices: tuple[slice | int, ...]
+    source_slices: tuple[slice | int, ...] | None = None
     shard_id: ShardId | None = None
+    read_segments: tuple[WeightPlanReadSegment, ...] | None = None
+    staging_shape: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if (self.source_slices is None) == (self.read_segments is None):
+            raise ValueError(
+                "SliceRuleEntry requires exactly one of source_slices "
+                "or read_segments"
+            )
+        if self.read_segments is not None and self.staging_shape is None:
+            raise ValueError("SliceRuleEntry read_segments requires staging_shape")
 
 
 @dataclass(frozen=True)
@@ -180,10 +192,41 @@ class SliceRule:
                 checkpoint_name=self.checkpoint_name,
                 target_name=entry.target_name,
                 source_slices=entry.source_slices,
+                read_into_cpu=entry.read_segments is not None,
+                read_segments=entry.read_segments,
+                staging_shape=entry.staging_shape,
                 shard_id=entry.shard_id,
             )
             for entry in self.entries
         )
+
+
+def build_interleaved_row_gather_segments(
+    *,
+    group_count: int,
+    group_rows: int,
+    block_start: int,
+    block_rows: int,
+    extra_dims: int,
+) -> tuple[WeightPlanReadSegment, ...]:
+    if group_count <= 0 or group_rows <= 0 or block_rows <= 0:
+        raise ValueError("interleaved row gather dimensions must be positive")
+    if block_start < 0 or block_start + block_rows > group_rows:
+        raise ValueError(
+            "interleaved row gather block must fit within each source group"
+        )
+    rest = (slice(None),) * extra_dims
+    segments: list[WeightPlanReadSegment] = []
+    for group_idx in range(group_count):
+        source_start = group_idx * group_rows + block_start
+        target_start = group_idx * block_rows
+        segments.append(
+            WeightPlanReadSegment(
+                (slice(source_start, source_start + block_rows), *rest),
+                (slice(target_start, target_start + block_rows), *rest),
+            )
+        )
+    return tuple(segments)
 
 
 RoutedNameParser = Callable[[str], tuple[int, int, str, str] | None]

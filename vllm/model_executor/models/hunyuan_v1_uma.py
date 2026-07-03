@@ -5,14 +5,11 @@
 from dataclasses import dataclass
 from typing import Any
 
-import torch
 from torch import nn
 
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
     ODirectSafetensorsWeightSource,
-    _call_weight_loader,
     execute_weight_plan,
-    _resolve_attr,
 )
 from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
@@ -33,6 +30,7 @@ from .routed_moe_uma import (
     SliceRuleEntry,
     StackedProjectionMap,
     StackedProjectionRule,
+    build_interleaved_row_gather_segments,
     build_routed_moe_weight_plan,
 )
 from .utils import PPMissingLayer
@@ -43,7 +41,6 @@ HunyuanV1RoutedEntry = RoutedMoeEntry
 @dataclass(frozen=True)
 class HunyuanV1SourcePlan:
     weight_plan: WeightPlan
-    fused_qkv_names: tuple[str, ...]
 
 _HUNYUAN_NAME_REWRITER = NameRewriter(
     (
@@ -132,38 +129,12 @@ def _is_cross_layer_q_proj(model: Any, name: str) -> bool:
     return False
 
 
-def _split_fused_qkv_shards(model: Any, qkv: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    config = model.config
-    num_attention_heads = config.num_attention_heads
-    num_kv_heads = getattr(config, "num_key_value_heads", num_attention_heads)
-    num_key_value_groups = num_attention_heads // num_kv_heads
-    hidden_size = config.hidden_size
-    attention_head_dim = getattr(
-        config,
-        "head_dim",
-        getattr(config, "attention_head_dim", hidden_size // num_attention_heads),
-    )
-    qkv = qkv.reshape(
-        num_kv_heads,
-        num_key_value_groups + 2,
-        attention_head_dim,
-        hidden_size,
-    )
-    q, k, v = torch.split(qkv, (num_key_value_groups, 1, 1), dim=1)
-    return (
-        q.reshape(-1, hidden_size),
-        k.reshape(-1, hidden_size),
-        v.reshape(-1, hidden_size),
-    )
-
-
 def _collect_fused_plan_entries(
     model: nn.Module,
     catalog: TensorCatalog,
-) -> tuple[list[WeightPlanEntry], set[str], tuple[str, ...]]:
+) -> tuple[list[WeightPlanEntry], set[str]]:
     entries: list[WeightPlanEntry] = []
     skip_auto: set[str] = set()
-    fused_qkv_names: list[str] = []
     for checkpoint_name in catalog.names():
         transformed = _hunyuan_name_transform(checkpoint_name)
         if transformed is None:
@@ -218,16 +189,64 @@ def _collect_fused_plan_entries(
                     f"{checkpoint_name}: shape={record.shape}, "
                     f"expected first dim {expected}"
                 )
-            fused_qkv_names.append(checkpoint_name)
+            group_count = num_kv_heads
+            group_rows = (num_heads // num_kv_heads + 2) * head_dim
+            q_rows = (num_heads // num_kv_heads) * head_dim
+            kv_rows = head_dim
+            extra_dims = len(record.shape) - 1
+            rest_shape = tuple(record.shape[1:])
+            entries.extend(
+                SliceRule(
+                    checkpoint_name,
+                    (
+                        SliceRuleEntry(
+                            name,
+                            read_segments=build_interleaved_row_gather_segments(
+                                group_count=group_count,
+                                group_rows=group_rows,
+                                block_start=0,
+                                block_rows=q_rows,
+                                extra_dims=extra_dims,
+                            ),
+                            staging_shape=(num_heads * head_dim, *rest_shape),
+                            shard_id="q",
+                        ),
+                        SliceRuleEntry(
+                            name,
+                            read_segments=build_interleaved_row_gather_segments(
+                                group_count=group_count,
+                                group_rows=group_rows,
+                                block_start=q_rows,
+                                block_rows=kv_rows,
+                                extra_dims=extra_dims,
+                            ),
+                            staging_shape=(num_kv_heads * head_dim, *rest_shape),
+                            shard_id="k",
+                        ),
+                        SliceRuleEntry(
+                            name,
+                            read_segments=build_interleaved_row_gather_segments(
+                                group_count=group_count,
+                                group_rows=group_rows,
+                                block_start=q_rows + kv_rows,
+                                block_rows=kv_rows,
+                                extra_dims=extra_dims,
+                            ),
+                            staging_shape=(num_kv_heads * head_dim, *rest_shape),
+                            shard_id="v",
+                        ),
+                    ),
+                ).to_weight_plan_entries()
+            )
             skip_auto.add(checkpoint_name)
-    return entries, skip_auto, tuple(fused_qkv_names)
+    return entries, skip_auto
 
 
 def build_hunyuan_v1_weight_plan(
     model: nn.Module,
     catalog: TensorCatalog,
 ) -> HunyuanV1SourcePlan:
-    fused_entries, skip_auto, fused_qkv_names = _collect_fused_plan_entries(
+    fused_entries, skip_auto = _collect_fused_plan_entries(
         model,
         catalog,
     )
@@ -257,37 +276,7 @@ def build_hunyuan_v1_weight_plan(
     ]
     return HunyuanV1SourcePlan(
         weight_plan=WeightPlan(tuple(entries) + tuple(fused_entries)),
-        fused_qkv_names=fused_qkv_names,
     )
-
-
-def _load_fused_qkv(
-    model: nn.Module,
-    source: ODirectSafetensorsWeightSource,
-    checkpoint_name: str,
-) -> str:
-    target_name = _hunyuan_name_transform(checkpoint_name)[0]
-    param = _resolve_attr(model, target_name)
-    weight_loader = getattr(param, "weight_loader", None)
-    if not callable(weight_loader):
-        raise RuntimeError(
-            f"HunYuan UMA fused qkv target {target_name!r} has no weight_loader"
-        )
-    tensor = source.read_full_cpu(checkpoint_name)
-    for shard_id, shard in zip(
-        ("q", "k", "v"),
-        _split_fused_qkv_shards(model, tensor),
-        strict=True,
-    ):
-        _call_weight_loader(
-            weight_loader,
-            param,
-            shard,
-            source_is_sharded=False,
-            kwargs={"shard_id": shard_id},
-            entry_name=checkpoint_name,
-        )
-    return target_name
 
 
 def load_hunyuan_v1_weights_from_source(
@@ -295,7 +284,4 @@ def load_hunyuan_v1_weights_from_source(
     source: ODirectSafetensorsWeightSource,
     plan: HunyuanV1SourcePlan,
 ) -> set[str]:
-    loaded = execute_weight_plan(model, source, plan.weight_plan)
-    for checkpoint_name in plan.fused_qkv_names:
-        loaded.add(_load_fused_qkv(model, source, checkpoint_name))
-    return loaded
+    return execute_weight_plan(model, source, plan.weight_plan)

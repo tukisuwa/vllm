@@ -33,10 +33,12 @@ from vllm.model_executor.model_loader.weight_plan import (
     TensorCatalog,
     WeightPlan,
     WeightPlanEntry,
-    WeightPlanReadSegment,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.llama import LlamaForCausalLM, LlamaModel
+from vllm.model_executor.models.routed_moe_uma import (
+    build_interleaved_row_gather_segments,
+)
 
 from .auto_uma import build_auto_uma_weight_plan, load_auto_uma_weights_from_source
 from .llama import LlamaDecoderLayer
@@ -71,27 +73,20 @@ def _telechat2_key_value_entries(
     target_name = entry.target_name.replace("key_value", "qkv_proj", 1)
     input_size = record.shape[1]
     staging_shape = (total_num_heads * head_dim, input_size)
-    k_segments: list[WeightPlanReadSegment] = []
-    v_segments: list[WeightPlanReadSegment] = []
-    for head_idx in range(total_num_heads):
-        source_base = head_idx * head_dim * 2
-        target_base = head_idx * head_dim
-        target_slice = (slice(target_base, target_base + head_dim), slice(None))
-        k_segments.append(
-            WeightPlanReadSegment(
-                (slice(source_base, source_base + head_dim), slice(None)),
-                target_slice,
-            )
-        )
-        v_segments.append(
-            WeightPlanReadSegment(
-                (
-                    slice(source_base + head_dim, source_base + 2 * head_dim),
-                    slice(None),
-                ),
-                target_slice,
-            )
-        )
+    k_segments = build_interleaved_row_gather_segments(
+        group_count=total_num_heads,
+        group_rows=head_dim * 2,
+        block_start=0,
+        block_rows=head_dim,
+        extra_dims=1,
+    )
+    v_segments = build_interleaved_row_gather_segments(
+        group_count=total_num_heads,
+        group_rows=head_dim * 2,
+        block_start=head_dim,
+        block_rows=head_dim,
+        extra_dims=1,
+    )
 
     return (
         WeightPlanEntry(

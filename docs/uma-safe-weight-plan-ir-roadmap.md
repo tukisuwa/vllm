@@ -1541,3 +1541,20 @@ Plan:
    GLM4's rocm_aiter gate) — the branch stays in code, the plan output stays
    concrete data;
 4. Llama4 `fused_expert_entries` folds last, once the segments form exists.
+
+### 2026-07-03 Phase 3 stage 2e: segmented SliceRule entries
+
+`SliceRuleEntry` now supports the existing segmented-read IR:
+`read_segments` plus `staging_shape`, with fail-closed validation that exactly
+one of `source_slices` or `read_segments` is present.  A shared
+`build_interleaved_row_gather_segments(...)` helper generates the common
+row-gather segment tuples used by TeleChat2 and HunYuan.
+
+TeleChat2's existing key/value fused qkv split now uses the shared helper,
+preserving the prior `WeightPlanReadSegment` output.  HunYuan fused qkv has
+moved off its old side path entirely: instead of full-reading the qkv tensor
+and calling `_split_fused_qkv_shards`, the builder emits three segmented
+`WeightPlanEntry` records for q/k/v.  The temporary `fused_qkv_names`
+side-channel is gone, so HunYuan load execution is now a single ordinary
+`execute_weight_plan()` call and the fused qkv staging/read volume is visible
+to plan summary and scheduler accounting.
