@@ -1248,3 +1248,35 @@ Golden snapshots should be added or expanded before each family moves.  The
 first implementation target should be Qwen or Mixtral because their parser is
 almost pure `RoutedExpertPattern`; Mistral/Bagel already exercise transform
 ops but are not routed-pattern migrations.
+
+### 2026-07-03 Phase 3 stage 1: Qwen routed expert pattern
+
+The first declarative parse-name primitive is now implemented in
+`routed_moe_uma.py`:
+
+- `RoutedExpertPattern` parses common
+  `...layers.<layer_id>.<module_path>.<expert_id>.<projection>.<suffix>`
+  checkpoint names into `(layer_id, expert_id, projection, suffix)`;
+- `RoutedProjectionMap` maps projection names to `(param_name, shard_id)` via
+  data rules such as `gate_proj -> w13_<suffix>, w1`.
+
+`qwen_moe_uma.py` no longer owns a hand-written routed parser or projection
+mapper.  It declares:
+
+```python
+RoutedExpertPattern(
+    module_path=("mlp", "experts"),
+    projections=("gate_proj", "down_proj", "up_proj"),
+)
+RoutedProjectionMap((
+    RoutedProjectionRule("gate_proj", "w13", "w1"),
+    RoutedProjectionRule("up_proj", "w13", "w3"),
+    RoutedProjectionRule("down_proj", "w2", "w2"),
+))
+```
+
+The existing Qwen golden snapshot stayed unchanged, which is the intended
+Phase 3 migration contract: replacing parser code with spec data must preserve
+the serialized `WeightPlan`.  This pattern should be reusable for Mixtral,
+Jamba, Laguna, Sarvam, Bailing, Ernie45, AFMoE, EXAONE, and Nemotron-H before
+moving on to families that need shape-derived `SliceRule`s.

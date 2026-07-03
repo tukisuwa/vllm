@@ -39,6 +39,69 @@ class RoutedMoeEntry:
     source_slices: tuple[slice | int, ...] | None = None
 
 
+@dataclass(frozen=True)
+class RoutedExpertPattern:
+    """Declarative parser for common per-expert checkpoint names.
+
+    The pattern matches:
+    ``... layers.<layer_id>.<module_path>.<expert_id>.<projection>.<suffix>``.
+    Prefixes before ``layers`` are allowed so wrappers can reuse the same spec.
+    """
+
+    module_path: tuple[str, ...]
+    projections: tuple[str, ...]
+    layer_token: str = "layers"
+
+    def parse(self, name: str) -> tuple[int, int, str, str] | None:
+        parts = name.split(".")
+        min_remaining = 3 + len(self.module_path)
+        for idx in range(len(parts) - min_remaining):
+            if parts[idx] != self.layer_token:
+                continue
+            layer_id_idx = idx + 1
+            module_start = idx + 2
+            expert_id_idx = module_start + len(self.module_path)
+            projection_idx = expert_id_idx + 1
+            suffix_start = projection_idx + 1
+            if not parts[layer_id_idx].isdigit():
+                continue
+            if tuple(parts[module_start:expert_id_idx]) != self.module_path:
+                continue
+            if not parts[expert_id_idx].isdigit():
+                continue
+            projection = parts[projection_idx]
+            if projection not in self.projections:
+                continue
+            suffix = ".".join(parts[suffix_start:])
+            if not suffix:
+                return None
+            return (
+                int(parts[layer_id_idx]),
+                int(parts[expert_id_idx]),
+                projection,
+                suffix,
+            )
+        return None
+
+
+@dataclass(frozen=True)
+class RoutedProjectionRule:
+    projection: str
+    param_prefix: str
+    shard_id: str
+
+
+@dataclass(frozen=True)
+class RoutedProjectionMap:
+    rules: tuple[RoutedProjectionRule, ...]
+
+    def map(self, projection: str, suffix: str) -> tuple[str, str]:
+        for rule in self.rules:
+            if rule.projection == projection:
+                return f"{rule.param_prefix}_{suffix}", rule.shard_id
+        raise ValueError(f"Unsupported routed expert projection {projection!r}")
+
+
 RoutedNameParser = Callable[[str], tuple[int, int, str, str] | None]
 RoutedProjectionMapper = Callable[[str, str], tuple[str, str]]
 RoutedExpertResolver = Callable[[nn.Module, int], RoutedExpertsResolution]

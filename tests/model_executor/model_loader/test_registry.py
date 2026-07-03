@@ -31,6 +31,11 @@ from vllm.model_executor.model_loader.weight_plan import (
     build_auto_weight_plan_from_catalog,
     summarize_weight_plan,
 )
+from vllm.model_executor.models.routed_moe_uma import (
+    RoutedExpertPattern,
+    RoutedProjectionMap,
+    RoutedProjectionRule,
+)
 from vllm.model_executor.models import (
     AXK1,
     afmoe,
@@ -149,6 +154,29 @@ def _routed_plan_entries(plan):
     return tuple(
         entry for entry in _weight_plan_entries(plan) if entry.expert_id is not None
     )
+
+
+def test_routed_expert_pattern_parses_standard_moe_names():
+    pattern = RoutedExpertPattern(
+        module_path=("mlp", "experts"),
+        projections=("gate_proj", "down_proj", "up_proj"),
+    )
+    projection_map = RoutedProjectionMap(
+        (
+            RoutedProjectionRule("gate_proj", "w13", "w1"),
+            RoutedProjectionRule("up_proj", "w13", "w3"),
+            RoutedProjectionRule("down_proj", "w2", "w2"),
+        )
+    )
+
+    assert pattern.parse(
+        "model.language_model.model.layers.12.mlp.experts.3.up_proj.weight"
+    ) == (12, 3, "up_proj", "weight")
+    assert pattern.parse("model.layers.0.mlp.experts.0.up_proj") is None
+    assert pattern.parse("model.layers.0.mlp.experts.0.foo.weight") is None
+    assert projection_map.map("up_proj", "weight") == ("w13_weight", "w3")
+    with pytest.raises(ValueError, match="Unsupported routed expert projection"):
+        projection_map.map("foo", "weight")
 
 
 def _entry_local_required(entry):
