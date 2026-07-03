@@ -1594,3 +1594,48 @@ custom loader is represented by a serializable `TransformOp("transpose_last_two"
 
 With HunYuan, DeepSeek, and Llama4 covered, the known fused/composite routed
 paths no longer require non-`WeightPlan` execution contracts.
+
+### 2026-07-03 Phase 3 routed IR host smoke attempt
+
+A host `ready` smoke was attempted after installing system `python3-dev` and
+`ninja-build`, using the tiny Qwen3.5 MoE checkpoint and
+`uma_odirect_safetensors`.
+
+Loader result was clean:
+
+```text
+tiny-random-qwen3.5 MoE
+  plan entries: 2034 total, 2017 required, 17 skipped
+  expected bytes_read: 0.01 GiB
+  actual bytes_read:   0.01 GiB
+  expected read amplification: 1.00x
+  model load: 0.02 GiB, 1.30 s
+```
+
+The end-to-end `ready` phase was stopped before completion for machine safety:
+post-load FlashInfer/CUDA JIT compilation spawned many `nvcc` processes and
+drove host RAM to `min available=1.50 GiB`, `peak swap=3.16 GiB`, and memory
+PSI avg10 `some/full=2.85/2.54`.  Remote RAM stayed idle.  This is outside the
+DGX Spark safety envelope, so the remaining ready smokes were not run.
+
+Conclusion: the Phase 3 loader path passed expected/actual byte accounting,
+but host `ready` startup with uncached FlashInfer/CUDA JIT is not safe in this
+configuration.  Further large-model validation should use `model_load` stop
+unless the JIT memory spike is mitigated or caches are safely prebuilt.
+
+After clearing swap, the standard three-model DGX Spark smoke was repeated with
+`VLLM_TEST_STOP_AFTER=model_load` to avoid the unsafe post-load JIT phase:
+
+```text
+Model                         Expected  Actual   Amplification  Load time
+tiny-random-qwen3.5 MoE        0.01GiB  0.01GiB         1.00x      1.55s
+PrimeIntellect tiny MoE        1.25GiB  1.25GiB         1.00x      1.49s
+Qwen3.6 35B NVFP4             22.23GiB 22.23GiB         1.02x     25.19s
+```
+
+All three model-load runs matched scheduled bytes exactly, emitted no
+actual-vs-expected amplification warning, kept swap at 0, and kept memory PSI
+at 0.  The 35B run peaked at `39.95GiB` used+buff/cache with
+`82.53GiB` minimum local available RAM.  This validates the Phase 3 routed IR
+loader path for the existing smoke set, while leaving end-to-end `ready`
+blocked on the separate FlashInfer/CUDA JIT memory spike.
