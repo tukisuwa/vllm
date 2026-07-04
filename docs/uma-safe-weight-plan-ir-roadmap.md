@@ -2246,3 +2246,41 @@ overhead, but not the dominant remaining cost.  The path still performs
 `124,306` serialized JSON/tensor request-response cycles, so the next
 performance step should be a batch-read RPC or schedule-aware transport that
 amortizes request parsing and tensor reconstruction over many entries.
+
+### 2026-07-04 RemoteWeightSource batch/schedule-aware design
+
+The next remote transport step is split into three gates rather than one large
+rewrite:
+
+1. **Stage B1: bounded `read_many` for full/sliced entries.**  Add an
+   optional executor/source method that reads multiple consecutive scheduled
+   entries in one remote request, capped by a configurable total response
+   payload (`64-256 MiB` initial range).  The response preserves entry order,
+   and the executor still calls weight loaders in the original scheduled
+   order.  Unsupported entries fall back to the per-entry path.  This directly
+   targets Qwen35B's `124,306` full-read requests.
+2. **Stage B2: segment entries.**  Extend the same request shape to
+   `read_segments` with owner-side `validate_weight_plan_read_segments`.
+   This makes TeleChat2/HunYuan/Llama4 segment-family remote smokes use the
+   same batching path without inventing a generic byte-range RPC.
+3. **Stage B3: owner capability handshake.**  Add a small owner request that
+   returns the actual O_DIRECT `chunk_size`, `window_size`, `alignment`, and
+   strided-read support.  The remote source exposes those as the attributes
+   `execute_weight_plan` already probes, so expected read accounting reflects
+   the owner source.  This should close the Qwen35B remote mismatch where the
+   schedule expected `22.86 GiB` while owner actual was `22.23 GiB`.
+
+The design deliberately keeps the network API WeightSource-shaped: requests
+name checkpoint tensors and declarative slices/segments, never arbitrary file
+offsets.  Batches are payload-capped to preserve the UMA safety invariant that
+the transport optimization must not trade request overhead for unbounded
+temporary staging memory.
+
+Gate for B1 completion:
+
+- loopback test proves a multi-entry batch returns correct tensor values in
+  request order and uses one owner request;
+- owner rejects malformed/oversized batches before reading;
+- Qwen35B remote smoke is repeated against the `143.98s` persistent baseline,
+  recording batch count, model-load time, owner read stats, remote stream
+  bytes, `buff/cache`, swap, and PSI.

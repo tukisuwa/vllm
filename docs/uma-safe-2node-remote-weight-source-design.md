@@ -386,6 +386,171 @@ WeightPlan entries into one request, or otherwise pass the read schedule into
 the transport, so the remote path does not pay JSON parsing, frame dispatch,
 and tensor reconstruction overhead `124,306` times for Qwen35B.
 
+## Phase 1b batch/schedule-aware transport design (2026-07-04)
+
+The persistent Qwen35B result narrows the remaining bottleneck: connection
+setup is no longer dominant, but the remote path still performs `124,306`
+serialized WeightSource requests.  The next step should reduce request count
+without changing model-side WeightPlan semantics.
+
+### Goals
+
+- Keep the remote rank from opening safetensors payload files.
+- Preserve fail-closed owner-side catalog validation; remote requests must
+  still name tensors and declared slices/segments, not arbitrary file ranges.
+- Keep executor dispatch order unchanged.  Weight loaders should still see
+  tensors in the scheduled plan order.
+- Bound owner and remote staging memory with an explicit batch payload limit.
+- Make expected read accounting use the owner source's actual O_DIRECT
+  `chunk_size`, `window_size`, and `alignment`, closing the Qwen35B
+  `22.86 GiB expected` vs `22.23 GiB actual` mismatch.
+
+### Non-goals
+
+- Do not implement true tensor/pipeline parallel distributed loading in this
+  transport step.  TP/PP rank topology remains a separate track.
+- Do not expose generic byte-range reads over the network.
+- Do not batch all model tensors at once.  That would reduce request count but
+  would create large temporary payload buffers and defeat UMA peak-memory
+  goals.
+
+### Stage B1: bounded `read_many` for full/sliced entries
+
+Add an optional source method used only by `execute_weight_plan`:
+
+```text
+read_many_cpu(requests: tuple[WeightPlanRemoteReadRequest, ...])
+    -> tuple[torch.Tensor, ...]
+```
+
+`WeightPlanRemoteReadRequest` is a small executor-local data shape, not a new
+model semantic primitive:
+
+- `checkpoint_name`
+- optional `source_slices`
+- optional `read_segments`
+- optional `staging_shape`
+
+B1 can initially support only entries without `read_segments`; this covers
+Qwen35B's `124,306` full reads and gives a clean measurement before segment
+batching.  If an entry is unsupported, the executor keeps the existing
+per-entry fallback.
+
+The executor forms batches from consecutive scheduled prepared entries:
+
+- preserve schedule order;
+- stop a batch before required/skipped boundaries that already need special
+  handling;
+- stop when the sum of expected response payload bytes exceeds a configurable
+  limit, for example `VLLM_UMA_ODIRECT_REMOTE_BATCH_BYTES` or loader extra
+  config, initially conservative (`64-256 MiB`);
+- after receiving tensors, call each weight loader in the original batch
+  order and release tensors as the loop advances.
+
+This keeps peak remote staging near:
+
+```text
+batch response payload bytes
++ reconstructed tensor bytes for that batch
++ normal model parameter allocations
+```
+
+instead of holding the whole model payload at once.
+
+Wire protocol:
+
+- request op: `read_many`
+- request payload: JSON only, containing an ordered `items` array of
+  tensor names and slice descriptors
+- response: one JSON header plus one raw concatenated payload
+- response header contains an ordered `tensors` array with dtype, shape, and
+  payload sizes/offsets
+- remote reconstructs tensors in order and verifies each payload size against
+  the local catalog-derived expectation
+
+Owner-side validation:
+
+- authenticate once per request as today;
+- reject batches whose item count or total expected payload exceeds the
+  configured limit;
+- for each item, resolve the tensor through the owner catalog and call the
+  same local `read_full_cpu` / `read_slice_cpu` methods used today;
+- return tensors in request order.
+
+The owner still serializes source access through `_source_lock`.  B1 is about
+reducing request/frame overhead, not introducing concurrent O_DIRECT reads.
+
+Expected impact:
+
+- Qwen35B request count drops from `124,306` to roughly
+  `ceil(21.73 GiB / batch_limit)`.  At `128 MiB`, this is about `174`
+  requests.
+- If the remaining `~115s` after persistent connection is mostly per-request
+  JSON/frame/tensor reconstruction overhead, B1 should be a large step toward
+  single-node O_DIRECT time plus network transfer and bounded reconstruction
+  cost.
+
+### Stage B2: segments and fused-source coalescing
+
+After B1 measurement, extend the same batch request shape to
+`read_segments` entries:
+
+- each item carries `read_segments` and `staging_shape`;
+- owner validates each item with `validate_weight_plan_read_segments`;
+- owner materializes each staging tensor using the existing local segmented
+  read path;
+- remote receives one tensor per item and executor dispatch stays unchanged.
+
+This is sufficient for TeleChat2/HunYuan/Llama4 segment-family remote smokes,
+but it does not yet coalesce multiple segment entries into a single owner-side
+staging tensor.  That can remain a later optimization if B2 still leaves a
+measurable segment-family gap.
+
+### Stage B3: owner capability handshake
+
+Add a small owner op, for example `source_capability`, returning:
+
+- `chunk_size`
+- `window_size`
+- `alignment`
+- `supports_strided_read`
+- optional maximum owner response payload recommendation
+
+`RemoteODirectSafetensorsWeightSource` stores these values as attributes that
+`execute_weight_plan` already probes (`_chunk_size`, `_window_size`,
+`_alignment`).  This makes remote schedule simulation use the owner's real
+O_DIRECT settings and should make Qwen35B expected bytes match owner actual
+bytes (`22.23 GiB` with the 128 MiB window) instead of the conservative
+`22.86 GiB` computed with local defaults.
+
+The handshake should run lazily before `set_expected_read_summary` is needed,
+or eagerly when constructing the remote source.  If the owner does not support
+the handshake, fail closed for the batch/schedule-aware path and retain the
+older remote path only when explicitly allowed for compatibility tests.
+
+### Tests
+
+Unit/fixture tests should cover:
+
+- repeated full reads use one connection and one `read_many` request per
+  batch;
+- batch response order is preserved even when tensor names are not sorted;
+- owner rejects unknown names, malformed slices, oversized item counts, and
+  oversized total payload before reading;
+- remote rejects payload-size mismatches and malformed tensor descriptors;
+- fallback remains correct for unsupported entries;
+- owner capability handshake updates remote scheduling parameters;
+- a small real O_DIRECT safetensors fixture verifies values, not only shapes.
+
+The first real measurement should repeat the Qwen35B remote smoke with the
+same settings as the `143.98s` persistent baseline and record:
+
+- request count / batch count;
+- model load time;
+- owner direct read stats;
+- remote stream bytes;
+- local/remote `buff/cache`, swap, memory PSI, and IO PSI.
+
 ## Open questions
 
 - How does per-rank payload ownership interact with pipeline-parallel layer
