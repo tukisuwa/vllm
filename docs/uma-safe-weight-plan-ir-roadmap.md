@@ -2136,3 +2136,113 @@ payload streaming work in a real vLLM model-load path. Remaining Phase 1
 gaps are topology/rank automation, remote `read_segment_group_into_cpu`
 coalescing, and larger segment-family 2-node smokes once the small path stays
 stable.
+
+### 2026-07-04 RemoteWeightSource 2node Qwen35B smoke
+
+The larger-payload 2-node gate was exercised with
+`/data/shared/models/hf/vllm-loader-test/Qwen3.6-35B-A3B-heretic-NVFP4`.
+The first attempt used `--skip-tokenizer-init` and failed before weight
+loading in Qwen3-VL processor initialization (`tokenizer=None`); owner stats
+confirmed `tensors_read=0`, so no payload was read.  The successful attempt
+kept tokenizer initialization enabled and stopped immediately after model
+load.
+
+Successful remote-source result:
+
+- owner/local: `dgx-spark2` (`192.168.100.11`)
+- remote: `dgx-spark1`
+- remote source selected:
+  `uma_odirect_safetensors using remote owner source: 192.168.100.11:34641`
+- model path: `Qwen3_5MoeForConditionalGeneration`
+- plan: `124306` entries, `124306` required, all full reads
+- tensor payload: `21.73 GiB`
+- remote stream receive: `21.73 GiB`
+- remote schedule log: `expected_bytes_read=22.86 GiB`,
+  `expected_read_amplification=1.05x`
+- owner actual direct-read stats: `bytes_read=22.23 GiB`,
+  `bytes_copied=21.73 GiB`, `direct_reads=407`, `window_loads=163`,
+  `window_hits=124304`
+- model load: `21.86 GiB`, `201.249922s`
+
+Safety summary:
+
+- remote (`dgx-spark1`) first `buff/cache`: `3.537 GiB`; peak:
+  `3.672 GiB`; delta: `+0.135 GiB`
+- remote min available: `84.806 GiB`; peak used + `buff/cache`:
+  `40.426 GiB`; swap: `0.00 GiB`; memory PSI: `0.00/0.00`; IO PSI:
+  `0.00/0.00`
+- owner/local first `buff/cache`: `3.624 GiB`; peak: `3.642 GiB`;
+  delta: `+0.017 GiB`
+- owner/local min available: `105.649 GiB`; peak used + `buff/cache`:
+  `17.611 GiB`; swap: `0.00 GiB`; memory PSI: `0.00/0.00`; IO PSI:
+  `3.16/2.87`
+
+Artifacts:
+
+- owner log:
+  `/home/tsukisuwa/LLM/logs/vllm-loader/qwen35b-remote-odirect-2node-20260704-125901.owner.log`
+- remote vLLM log:
+  `/home/tsukisuwa/LLM/logs/vllm-loader/qwen35b-remote-odirect-2node-20260704-125901.remote.log`
+- remote runner log:
+  `/home/tsukisuwa/LLM/logs/vllm-loader/qwen35b-remote-odirect-2node-20260704-125901.remote-runner.log`
+- RAM CSV:
+  `/home/tsukisuwa/LLM/logs/ram/qwen35b-remote-odirect-2node-20260704-125901.csv`
+- RAM summary:
+  `/home/tsukisuwa/LLM/logs/ram/qwen35b-remote-odirect-2node-20260704-125901.summary.txt`
+
+This is the first large-payload proof for the remote source: the remote rank
+received `21.73 GiB` of tensor payload while its `buff/cache` peak rose only
+`0.135 GiB`, so the remote path did not behave like an NFS/page-cache payload
+read.  The owner side performed the actual O_DIRECT reads and kept page-cache
+growth similarly bounded.
+
+Follow-up: the remote rank's schedule log was conservative
+(`expected_bytes_read=22.86 GiB`) while the owner measured `22.23 GiB`,
+matching the 128 MiB-window single-node baseline.  Remote Phase 1 should pass
+the owner-side direct-I/O window/alignment capability through the transport
+or handshake so expected read accounting reflects the owner source exactly.
+
+### 2026-07-04 RemoteWeightSource persistent connection
+
+The Qwen35B 2-node smoke made the Phase 1 performance bottleneck explicit:
+owner O_DIRECT read time was only `7.37s`, but total model-load time was
+`201.25s`.  Because Qwen35B has `124,306` full-read entries, the initial
+remote source paid one TCP connection plus one synchronous JSON/tensor
+request-response per entry.  This is a request-granularity problem, not a
+network bandwidth problem.
+
+The first optimization is intentionally narrow and independently measurable:
+keep the WeightSource-shaped request protocol, but reuse one TCP connection
+for all requests from a remote source.  Owner handlers now loop over multiple
+frames on a single connection, while the existing owner `_source_lock` still
+serializes access to the mutable O_DIRECT window state.  The remote source
+keeps one socket, serializes requests with a lock, and closes the socket on
+transport or owner-reported errors.  Loopback tests now assert that repeated
+and concurrent remote reads use a single accepted owner connection while
+owner source calls remain serialized.
+
+The next measurement gate is another Qwen35B remote-source smoke against the
+`201.25s` baseline.  If persistent connection removes most of the overhead,
+batch-read RPCs can be designed more conservatively; if it does not, batch
+RPC/schedule-aware transport becomes the main remaining performance lever.
+
+The measurement gate was run with the same Qwen35B checkpoint immediately
+after the persistent-connection change:
+
+- owner accepted connections: `1`
+- tensor payload: `21.73 GiB`
+- owner actual direct read: `22.23 GiB`
+- model load: `143.982355s`
+- baseline before persistent connection: `201.249922s`
+- improvement: `57.27s` (`28.5%`)
+- owner O_DIRECT read time: `6.71s`
+- owner gate time: `20.39s`
+- remote `buff/cache` delta, first to peak: `+0.200 GiB`
+- remote min available: `83.227 GiB`
+- swap and memory PSI stayed zero on both nodes
+
+This confirms that TCP connection setup was a meaningful part of the
+overhead, but not the dominant remaining cost.  The path still performs
+`124,306` serialized JSON/tensor request-response cycles, so the next
+performance step should be a batch-read RPC or schedule-aware transport that
+amortizes request parsing and tensor reconstruction over many entries.

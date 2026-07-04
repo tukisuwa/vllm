@@ -321,6 +321,7 @@ def test_remote_odirect_weight_source_loopback_reads_real_odirect_payload(
         assert owner_stats["tensors_read_full"] == 1
         assert owner_stats["tensors_read_sliced"] == 4
         assert owner_stats["bytes_read"] > 0
+        assert server.connections_accepted == 1
 
 
 def test_remote_odirect_weight_source_rejects_bad_auth(tmp_path, monkeypatch):
@@ -426,6 +427,7 @@ def test_remote_odirect_owner_source_calls_are_serialized():
 
     assert errors == []
     assert source.max_active == 1
+    assert server.connections_accepted == 1
 
 
 def test_execute_weight_plan_uses_remote_per_entry_segment_fallback(

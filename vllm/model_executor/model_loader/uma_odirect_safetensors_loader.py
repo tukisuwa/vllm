@@ -394,13 +394,20 @@ def _recv_exact(sock: socket.socket, size: int) -> bytes:
     return bytes(chunks)
 
 
-def _recv_frame(
+def _recv_frame_or_none(
     sock: socket.socket,
     *,
     max_header_bytes: int = _REMOTE_MAX_HEADER_BYTES,
     max_payload_bytes: int = 0,
-) -> object:
-    raw_size = _recv_exact(sock, 8)
+) -> object | None:
+    raw_size = sock.recv(8)
+    if not raw_size:
+        return None
+    while len(raw_size) < 8:
+        chunk = sock.recv(8 - len(raw_size))
+        if not chunk:
+            raise RuntimeError("Remote weight source connection closed mid-frame")
+        raw_size += chunk
     size = int.from_bytes(raw_size, "big")
     if size <= 0:
         raise RuntimeError(f"Invalid remote weight source frame size: {size}")
@@ -423,6 +430,22 @@ def _recv_frame(
         )
     payload = _recv_exact(sock, payload_size) if payload_size else b""
     return _merge_tensor_payload(header, payload)
+
+
+def _recv_frame(
+    sock: socket.socket,
+    *,
+    max_header_bytes: int = _REMOTE_MAX_HEADER_BYTES,
+    max_payload_bytes: int = 0,
+) -> object:
+    frame = _recv_frame_or_none(
+        sock,
+        max_header_bytes=max_header_bytes,
+        max_payload_bytes=max_payload_bytes,
+    )
+    if frame is None:
+        raise RuntimeError("Remote weight source connection closed before frame")
+    return frame
 
 
 def _call_weight_loader(
@@ -1482,22 +1505,38 @@ class RemoteODirectSafetensorsWeightSourceServer:
         self.auth_token = auth_token
         self.request_timeout = request_timeout
         self._source_lock = threading.Lock()
+        self._connection_lock = threading.Lock()
+        self._connections_accepted = 0
         outer = self
 
         class _Handler(socketserver.BaseRequestHandler):
             def handle(self) -> None:
                 self.request.settimeout(outer.request_timeout)
-                try:
-                    request = _recv_frame(self.request, max_payload_bytes=0)
-                    # ODirectSafetensorsWeightSource keeps one mutable O_DIRECT
-                    # file/window cache and shared counters.  Phase 1 is a
-                    # correctness-first sync RPC path, so serialize all owner
-                    # source access instead of letting handler threads race.
-                    with outer._source_lock:
-                        response = outer._handle_request(request)
-                except Exception as exc:  # noqa: BLE001 - propagate as RPC error.
-                    response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-                _send_frame(self.request, response)
+                with outer._connection_lock:
+                    outer._connections_accepted += 1
+                while True:
+                    try:
+                        request = _recv_frame_or_none(
+                            self.request,
+                            max_payload_bytes=0,
+                        )
+                        if request is None:
+                            return
+                        # ODirectSafetensorsWeightSource keeps one mutable
+                        # O_DIRECT file/window cache and shared counters.
+                        # Phase 1 is a correctness-first sync RPC path, so
+                        # serialize all owner source access instead of letting
+                        # handler threads race.
+                        with outer._source_lock:
+                            response = outer._handle_request(request)
+                    except Exception as exc:  # noqa: BLE001 - propagate as RPC error.
+                        response = {
+                            "ok": False,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                        _send_frame(self.request, response)
+                        return
+                    _send_frame(self.request, response)
 
         class _Server(socketserver.ThreadingTCPServer):
             allow_reuse_address = True
@@ -1510,6 +1549,11 @@ class RemoteODirectSafetensorsWeightSourceServer:
     def address(self) -> tuple[str, int]:
         host, port = self._server.server_address
         return str(host), int(port)
+
+    @property
+    def connections_accepted(self) -> int:
+        with self._connection_lock:
+            return self._connections_accepted
 
     def start(self) -> None:
         if self._thread is not None:
@@ -1638,6 +1682,8 @@ class RemoteODirectSafetensorsWeightSource:
         self._request_timeout = request_timeout
         self._stats = _RemoteReadStats()
         self._expected_read_summary: ReadScheduleSummary | None = None
+        self._sock: socket.socket | None = None
+        self._sock_lock = threading.Lock()
 
     def read_full_cpu(self, name: str) -> torch.Tensor:
         record = self.catalog.get(name)
@@ -1851,6 +1897,7 @@ class RemoteODirectSafetensorsWeightSource:
             _format_gib(owner_stats["bytes_read"]),
             _format_gib(owner_stats["bytes_copied"]),
         )
+        self._close_socket()
 
     def _record_tensor_read(self, payload_bytes: int, *, sliced: bool) -> None:
         self._stats.tensors_read += 1
@@ -1888,22 +1935,47 @@ class RemoteODirectSafetensorsWeightSource:
     ) -> dict[str, object]:
         request = dict(request)
         request["auth_token"] = self._auth_token
-        with socket.create_connection(
-            (self._host, self._port),
-            timeout=self._request_timeout,
-        ) as sock:
-            sock.settimeout(self._request_timeout)
-            _send_frame(sock, request)
-            response = _recv_frame(sock, max_payload_bytes=max_payload_bytes)
+        with self._sock_lock:
+            sock = self._ensure_socket()
+            try:
+                _send_frame(sock, request)
+                response = _recv_frame(sock, max_payload_bytes=max_payload_bytes)
+            except Exception:
+                self._close_socket_locked()
+                raise
         if not isinstance(response, dict):
             raise RuntimeError("Remote O_DIRECT owner returned invalid response")
         if not response.get("ok"):
             error = response.get("error")
+            self._close_socket()
             raise RuntimeError(
                 "Remote O_DIRECT owner rejected request"
                 + (f": {error}" if isinstance(error, str) else "")
             )
         return response
+
+    def _ensure_socket(self) -> socket.socket:
+        if self._sock is None:
+            sock = socket.create_connection(
+                (self._host, self._port),
+                timeout=self._request_timeout,
+            )
+            sock.settimeout(self._request_timeout)
+            self._sock = sock
+        return self._sock
+
+    def _close_socket(self) -> None:
+        with self._sock_lock:
+            self._close_socket_locked()
+
+    def _close_socket_locked(self) -> None:
+        sock = self._sock
+        self._sock = None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 class _ConsumerProfile:

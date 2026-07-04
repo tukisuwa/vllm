@@ -340,6 +340,52 @@ real vLLM model-load path.
 The remote env names are now registered in `vllm.envs` so vLLM's unknown-env
 checker does not warn for this fork-specific transport configuration.
 
+## Phase 1a persistent connection (2026-07-04)
+
+The first Qwen35B 2-node smoke proved the remote path but also exposed the
+Phase 1 performance limit: `124,306` full-read entries caused `124,306`
+independent synchronous TCP connections.  The owner measured only `7.37s` of
+O_DIRECT read time, while total model-load time was `201.25s`; the bottleneck
+was request granularity/connection overhead, not disk or network bandwidth.
+
+Phase 1a keeps the existing narrow WeightSource-shaped protocol and changes
+only the connection lifetime:
+
+- the owner handler now accepts multiple length-prefixed request frames on one
+  TCP connection until the remote side closes it;
+- owner source access remains protected by the same coarse `_source_lock`, so
+  the mutable single-window O_DIRECT state is still serialized;
+- the remote source keeps one socket and serializes request/response pairs
+  with a lock, preserving correctness if multiple loader threads touch the
+  same source;
+- failed requests close the remote socket so a rejected/auth-failed connection
+  is not reused;
+- tests assert that repeated loopback reads and concurrent reads share one
+  accepted owner connection while still keeping owner source calls serialized.
+
+This is intentionally an isolated measurement step before adding batch-read
+RPCs.  The next Qwen35B remote smoke should be compared against the
+`201.25s` pre-persistent baseline to decide how much of the unexplained time
+was TCP connect overhead versus JSON/tensor reconstruction/dispatch overhead.
+
+Measured outcome on the same Qwen35B checkpoint:
+
+- owner accepted connections: `1`
+- model load: `143.982355s`
+- pre-persistent baseline: `201.249922s`
+- improvement: `57.27s` (`28.5%`)
+- payload and owner read accounting stayed unchanged: remote stream
+  `21.73 GiB`, owner `bytes_read=22.23 GiB`, `direct_reads=407`,
+  `window_loads=163`, `window_hits=124304`
+- remote `buff/cache` first-to-peak delta stayed small at `+0.200 GiB`
+- swap and memory PSI stayed zero on both nodes
+
+Persistent connection therefore removes a substantial TCP setup cost, but the
+remaining gap is still large.  The next optimization should batch many
+WeightPlan entries into one request, or otherwise pass the read schedule into
+the transport, so the remote path does not pay JSON parsing, frame dispatch,
+and tensor reconstruction overhead `124,306` times for Qwen35B.
+
 ## Open questions
 
 - How does per-rank payload ownership interact with pipeline-parallel layer
