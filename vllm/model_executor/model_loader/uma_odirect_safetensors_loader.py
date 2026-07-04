@@ -2860,6 +2860,7 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
     REMOTE_ROLE_ENV = "VLLM_UMA_ODIRECT_REMOTE_ROLE"
     REMOTE_HOST_ENV = "VLLM_UMA_ODIRECT_REMOTE_HOST"
     REMOTE_PORT_ENV = "VLLM_UMA_ODIRECT_REMOTE_PORT"
+    REMOTE_PORT_OFFSET_ENV = "VLLM_UMA_ODIRECT_REMOTE_PORT_OFFSET"
     REMOTE_TOKEN_ENV = "VLLM_UMA_ODIRECT_REMOTE_TOKEN"
     REMOTE_TIMEOUT_ENV = "VLLM_UMA_ODIRECT_REMOTE_TIMEOUT_SECONDS"
 
@@ -3052,6 +3053,33 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
             raise RuntimeError(
                 f"{self.REMOTE_PORT_ENV} must be a TCP port, got {raw!r}"
             )
+        raw_offset = os.environ.get(self.REMOTE_PORT_OFFSET_ENV, "0")
+        try:
+            offset = int(raw_offset)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{self.REMOTE_PORT_OFFSET_ENV} must be an integer, "
+                f"got {raw_offset!r}"
+            ) from exc
+        if offset < 0:
+            raise RuntimeError(
+                f"{self.REMOTE_PORT_OFFSET_ENV} must be non-negative, "
+                f"got {raw_offset!r}"
+            )
+        if port + offset > 65535:
+            raise RuntimeError(
+                "Remote O_DIRECT resolved TCP port is out of range: "
+                f"{port} + {offset} > 65535"
+            )
+        if offset:
+            logger.info(
+                "uma_odirect_safetensors remote port offset: base=%d offset=%d "
+                "resolved=%d",
+                port,
+                offset,
+                port + offset,
+            )
+            port += offset
         return port
 
     def _create_weight_source(

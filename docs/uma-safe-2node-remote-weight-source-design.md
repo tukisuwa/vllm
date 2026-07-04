@@ -300,6 +300,7 @@ The first implementation cut adds:
   - `VLLM_UMA_ODIRECT_REMOTE_ROLE=owner|remote`
   - `VLLM_UMA_ODIRECT_REMOTE_HOST`
   - `VLLM_UMA_ODIRECT_REMOTE_PORT`
+  - `VLLM_UMA_ODIRECT_REMOTE_PORT_OFFSET` (optional, added to the base port)
   - `VLLM_UMA_ODIRECT_REMOTE_TOKEN`
   - `VLLM_UMA_ODIRECT_REMOTE_TIMEOUT_SECONDS` (optional, default `30`)
 
@@ -311,10 +312,11 @@ or reads safetensors headers from the configured model path; it fetches the
 owner catalog first, then uses `RemoteODirectSafetensorsWeightSource` for
 payload reads.
 
-The env wiring is still a single-owner-process contract. A launch that starts
-multiple owner-role worker processes on the same node with the same host/port
-will fail to bind; rank-aware owner election/topology files are intentionally
-left for the next harness step rather than hidden inside this first cut.
+The env wiring is still a manually configured topology contract. A launch that
+starts multiple owner-role worker processes on the same node must assign a
+distinct resolved port per owner. `VLLM_UMA_ODIRECT_REMOTE_PORT_OFFSET` lets a
+launcher use one base port and add a rank/local-rank-derived offset, but owner
+election and topology-file generation remain outside this loader.
 
 This implementation is intentionally not wired into distributed vLLM launch
 automation yet. Manual owner/remote env wiring has been validated, but

@@ -37,6 +37,8 @@ Enable it with the fork-specific environment variables:
 - `VLLM_UMA_ODIRECT_REMOTE_ROLE=owner|remote`
 - `VLLM_UMA_ODIRECT_REMOTE_HOST`
 - `VLLM_UMA_ODIRECT_REMOTE_PORT`
+- `VLLM_UMA_ODIRECT_REMOTE_PORT_OFFSET` (optional; resolved port is
+  `PORT + OFFSET`)
 - `VLLM_UMA_ODIRECT_REMOTE_TOKEN`
 - `VLLM_UMA_ODIRECT_REMOTE_TIMEOUT_SECONDS` (optional)
 
@@ -46,7 +48,7 @@ The remote path is deliberately limited:
   loading;
 - ownership is static and manually configured;
 - one owner process binds one TCP port, so multi-owner same-node launches need
-  explicit port/topology management outside this first implementation;
+  explicit per-rank port offsets;
 - remote ranks depend on the owner for catalog metadata and payload bytes, so
   the owner must be listening before remote load starts;
 - the TCP token is a private-network guard, not a replacement for a trusted
@@ -137,7 +139,7 @@ As of 2026-07-04:
 
 The 2-node remote path has been validated as a catalog/payload transport, not
 as a complete distributed serving topology.  Pipeline-parallel layer
-distribution, rank-aware owner election, multi-owner port assignment, and
+distribution, rank-aware owner election, topology-file generation, and
 cross-rank failure propagation are still explicit follow-up work.
 
 The tiny fixtures validate byte boundaries and O_DIRECT execution, and the

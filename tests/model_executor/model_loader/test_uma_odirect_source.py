@@ -943,3 +943,33 @@ def test_uma_odirect_owner_role_warns_when_host_defaults_to_loopback(
     finally:
         if loader._remote_owner_server is not None:
             loader._remote_owner_server.close()
+
+
+def test_uma_odirect_remote_port_offset(monkeypatch):
+    loader = L.UmaODirectSafetensorsModelLoader(
+        LoadConfig(
+            load_format="uma_odirect_safetensors",
+            model_loader_extra_config={},
+        )
+    )
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_PORT_ENV, "9000")
+    monkeypatch.setenv(
+        L.UmaODirectSafetensorsModelLoader.REMOTE_PORT_OFFSET_ENV,
+        "3",
+    )
+    assert loader._remote_port() == 9003
+
+    monkeypatch.setenv(
+        L.UmaODirectSafetensorsModelLoader.REMOTE_PORT_OFFSET_ENV,
+        "-1",
+    )
+    with pytest.raises(RuntimeError, match="must be non-negative"):
+        loader._remote_port()
+
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_PORT_ENV, "65535")
+    monkeypatch.setenv(
+        L.UmaODirectSafetensorsModelLoader.REMOTE_PORT_OFFSET_ENV,
+        "1",
+    )
+    with pytest.raises(RuntimeError, match="out of range"):
+        loader._remote_port()

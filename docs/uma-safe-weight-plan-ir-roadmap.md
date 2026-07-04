@@ -2562,3 +2562,17 @@ This removes the remaining NFS dependency for metadata.  Remaining 2-node
 work is now rank/topology oriented: owner election and port assignment for
 multi-worker launches, failure propagation through vLLM's distributed
 lifecycle, and true TP/PP placement validation.
+
+### 2026-07-05 RemoteWeightSource port offsets
+
+The first rank-aware topology hook is a minimal explicit port-offset control:
+`VLLM_UMA_ODIRECT_REMOTE_PORT_OFFSET`.  The resolved TCP endpoint is
+`VLLM_UMA_ODIRECT_REMOTE_PORT + VLLM_UMA_ODIRECT_REMOTE_PORT_OFFSET`, with
+fail-closed validation for non-integer, negative, or out-of-range results.
+
+This keeps the single-owner default unchanged while letting a launcher assign
+per-rank ports without hardcoding a separate full port value for every worker.
+It is intentionally not automatic owner election: the launch layer still owns
+which ranks are owners/remotes and must pass matching offsets on both sides.
+The remaining topology work is a small topology file or launcher wrapper that
+sets role, host, base port, offset, and token consistently for all ranks.

@@ -668,6 +668,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_UMA_ODIRECT_REMOTE_PORT": lambda: os.getenv(
         "VLLM_UMA_ODIRECT_REMOTE_PORT", ""
     ),
+    "VLLM_UMA_ODIRECT_REMOTE_PORT_OFFSET": lambda: os.getenv(
+        "VLLM_UMA_ODIRECT_REMOTE_PORT_OFFSET", ""
+    ),
     "VLLM_UMA_ODIRECT_REMOTE_TOKEN": lambda: os.getenv(
         "VLLM_UMA_ODIRECT_REMOTE_TOKEN", ""
     ),
