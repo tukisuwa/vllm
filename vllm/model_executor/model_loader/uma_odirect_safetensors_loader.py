@@ -2707,6 +2707,7 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
     DEFAULT_PSI_GATE_SECONDS = 30.0
     DEFAULT_GATE_INTERVAL_MIB = 64
     DEFAULT_ALLOCATION_GATE_MIN_MIB = 16
+    DEFAULT_REMOTE_BATCH_PAYLOAD_MIB = 128
     REMOTE_ROLE_ENV = "VLLM_UMA_ODIRECT_REMOTE_ROLE"
     REMOTE_HOST_ENV = "VLLM_UMA_ODIRECT_REMOTE_HOST"
     REMOTE_PORT_ENV = "VLLM_UMA_ODIRECT_REMOTE_PORT"
@@ -2732,6 +2733,7 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
             "allocation_gate_min_mib",
             "psi_gate_seconds",
             "max_swap_gib",
+            "remote_batch_payload_mib",
         }
         unexpected_keys = set(extra_config) - allowed_keys
         if unexpected_keys:
@@ -2777,6 +2779,15 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
                 extra_config,
                 "allocation_gate_min_mib",
                 self.DEFAULT_ALLOCATION_GATE_MIN_MIB,
+            )
+            * 1024
+            * 1024
+        )
+        self._remote_batch_payload_bytes = (
+            self._get_positive_int(
+                extra_config,
+                "remote_batch_payload_mib",
+                self.DEFAULT_REMOTE_BATCH_PAYLOAD_MIB,
             )
             * 1024
             * 1024
@@ -2929,6 +2940,7 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
                 port=port,
                 auth_token=token,
                 request_timeout=timeout,
+                max_batch_payload_bytes=self._remote_batch_payload_bytes,
             )
             server.start()
             actual_host, actual_port = server.address
@@ -2966,6 +2978,7 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
             port=port,
             auth_token=token,
             request_timeout=timeout,
+            max_batch_payload_bytes=self._remote_batch_payload_bytes,
         )
 
     def _get_weights_iterator(

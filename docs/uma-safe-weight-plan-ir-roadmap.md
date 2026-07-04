@@ -2479,3 +2479,57 @@ one remote batch request, and one owner `read_segment_group_into_cpu` call with
 all three entries.  Remaining gate: run a segment-family 2-node smoke
 (TeleChat2/HunYuan/Llama4) to confirm request reduction and read accounting on
 a real checkpoint.
+
+TeleChat2 B2 2-node smoke result:
+
+- model: `/data/shared/models/hf/vllm-loader-test/TeleChat2-35B`
+- owner/local: `dgx-spark2` (`192.168.100.11`)
+- remote: `dgx-spark1`
+- loader config: `remote_batch_payload_mib=256`
+- tensor payload: `66.00 GiB`
+- full payload: `57.00 GiB`
+- segmented/read-into payload: `9.00 GiB`
+- weight plan: `707` entries, `579` full reads, `128` read-into segmented
+  entries
+- remote batch requests: `254`
+- remote batched tensors: `636`
+- owner accepted connections: `1`
+- remote schedule: `expected_direct_reads=6344`,
+  `expected_window_loads=200`, `expected_window_hits=6529`,
+  `expected_bytes_read=72.64 GiB`, `expected_read_amplification=1.10x`
+- owner actual direct read: `72.64 GiB` (`direct_reads=6344`,
+  `window_loads=200`, `window_hits=6529`)
+- owner timings: `read=19.01s`, `gate=0.21s`, `alloc=0.03s`
+- model load: `66.01 GiB`, `205.299442s`
+
+Safety summary:
+
+- remote first `buff/cache`: `1.654 GiB`; peak: `2.602 GiB`; delta:
+  `+0.948 GiB`
+- remote min available: `38.22 GiB`; peak used + `buff/cache`: `85.99 GiB`
+- owner/local first `buff/cache`: `2.333 GiB`; peak: `2.910 GiB`; delta:
+  `+0.577 GiB`
+- owner/local min available: `101.27 GiB`; peak used + `buff/cache`:
+  `20.91 GiB`
+- swap and memory PSI stayed zero on both nodes
+
+Artifacts:
+
+- owner log:
+  `/home/tsukisuwa/LLM/logs/vllm-loader/telechat2-remote-odirect-b2-20260704-225406.owner.log`
+- remote vLLM log:
+  `/home/tsukisuwa/LLM/logs/vllm-loader/telechat2-remote-odirect-b2-20260704-225406.remote.log`
+- remote runner log:
+  `/home/tsukisuwa/LLM/logs/vllm-loader/telechat2-remote-odirect-b2-20260704-225406.remote-runner.log`
+- RAM CSV:
+  `/home/tsukisuwa/LLM/logs/ram/telechat2-remote-odirect-b2-20260704-225406.csv`
+- RAM summary:
+  `/home/tsukisuwa/LLM/logs/ram/telechat2-remote-odirect-b2-20260704-225406.summary.txt`
+
+This closes the B2 real-checkpoint gate for TeleChat2: segmented remote reads
+are batched over the WeightSource-shaped transport, owner read accounting
+matches the remote schedule, and the remote node still avoids model-sized page
+cache growth.  The high model-load time relative to local O_DIRECT is expected
+for a 66 GiB payload streamed through the synchronous TCP transport; B2's goal
+was functional coverage and read-accounting correctness for segment-family
+models, not full distributed loading.

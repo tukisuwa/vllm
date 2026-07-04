@@ -514,6 +514,12 @@ HunYuan-style Q/K/V entries that share one fused checkpoint tensor from
 devolving into independent owner sweeps.  Response tensors are still returned
 in the original request order, so executor dispatch order remains unchanged.
 
+The batch payload cap is configurable through the loader extra config
+`remote_batch_payload_mib` (default `128`).  TeleChat2's K/V staging tensors
+are about `72 MiB` each, so the B2 real-checkpoint smoke used `256 MiB` to let
+K/V pairs that share one `key_value.weight` source tensor enter the same remote
+batch while still keeping peak transport staging bounded.
+
 ### Stage B3: owner capability handshake
 
 Add a small owner op, for example `source_capability`, returning:

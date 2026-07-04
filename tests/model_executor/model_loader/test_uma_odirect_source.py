@@ -87,6 +87,7 @@ def _real_source_many(tmp_path, monkeypatch, tensors: dict[str, torch.Tensor]):
                 "chunk_size": 4096,
                 "window_size": 4096,
                 "gate_interval_mib": 1,
+                "remote_batch_payload_mib": 2,
             },
         )
     )
@@ -884,11 +885,15 @@ def test_uma_odirect_loader_env_wires_owner_and_remote_sources(
         assert owner_loader._remote_owner_server is not None
 
         remote_loader = L.UmaODirectSafetensorsModelLoader(
-            LoadConfig(load_format="uma_odirect_safetensors")
+            LoadConfig(
+                load_format="uma_odirect_safetensors",
+                model_loader_extra_config={"remote_batch_payload_mib": 2},
+            )
         )
         monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_ROLE_ENV, "remote")
         remote_source = remote_loader._create_weight_source(str(tmp_path))
         assert isinstance(remote_source, L.RemoteODirectSafetensorsWeightSource)
+        assert remote_source.read_many_max_payload_bytes() == 2 * 1024 * 1024
         loaded = _remote_read_or_skip(lambda: remote_source.read_full_cpu(name))
         assert torch.equal(loaded, tensor)
     finally:
