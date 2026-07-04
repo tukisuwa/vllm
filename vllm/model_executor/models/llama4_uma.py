@@ -140,7 +140,7 @@ def _local_expert_slice(routed_experts: Any) -> tuple[tuple[slice, ...] | None, 
 
 def _parse_fused_expert_name(name: str) -> tuple[int, str] | None:
     parts = name.split(".")
-    for idx in range(len(parts) - 5):
+    for idx in range(len(parts) - 4):
         if parts[idx] != "layers":
             continue
         if (
@@ -154,6 +154,27 @@ def _parse_fused_expert_name(name: str) -> tuple[int, str] | None:
             continue
         return int(parts[idx + 1]), proj_name
     return None
+
+
+def _fused_expert_target_name(
+    checkpoint_name: str,
+    *,
+    source_projection: str,
+    target_projection: str,
+) -> str:
+    parts = checkpoint_name.split(".")
+    for idx in range(len(parts) - 4):
+        if (
+            parts[idx] == "layers"
+            and parts[idx + 1].isdigit()
+            and parts[idx + 2] == "feed_forward"
+            and parts[idx + 3] == "experts"
+            and parts[idx + 4] == source_projection
+        ):
+            prefix = parts[: idx + 4]
+            suffix = parts[idx + 5 :] or ["weight"]
+            return ".".join(prefix + [f"{target_projection}_{'_'.join(suffix)}"])
+    raise RuntimeError(f"Invalid Llama4 fused expert tensor name: {checkpoint_name}")
 
 
 def _fused_expert_plan_entry(
@@ -239,9 +260,10 @@ def _collect_fused_expert_entries(
                     f"{checkpoint_name} shape={record.shape}"
                 )
             half = record.shape[-1] // 2
-            target_name = checkpoint_name.replace(
-                ".experts.gate_up_proj.",
-                ".experts.w13_",
+            target_name = _fused_expert_target_name(
+                checkpoint_name,
+                source_projection="gate_up_proj",
+                target_projection="w13",
             )
             for shard_id, start, stop in (
                 ("w1", 0, half),
@@ -276,9 +298,10 @@ def _collect_fused_expert_entries(
                     ).to_weight_plan_entries()
                 )
         else:
-            target_name = checkpoint_name.replace(
-                ".experts.down_proj.",
-                ".experts.w2_",
+            target_name = _fused_expert_target_name(
+                checkpoint_name,
+                source_projection="down_proj",
+                target_projection="w2",
             )
             entries.extend(
                 _fused_expert_plan_entry(

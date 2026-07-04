@@ -8798,7 +8798,7 @@ def test_openpangu_source_hook_delegates_and_runs_post_weight_load(monkeypatch):
 def test_llama4_source_plan_maps_dense_per_expert_and_fused_names(monkeypatch):
     local_name = "model.layers.0.feed_forward.experts.1.gate_proj.weight"
     remote_name = "model.layers.0.feed_forward.experts.3.down_proj.weight"
-    fused_gate_up = "model.layers.0.feed_forward.experts.gate_up_proj.weight"
+    fused_gate_up = "model.layers.0.feed_forward.experts.gate_up_proj"
     q_name = "model.layers.0.self_attn.q_proj.weight"
     catalog = TensorCatalog([
         TensorMeta("model.safetensors", local_name, torch.float32, [1], 0, 4),

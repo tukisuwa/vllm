@@ -20,10 +20,13 @@ from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
+import requests
 from torch import nn
 
 from vllm.model_executor.model_loader.weight_plan import (
     WeightPlanEntry,
+    _DTYPE_MAP,
+    _tensor_nbytes,
     validate_weight_plan_read_segments,
 )
 from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
@@ -35,6 +38,7 @@ from vllm.model_executor.model_loader.uma_odirect_safetensors_loader import (
 DEFAULT_METADATA_LIMIT_MIB = 16
 DEFAULT_TOP_N = 20
 DEFAULT_PLAN_EXAMPLES = 20
+DEFAULT_HF_TIMEOUT = 30.0
 
 
 def _format_gib(nbytes: int) -> str:
@@ -48,9 +52,8 @@ def _find_safetensors(model_dir: Path) -> list[str]:
     return files
 
 
-def _read_architectures(model_dir: Path) -> list[str]:
-    data = _read_config(model_dir)
-    architectures = data.get("architectures")
+def _architectures_from_config(config: dict[str, object]) -> list[str]:
+    architectures = config.get("architectures")
     if not isinstance(architectures, list):
         return []
     return [item for item in architectures if isinstance(item, str)]
@@ -67,6 +70,295 @@ def _read_config(model_dir: Path) -> dict[str, object]:
     if not isinstance(data, dict):
         return {}
     return data
+
+
+def _hf_token_from_env(token_env: str) -> str | None:
+    token = os.environ.get(token_env)
+    if token:
+        return token
+    if token_env != "HF_TOKEN":
+        return None
+    return os.environ.get("HUGGING_FACE_HUB_TOKEN")
+
+
+def _hf_headers(token: str | None) -> dict[str, str]:
+    from huggingface_hub.utils import build_hf_headers
+
+    return build_hf_headers(token=token)
+
+
+def _hf_url(repo_id: str, filename: str, *, revision: str | None) -> str:
+    from huggingface_hub import hf_hub_url
+
+    return hf_hub_url(repo_id, filename, revision=revision)
+
+
+def _hf_get_json(
+    repo_id: str,
+    filename: str,
+    *,
+    revision: str | None,
+    headers: dict[str, str],
+    timeout: float,
+) -> dict[str, object]:
+    response = requests.get(
+        _hf_url(repo_id, filename, revision=revision),
+        headers=headers,
+        timeout=timeout,
+    )
+    if response.status_code == 404:
+        return {}
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict):
+        raise SystemExit(f"HF file {filename} did not contain a JSON object")
+    return data
+
+
+def _hf_get_range(
+    repo_id: str,
+    filename: str,
+    *,
+    revision: str | None,
+    start: int,
+    end: int,
+    headers: dict[str, str],
+    timeout: float,
+) -> bytes:
+    if start < 0 or end < start:
+        raise RuntimeError(f"Invalid HF range for {filename}: {start}-{end}")
+    request_headers = dict(headers)
+    request_headers["Range"] = f"bytes={start}-{end}"
+    response = requests.get(
+        _hf_url(repo_id, filename, revision=revision),
+        headers=request_headers,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.content
+    expected = end - start + 1
+    if response.status_code != 206:
+        raise RuntimeError(
+            f"HF server did not honor range request for {filename}: "
+            f"status={response.status_code}"
+        )
+    if len(payload) != expected:
+        raise RuntimeError(
+            f"Short HF range read for {filename}: got={len(payload)}, "
+            f"expected={expected}, range={start}-{end}"
+        )
+    return payload
+
+
+def _hf_file_size(
+    repo_id: str,
+    filename: str,
+    *,
+    revision: str | None,
+    headers: dict[str, str],
+    timeout: float,
+) -> int:
+    response = requests.head(
+        _hf_url(repo_id, filename, revision=revision),
+        headers=headers,
+        timeout=timeout,
+        allow_redirects=True,
+    )
+    response.raise_for_status()
+    size = response.headers.get("content-length")
+    if size is None or not size.isdigit():
+        raise RuntimeError(f"Could not determine HF file size for {filename}")
+    return int(size)
+
+
+def _hf_safetensors_files(
+    repo_id: str,
+    *,
+    revision: str | None,
+    token: str | None,
+    timeout: float,
+) -> list[tuple[str, int | None]]:
+    from huggingface_hub import HfApi
+
+    info = HfApi().model_info(
+        repo_id,
+        revision=revision,
+        files_metadata=True,
+        token=token,
+        timeout=timeout,
+    )
+    files: list[tuple[str, int | None]] = []
+    for sibling in info.siblings:
+        filename = getattr(sibling, "rfilename", None)
+        if not isinstance(filename, str) or not filename.endswith(".safetensors"):
+            continue
+        size = getattr(sibling, "size", None)
+        if isinstance(size, bool) or not isinstance(size, int):
+            size = None
+        files.append((filename, size))
+    files.sort(key=lambda item: item[0])
+    if not files:
+        raise SystemExit(f"No .safetensors files found in HF repo {repo_id}")
+    return files
+
+
+def _catalog_from_hf_safetensors(
+    repo_id: str,
+    *,
+    revision: str | None,
+    metadata_limit_bytes: int,
+    token_env: str,
+    timeout: float,
+) -> tuple[TensorCatalog, list[str], dict[str, object]]:
+    token = _hf_token_from_env(token_env)
+    headers = _hf_headers(token)
+    config = _hf_get_json(
+        repo_id,
+        "config.json",
+        revision=revision,
+        headers=headers,
+        timeout=timeout,
+    )
+    hf_files = _hf_safetensors_files(
+        repo_id,
+        revision=revision,
+        token=token,
+        timeout=timeout,
+    )
+    records: list[TensorMeta] = []
+    seen_names: dict[str, str] = {}
+    file_labels: list[str] = []
+    for filename, file_size in hf_files:
+        if file_size is None:
+            file_size = _hf_file_size(
+                repo_id,
+                filename,
+                revision=revision,
+                headers=headers,
+                timeout=timeout,
+            )
+        raw_size = _hf_get_range(
+            repo_id,
+            filename,
+            revision=revision,
+            start=0,
+            end=7,
+            headers=headers,
+            timeout=timeout,
+        )
+        metadata_size = int.from_bytes(raw_size, "little")
+        if metadata_size > metadata_limit_bytes:
+            raise RuntimeError(
+                f"Safetensors metadata too large in {filename}: "
+                f"{metadata_size} bytes > {metadata_limit_bytes} bytes"
+            )
+        if metadata_size > file_size - 8:
+            raise RuntimeError(
+                f"Invalid safetensors metadata size in {filename}: "
+                f"{metadata_size} bytes exceeds file payload"
+            )
+        metadata_raw = _hf_get_range(
+            repo_id,
+            filename,
+            revision=revision,
+            start=8,
+            end=7 + metadata_size,
+            headers=headers,
+            timeout=timeout,
+        )
+        metadata = json.loads(metadata_raw)
+        if not isinstance(metadata, dict):
+            raise RuntimeError(f"Invalid safetensors metadata in {filename}")
+        data_start = 8 + metadata_size
+        file_ranges: list[tuple[int, int, str]] = []
+        file_label = f"hf://{repo_id}@{revision or 'main'}/{filename}"
+        file_labels.append(file_label)
+        for name, info in metadata.items():
+            if name == "__metadata__":
+                continue
+            if name in seen_names:
+                raise RuntimeError(
+                    f"Duplicate safetensors tensor name {name!r}: "
+                    f"{seen_names[name]} and {file_label}"
+                )
+            seen_names[name] = file_label
+            if not isinstance(info, dict):
+                raise RuntimeError(f"Invalid safetensors metadata for {name}")
+            try:
+                dtype_name = info["dtype"]
+                data_offsets = info["data_offsets"]
+                shape_raw = info["shape"]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"Missing safetensors metadata key {exc.args[0]!r} for {name}"
+                ) from exc
+            if dtype_name not in _DTYPE_MAP:
+                raise RuntimeError(
+                    f"Unsupported safetensors dtype {dtype_name!r} for {name}"
+                )
+            dtype = _DTYPE_MAP[dtype_name]
+            if not isinstance(data_offsets, list) or len(data_offsets) != 2:
+                raise RuntimeError(
+                    f"Invalid safetensors data_offsets for {name}: "
+                    f"{data_offsets!r}"
+                )
+            if not isinstance(shape_raw, list):
+                raise RuntimeError(
+                    f"Invalid safetensors shape for {name}: {shape_raw!r}"
+                )
+            start, end = data_offsets
+            shape = tuple(shape_raw)
+            if (
+                isinstance(start, bool)
+                or isinstance(end, bool)
+                or not isinstance(start, int)
+                or not isinstance(end, int)
+                or start < 0
+                or end < start
+                or data_start + end > file_size
+            ):
+                raise RuntimeError(
+                    f"Invalid safetensors byte range for {name}: "
+                    f"start={start}, end={end}, file_size={file_size}, "
+                    f"data_start={data_start}"
+                )
+            if not all(
+                not isinstance(dim, bool) and isinstance(dim, int) and dim >= 0
+                for dim in shape
+            ):
+                raise RuntimeError(f"Invalid safetensors shape for {name}: {shape}")
+            size = end - start
+            expected_size = _tensor_nbytes(shape, dtype)
+            if expected_size != size:
+                raise RuntimeError(
+                    f"Tensor size mismatch for {name}: metadata has {size} "
+                    f"bytes, shape/dtype imply {expected_size} bytes"
+                )
+            file_ranges.append((start, end, name))
+            records.append(
+                TensorMeta(
+                    file_path=file_label,
+                    name=name,
+                    dtype=dtype,
+                    shape=shape,
+                    offset=data_start + start,
+                    size=size,
+                )
+            )
+        file_ranges.sort(key=lambda item: item[0])
+        previous_end = 0
+        previous_name = ""
+        for start, _end, name in file_ranges:
+            if start < previous_end:
+                raise RuntimeError(
+                    f"Overlapping safetensors data ranges in {file_label}: "
+                    f"{previous_name} ends at {previous_end}, "
+                    f"{name} starts at {start}"
+                )
+            previous_end = _end
+            previous_name = name
+    records.sort(key=lambda record: (record.file_path, record.offset))
+    return TensorCatalog(records), file_labels, config
 
 
 def _classify_name(name: str) -> str:
@@ -88,12 +380,12 @@ def _classify_name(name: str) -> str:
         return "shared_experts"
     if ".q_proj." in name or ".k_proj." in name or ".v_proj." in name:
         return "split_qkv"
-    if ".qkv_proj." in name:
+    if ".qkv_proj." in name or name.endswith(".qkv_proj"):
         return "packed_qkv"
+    if ".gate_up_proj." in name or name.endswith(".gate_up_proj"):
+        return "packed_gate_up"
     if ".gate_proj." in name or ".up_proj." in name:
         return "split_gate_up"
-    if ".gate_up_proj." in name:
-        return "packed_gate_up"
     if name.endswith(".lm_head.weight"):
         return "lm_head"
     if "embed_tokens" in name:
@@ -261,7 +553,10 @@ def _print_llama4_plan_audit(
         staging_bytes += _entry_staging_bytes(record, entry)
         checkpoint_counts[entry.checkpoint_name] += 1
         shard_counts[str(entry.shard_id)] += 1
-        if ".feed_forward.experts.gate_up_proj." in entry.checkpoint_name:
+        if (
+            ".feed_forward.experts.gate_up_proj." in entry.checkpoint_name
+            or entry.checkpoint_name.endswith(".feed_forward.experts.gate_up_proj")
+        ):
             fused_gate_up_entries += 1
 
     print(
@@ -367,7 +662,38 @@ def main() -> None:
             "No tensor payload bytes are read."
         )
     )
-    parser.add_argument("model_dir", type=Path)
+    parser.add_argument(
+        "model_dir",
+        type=Path,
+        nargs="?",
+        help="Local model directory. Mutually exclusive with --hf-repo.",
+    )
+    parser.add_argument(
+        "--hf-repo",
+        help=(
+            "Hugging Face repo id to audit by range-reading safetensors "
+            "headers only."
+        ),
+    )
+    parser.add_argument(
+        "--hf-revision",
+        default=None,
+        help="Optional Hugging Face repo revision.",
+    )
+    parser.add_argument(
+        "--hf-token-env",
+        default="HF_TOKEN",
+        help=(
+            "Environment variable containing a Hugging Face token. "
+            "HF_TOKEN also falls back to HUGGING_FACE_HUB_TOKEN."
+        ),
+    )
+    parser.add_argument(
+        "--hf-timeout",
+        type=float,
+        default=DEFAULT_HF_TIMEOUT,
+        help="HTTP timeout in seconds for Hugging Face metadata/range requests.",
+    )
     parser.add_argument(
         "--metadata-limit-mib",
         type=int,
@@ -400,23 +726,41 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    model_dir = args.model_dir.resolve()
-    if not model_dir.is_dir():
-        raise SystemExit(f"Model path is not a directory: {model_dir}")
+    if (args.model_dir is None) == (args.hf_repo is None):
+        raise SystemExit("Specify exactly one of model_dir or --hf-repo")
     if args.metadata_limit_mib <= 0:
         raise SystemExit("--metadata-limit-mib must be positive")
     if args.top < 0:
         raise SystemExit("--top must be non-negative")
     if args.plan_examples < 0:
         raise SystemExit("--plan-examples must be non-negative")
+    if args.hf_timeout <= 0:
+        raise SystemExit("--hf-timeout must be positive")
 
-    files = _find_safetensors(model_dir)
-    catalog = TensorCatalog.from_safetensors_files(
-        files,
-        metadata_limit_bytes=args.metadata_limit_mib * 1024 * 1024,
-    )
+    if args.hf_repo is not None:
+        source_label = f"hf_repo={args.hf_repo}"
+        if args.hf_revision is not None:
+            source_label += f" revision={args.hf_revision}"
+        catalog, files, config = _catalog_from_hf_safetensors(
+            args.hf_repo,
+            revision=args.hf_revision,
+            metadata_limit_bytes=args.metadata_limit_mib * 1024 * 1024,
+            token_env=args.hf_token_env,
+            timeout=args.hf_timeout,
+        )
+    else:
+        model_dir = args.model_dir.resolve()
+        if not model_dir.is_dir():
+            raise SystemExit(f"Model path is not a directory: {model_dir}")
+        source_label = f"model_dir={model_dir}"
+        files = _find_safetensors(model_dir)
+        catalog = TensorCatalog.from_safetensors_files(
+            files,
+            metadata_limit_bytes=args.metadata_limit_mib * 1024 * 1024,
+        )
+        config = _read_config(model_dir)
     records = list(catalog.records())
-    architectures = _read_architectures(model_dir)
+    architectures = _architectures_from_config(config)
     class_counts: Counter[str] = Counter()
     class_bytes: Counter[str] = Counter()
     dtype_counts: Counter[str] = Counter()
@@ -432,7 +776,7 @@ def main() -> None:
         dtype_bytes[dtype] += record.size
         file_bytes[record.file_path] += record.size
 
-    print(f"model_dir={model_dir}")
+    print(source_label)
     if architectures:
         print(f"architectures={','.join(architectures)}")
     print(
@@ -461,7 +805,7 @@ def main() -> None:
     if args.uma_plan == "llama4":
         _print_llama4_plan_audit(
             catalog,
-            _read_config(model_dir),
+            config,
             examples=args.plan_examples,
         )
 
