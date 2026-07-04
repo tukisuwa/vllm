@@ -611,7 +611,6 @@ JSON manifest can be selected by `VLLM_UMA_ODIRECT_REMOTE_TOPOLOGY`:
 ```json
 {
   "version": 1,
-  "default_token_env": "VLLM_UMA_ODIRECT_REMOTE_TOKEN",
   "base_port": 32190,
   "owners": {
     "0": {
@@ -639,6 +638,8 @@ The manifest is intentionally rank-indexed and concrete:
 - every remote rank names exactly one owner endpoint;
 - every owner endpoint resolves to `base_port + port_offset`, with the same
   fail-closed range validation as `VLLM_UMA_ODIRECT_REMOTE_PORT_OFFSET`;
+- the auth token is always read from `VLLM_UMA_ODIRECT_REMOTE_TOKEN`; the
+  manifest does not select alternate token env names;
 - an explicit env still wins for manual debugging, so the current
   `ROLE/HOST/PORT/OFFSET/TOKEN` path remains the low-level escape hatch.
 
