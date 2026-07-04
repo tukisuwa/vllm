@@ -2066,3 +2066,73 @@ Remaining before a real two-node vLLM serve:
   header metadata reads),
 - record owner and remote `buff/cache`, swap, memory PSI, and IO PSI on a
   small checkpoint before attempting larger model loads.
+
+### 2026-07-04 RemoteWeightSource 2node smoke
+
+Phase 1 has now been exercised across the DGX Spark QSFP link before trying
+large segment-family checkpoints:
+
+1. Raw TCP connectivity was verified independently of vLLM. A local owner
+   listener on `192.168.100.11` accepted a connection from `dgx-spark1`
+   (`192.168.100.10`) and echoed a payload, proving the chosen interface and
+   port path were reachable.
+2. A Python RemoteWeightSource harness streamed all tensors from
+   `/data/shared/models/hf/vllm-loader-test/tiny-random-qwen3.5-moe` over the
+   owner TCP service. The remote side read `2034` tensors and received
+   `9,805,008` tensor-payload bytes. Owner stats reported
+   `bytes_read=19,665,712`, `bytes_copied=9,805,008`, `direct_reads=2408`,
+   `window_loads=274`, and `window_hits=2016`.
+3. A real remote vLLM model-load smoke then used
+   `/data/shared/models/hf/vllm-loader-test/tiny-random-qwen3-moe` on
+   `dgx-spark1` with `VLLM_UMA_ODIRECT_REMOTE_ROLE=remote` while the owner
+   source ran on local `dgx-spark2`.
+
+The first vLLM attempt with `tiny-random-qwen3.5-moe` failed before weight
+loading in Qwen3-VL processor/tokenizer initialization, so it was not counted
+as a loader result.
+
+Successful vLLM remote-source result:
+
+- remote log selected the remote source:
+  `uma_odirect_safetensors using remote owner source: 192.168.100.11:38221`
+- model path: `Qwen3MoeForCausalLM`
+- plan: `46` entries, `46` required, `46` full reads
+- payload: `0.02 GiB`
+- expected bytes read: `0.02 GiB`
+- actual remote stream receive: `0.02 GiB`
+- expected read amplification: `1.00x`
+- owner direct-read stats: `bytes_read=0.04 GiB`,
+  `bytes_copied=0.02 GiB`, `direct_reads=4873`, `window_loads=9`,
+  `window_hits=14`
+- model load: `2.348608s`
+
+Safety summary:
+
+- remote (`dgx-spark1`) first `buff/cache`: `3.205 GiB`; peak:
+  `3.424 GiB`; delta: `+0.220 GiB`
+- remote min available: `110.272 GiB`; peak used + `buff/cache`:
+  `14.762 GiB`; swap: `0.00 GiB`; memory PSI: `0.00/0.00`
+- owner/local first `buff/cache`: `3.085 GiB`; peak: `3.147 GiB`;
+  delta: `+0.062 GiB`
+- owner/local min available: `108.077 GiB`; peak used + `buff/cache`:
+  `14.700 GiB`; swap: `0.00 GiB`; memory PSI: `0.00/0.00`
+
+Artifacts:
+
+- owner log:
+  `/home/tsukisuwa/LLM/logs/vllm-loader/vllm-remote-odirect-2node-tiny-qwen3-20260704-102555.owner.log`
+- remote vLLM log:
+  `/home/tsukisuwa/LLM/logs/vllm-loader/vllm-remote-odirect-2node-tiny-qwen3-20260704-102555.remote.log`
+- remote runner log:
+  `/home/tsukisuwa/LLM/logs/vllm-loader/vllm-remote-odirect-2node-tiny-qwen3-20260704-102555.remote-runner.log`
+- RAM CSV:
+  `/home/tsukisuwa/LLM/logs/ram/vllm-remote-odirect-2node-tiny-qwen3-20260704-102555.csv`
+- RAM summary:
+  `/home/tsukisuwa/LLM/logs/ram/vllm-remote-odirect-2node-tiny-qwen3-20260704-102555.summary.txt`
+
+This closes the first real 2-node wiring gate: transport, auth, owner
+lifetime, remote source integration, O_DIRECT owner reads, and remote-side
+payload streaming work in a real vLLM model-load path. Remaining Phase 1
+gaps are topology/rank automation, remote `read_segment_group_into_cpu`
+coalescing, and larger segment-family 2-node smokes once the small path stays
+stable.

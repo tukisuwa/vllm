@@ -305,6 +305,41 @@ remote rank does not open the safetensors payload path, and records
 owner/remote `buff/cache`, swap, and PSI before trying a full two-node vLLM
 serve.
 
+## Phase 1 two-node smoke (2026-07-04)
+
+The first real 2-node check used the DGX Spark QSFP link with local
+`dgx-spark2` as owner (`192.168.100.11`) and `dgx-spark1` as remote
+(`192.168.100.10`):
+
+1. Raw TCP reachability was verified without vLLM by accepting a remote
+   connection on the owner address and echoing a payload.
+2. A Python RemoteWeightSource harness streamed every tensor from
+   `tiny-random-qwen3.5-moe` over TCP. The remote side received
+   `9,805,008` tensor-payload bytes for `2034` tensors. Owner O_DIRECT stats
+   reported `bytes_read=19,665,712`, `bytes_copied=9,805,008`,
+   `direct_reads=2408`, `window_loads=274`, and `window_hits=2016`.
+3. A real vLLM model-load smoke then loaded
+   `tiny-random-qwen3-moe` on `dgx-spark1` with
+   `VLLM_UMA_ODIRECT_REMOTE_ROLE=remote` while the owner TCP source served
+   payload bytes from local `dgx-spark2`.
+
+The vLLM smoke selected `Qwen3MoeForCausalLM`, built a 46-entry plan, received
+`0.02 GiB` of remote tensor payload, and reported `1.00x` read amplification.
+Owner direct-read stats reported `bytes_read=0.04 GiB`,
+`bytes_copied=0.02 GiB`, `direct_reads=4873`, `window_loads=9`, and
+`window_hits=14`.
+
+Remote memory behavior stayed consistent with the design goal: `dgx-spark1`
+`buff/cache` rose from `3.205 GiB` to `3.424 GiB` (`+0.220 GiB`), swap stayed
+`0.00 GiB`, and memory PSI stayed `0.00/0.00`. Owner/local `buff/cache` rose
+from `3.085 GiB` to `3.147 GiB` (`+0.062 GiB`) with swap and memory PSI also
+at zero. This is not yet a large-checkpoint proof, but it confirms the
+transport, env wiring, owner lifetime, and remote-source integration in a
+real vLLM model-load path.
+
+The remote env names are now registered in `vllm.envs` so vLLM's unknown-env
+checker does not warn for this fork-specific transport configuration.
+
 ## Open questions
 
 - How does per-rank payload ownership interact with pipeline-parallel layer

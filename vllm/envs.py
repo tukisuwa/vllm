@@ -656,6 +656,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VLLM_PORT will be used as the first port, and the rest will be generated
     # by incrementing the VLLM_PORT value.
     "VLLM_PORT": get_vllm_port,
+    # UMA O_DIRECT remote weight source role. This fork-specific experimental
+    # path lets a remote rank stream tensor payload bytes from an owner rank
+    # instead of opening safetensors payload files over NFS/shared storage.
+    "VLLM_UMA_ODIRECT_REMOTE_ROLE": lambda: os.getenv(
+        "VLLM_UMA_ODIRECT_REMOTE_ROLE", ""
+    ),
+    "VLLM_UMA_ODIRECT_REMOTE_HOST": lambda: os.getenv(
+        "VLLM_UMA_ODIRECT_REMOTE_HOST", ""
+    ),
+    "VLLM_UMA_ODIRECT_REMOTE_PORT": lambda: os.getenv(
+        "VLLM_UMA_ODIRECT_REMOTE_PORT", ""
+    ),
+    "VLLM_UMA_ODIRECT_REMOTE_TOKEN": lambda: os.getenv(
+        "VLLM_UMA_ODIRECT_REMOTE_TOKEN", ""
+    ),
+    "VLLM_UMA_ODIRECT_REMOTE_TIMEOUT_SECONDS": lambda: os.getenv(
+        "VLLM_UMA_ODIRECT_REMOTE_TIMEOUT_SECONDS", ""
+    ),
     # path used for ipc when the frontend api server is running in
     # multi-processing mode to communicate with the backend engine process.
     "VLLM_RPC_BASE_PATH": lambda: os.getenv(
