@@ -620,6 +620,52 @@ def test_execute_weight_plan_uses_remote_read_many_for_full_reads(
     assert server.connections_accepted == 1
 
 
+def test_execute_weight_plan_limits_remote_read_many_item_count(
+    tmp_path,
+    monkeypatch,
+):
+    tensors = {
+        "a.weight": torch.arange(4, dtype=torch.float32),
+        "b.weight": torch.arange(4, 8, dtype=torch.float32),
+        "c.weight": torch.arange(8, 12, dtype=torch.float32),
+    }
+    owner_source = _real_source_many(tmp_path, monkeypatch, tensors)
+    monkeypatch.setattr(L, "_REMOTE_MAX_BATCH_ITEMS", 2)
+
+    with L.RemoteODirectSafetensorsWeightSourceServer(
+        owner_source,
+        auth_token="owner-token",
+    ) as server:
+        host, port = server.address
+        remote = L.RemoteODirectSafetensorsWeightSource(
+            owner_source.catalog,
+            host=host,
+            port=port,
+            auth_token="owner-token",
+        )
+        model = torch.nn.Module()
+        model.a = torch.nn.Parameter(torch.empty(4))
+        model.b = torch.nn.Parameter(torch.empty(4))
+        model.c = torch.nn.Parameter(torch.empty(4))
+        plan = L.WeightPlan(
+            (
+                L.WeightPlanEntry("a.weight", "a"),
+                L.WeightPlanEntry("b.weight", "b"),
+                L.WeightPlanEntry("c.weight", "c"),
+            )
+        )
+
+        loaded = _remote_read_or_skip(lambda: L.execute_weight_plan(model, remote, plan))
+
+    assert loaded == {"a", "b", "c"}
+    stats = remote.stats_snapshot()
+    assert stats["batch_requests"] == 1
+    assert stats["batch_tensors"] == 2
+    assert stats["tensors_read"] == 3
+    assert torch.equal(model.c.detach(), tensors["c.weight"])
+    assert server.connections_accepted == 1
+
+
 def test_uma_odirect_loader_env_wires_owner_and_remote_sources(
     tmp_path,
     monkeypatch,

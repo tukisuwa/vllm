@@ -2301,3 +2301,63 @@ Implementation status (2026-07-04):
   integration test that verifies three full entries are served by one batch.
   The remaining B1 gate is the Qwen35B 2-node smoke against the persistent
   connection baseline.
+
+### 2026-07-04 RemoteWeightSource B1 batch Qwen35B smoke
+
+The first B1 smoke attempt exposed a real item-count bug before any payload was
+read: Qwen35B begins with many small tensors, so the executor's payload-only
+batching formed a `61,760` item request.  The remote source rejected it against
+the `16,384` item cap before contacting the owner.  The executor now mirrors
+the source item cap while building batches, and the regression is covered by a
+loopback test that temporarily lowers the cap and verifies split batches.
+
+The corrected B1 run used the same Qwen35B checkpoint and 2-node remote-source
+configuration as the persistent-connection baseline:
+
+- owner/local: `dgx-spark2` (`192.168.100.11`)
+- remote: `dgx-spark1`
+- tensor payload: `21.73 GiB`
+- entries: `124,306` full reads
+- remote batch requests: `324`
+- remote batched tensors: `124,304` (the final two singleton reads used the
+  existing per-entry path)
+- owner accepted connections: `1`
+- owner actual direct read: `22.23 GiB` (`direct_reads=407`,
+  `window_loads=163`, `window_hits=124304`)
+- owner timings: `read=5.80s`, `gate=7.71s`, `alloc=0.21s`
+- model load: `87.377654s`
+- persistent baseline: `143.982355s`
+- improvement over persistent: `56.60s` (`39.3%`)
+- improvement over initial per-connection remote path: `113.87s` (`56.6%`)
+
+Safety summary:
+
+- remote first `buff/cache`: `4.412 GiB`; peak: `4.609 GiB`; delta:
+  `+0.197 GiB`
+- remote min available: `83.60 GiB`; peak used + `buff/cache`: `42.48 GiB`
+- owner/local first `buff/cache`: `4.141 GiB`; peak: `4.291 GiB`; delta:
+  `+0.151 GiB`
+- owner/local min available: `104.50 GiB`; peak used + `buff/cache`:
+  `19.27 GiB`
+- swap and memory PSI stayed zero on both nodes
+
+Artifacts:
+
+- owner log:
+  `/home/tsukisuwa/LLM/logs/vllm-loader/qwen35b-remote-odirect-batch-20260704-205117.owner.log`
+- remote vLLM log:
+  `/home/tsukisuwa/LLM/logs/vllm-loader/qwen35b-remote-odirect-batch-20260704-205117.remote.log`
+- remote runner log:
+  `/home/tsukisuwa/LLM/logs/vllm-loader/qwen35b-remote-odirect-batch-20260704-205117.remote-runner.log`
+- RAM CSV:
+  `/home/tsukisuwa/LLM/logs/ram/qwen35b-remote-odirect-batch-20260704-205117.csv`
+- RAM summary:
+  `/home/tsukisuwa/LLM/logs/ram/qwen35b-remote-odirect-batch-20260704-205117.summary.txt`
+
+B1 removes most of the remaining per-entry RPC overhead while preserving the
+remote page-cache invariant.  The remaining schedule mismatch is unchanged:
+the remote side still predicts `22.86 GiB` because it does not know the owner
+source's `128 MiB` window capability, while owner actual remains `22.23 GiB`.
+Stage B3 should address that accounting gap.  Stage B2 remains useful for
+segment-family remote runs, but Qwen35B's full-read path no longer makes it
+urgent for throughput.

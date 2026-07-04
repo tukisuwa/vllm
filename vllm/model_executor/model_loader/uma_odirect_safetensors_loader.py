@@ -800,6 +800,11 @@ def execute_weight_plan(
         batch_payload_cap = int(read_many_max_payload_bytes())
     else:
         batch_payload_cap = 0
+    read_many_max_items = getattr(source, "read_many_max_items", None)
+    if callable(read_many_cpu) and callable(read_many_max_items):
+        batch_item_cap = int(read_many_max_items())
+    else:
+        batch_item_cap = _REMOTE_MAX_BATCH_ITEMS
 
     def batchable_entry_payload(prepared) -> int | None:
         entry, _param, _weight_loader, record = prepared
@@ -866,6 +871,8 @@ def execute_weight_plan(
                 total_payload = first_payload
                 next_index = index + 1
                 while next_index < len(scheduled_entries):
+                    if len(group) >= batch_item_cap:
+                        break
                     next_entry = scheduled_entries[next_index]
                     if (
                         not next_entry.required
@@ -1910,6 +1917,9 @@ class RemoteODirectSafetensorsWeightSource:
 
     def read_many_max_payload_bytes(self) -> int:
         return self._max_batch_payload_bytes
+
+    def read_many_max_items(self) -> int:
+        return _REMOTE_MAX_BATCH_ITEMS
 
     def read_many_cpu(
         self,
