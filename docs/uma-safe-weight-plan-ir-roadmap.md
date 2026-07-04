@@ -1973,3 +1973,52 @@ safetensors headers and payload bytes, not only the small O_DIRECT fixtures.
 It does not validate Llama4 fused experts or a real Hunyuan fused-QKV
 checkpoint; those remain lower-priority segment-family smokes when suitable
 checkpoints are available.
+
+### 2026-07-04 RemoteWeightSource Phase 1 loopback implementation
+
+The first 2-node transport implementation step is in place as a loopback
+unit-testable protocol, not yet a real distributed vLLM launch integration:
+
+- `RemoteODirectSafetensorsWeightSourceServer` wraps a local
+  `ODirectSafetensorsWeightSource` owner and serves TCP requests.
+- `RemoteODirectSafetensorsWeightSource` implements the executor-facing
+  `WeightSource` methods from metadata plus TCP responses, without opening
+  safetensors payload files itself.
+- Phase 1 intentionally omits `read_segment_group_into_cpu` on the remote
+  source. The executor therefore uses the existing per-entry
+  `read_segments_into_cpu` fallback, keeping the first transport cut smaller
+  and preserving correctness before reintroducing coalescing on the remote
+  path.
+- The request set is WeightSource-shaped (`read_full`, `read_slice`,
+  `read_segments`, `skip`, `stats_snapshot`, `close_files`) rather than an
+  arbitrary byte-range RPC. Owner-side validation stays in the existing local
+  source/catalog path.
+- Owner source calls are serialized with a lock even though the TCP server
+  uses per-connection handler threads; the wrapped local source has mutable
+  single-window O_DIRECT state and is not thread-safe.
+- The wire protocol uses a length-prefixed JSON header plus optional raw
+  tensor payload, with fixed header limits and catalog/expected-shape derived
+  response payload limits. Request frames carry no payload. Auth uses
+  constant-time token comparison.
+- The loopback test creates a real safetensors file, exercises the owner
+  through `_ODirectFile`, validates full/sliced/segmented reads over TCP,
+  checks stream accounting, verifies auth failures are rejected, rejects
+  oversized frames before allocation, and confirms concurrent handler threads
+  do not enter the shared owner source concurrently.
+
+Targeted validation:
+
+```text
+PYTHONPATH=$PWD .venv-host/bin/python -m pytest \
+  tests/model_executor/model_loader/test_uma_odirect_source.py -q
+  -> 12 passed
+
+PYTHONPATH=$PWD .venv-host/bin/python -m pytest \
+  tests/model_executor/model_loader/test_registry.py \
+  -k 'uma_odirect_safetensors_registered or uma_odirect_safetensors_rejects_invalid_extra_config or telechat2 or hunyuan' -q
+  -> 20 passed, 233 deselected
+```
+
+The next step is a small two-process harness on one host, then a real
+two-node smoke where the remote rank is verified not to open the NFS-visible
+payload path and receives tensor bytes only from the owner transport.

@@ -2,10 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import ctypes
+import hmac
 import inspect
+import json
 import math
 import os
+import socket
+import socketserver
 import sys
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Generator
@@ -23,6 +28,7 @@ from vllm.model_executor.model_loader._uma_memory_gate import (
 )
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.weight_plan import (
+    _DTYPE_MAP,
     _DTYPE_NBYTES,
     ExecutorCapability,
     TensorCatalog,
@@ -56,9 +62,13 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 logger = init_logger(__name__)
 
+_REMOTE_MAX_HEADER_BYTES = 4 * 1024 * 1024
+
 
 __all__ = [
     "ODirectSafetensorsWeightSource",
+    "RemoteODirectSafetensorsWeightSource",
+    "RemoteODirectSafetensorsWeightSourceServer",
     "ExecutorCapability",
     "TensorCatalog",
     "TensorMeta",
@@ -176,6 +186,243 @@ def _source_tensor_shape(
         if strided is None:
             raise exc
         return strided[4]
+
+
+def _encode_slice_selection(
+    selection: tuple[slice | int, ...] | None,
+) -> tuple[dict[str, int | None | str], ...] | None:
+    if selection is None:
+        return None
+    encoded = []
+    for item in selection:
+        if isinstance(item, bool):
+            raise RuntimeError(f"Boolean indices are not supported: {selection!r}")
+        if isinstance(item, int):
+            encoded.append({"kind": "int", "value": item})
+        elif isinstance(item, slice):
+            encoded.append(
+                {
+                    "kind": "slice",
+                    "start": item.start,
+                    "stop": item.stop,
+                    "step": item.step,
+                }
+            )
+        else:
+            raise RuntimeError(f"Unsupported slice item {item!r}")
+    return tuple(encoded)
+
+
+def _decode_slice_selection(
+    encoded: list[dict[str, int | None | str]]
+    | tuple[dict[str, int | None | str], ...]
+    | None,
+) -> tuple[slice | int, ...] | None:
+    if encoded is None:
+        return None
+    decoded: list[slice | int] = []
+    for item in encoded:
+        kind = item.get("kind")
+        if kind == "int":
+            value = item.get("value")
+            if not isinstance(value, int):
+                raise RuntimeError(f"Invalid encoded integer slice item: {item!r}")
+            decoded.append(value)
+        elif kind == "slice":
+            decoded.append(slice(item.get("start"), item.get("stop"), item.get("step")))
+        else:
+            raise RuntimeError(f"Invalid encoded slice item: {item!r}")
+    return tuple(decoded)
+
+
+def _encode_segments(
+    segments: tuple[WeightPlanReadSegment, ...],
+) -> tuple[dict[str, object], ...]:
+    return tuple(
+        {
+            "source_slices": _encode_slice_selection(segment.source_slices),
+            "target_slices": _encode_slice_selection(segment.target_slices),
+        }
+        for segment in segments
+    )
+
+
+def _decode_segments(
+    encoded: list[dict[str, object]] | tuple[dict[str, object], ...],
+) -> tuple[WeightPlanReadSegment, ...]:
+    segments: list[WeightPlanReadSegment] = []
+    for item in encoded:
+        if not isinstance(item, dict):
+            raise RuntimeError(f"Invalid encoded read segment: {item!r}")
+        source_slices = _decode_slice_selection(  # type: ignore[arg-type]
+            item.get("source_slices")
+        )
+        target_slices = _decode_slice_selection(  # type: ignore[arg-type]
+            item.get("target_slices")
+        )
+        if source_slices is None or target_slices is None:
+            raise RuntimeError(f"Invalid encoded read segment: {item!r}")
+        segments.append(
+            WeightPlanReadSegment(
+                source_slices=source_slices,
+                target_slices=target_slices,
+            )
+        )
+    return tuple(segments)
+
+
+_WIRE_DTYPE_BY_TORCH: dict[torch.dtype, str] = {
+    dtype: name for name, dtype in _DTYPE_MAP.items()
+}
+
+
+def _dtype_to_wire(dtype: torch.dtype) -> str:
+    try:
+        return _WIRE_DTYPE_BY_TORCH[dtype]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"Unsupported tensor dtype for remote transfer: {dtype}"
+        ) from exc
+
+
+def _dtype_from_wire(name: str) -> torch.dtype:
+    try:
+        return _DTYPE_MAP[name]
+    except KeyError as exc:
+        raise RuntimeError(f"Unsupported remote tensor dtype {name!r}") from exc
+
+
+def _tensor_to_wire(tensor: torch.Tensor) -> dict[str, object]:
+    if tensor.device.type != "cpu":
+        raise RuntimeError(
+            f"Remote weight transfer requires CPU tensor, got {tensor.device}"
+        )
+    contiguous = tensor.contiguous()
+    return {
+        "dtype": _dtype_to_wire(contiguous.dtype),
+        "shape": tuple(int(dim) for dim in contiguous.shape),
+        "payload": contiguous.view(torch.uint8).numpy().tobytes(),
+    }
+
+
+def _tensor_from_wire(encoded: dict[str, object]) -> torch.Tensor:
+    dtype_name = encoded.get("dtype")
+    shape = encoded.get("shape")
+    payload = encoded.get("payload")
+    if not isinstance(dtype_name, str):
+        raise RuntimeError(f"Invalid remote tensor dtype: {encoded!r}")
+    if not isinstance(shape, (list, tuple)) or not all(
+        isinstance(dim, int) for dim in shape
+    ):
+        raise RuntimeError(f"Invalid remote tensor shape: {encoded!r}")
+    shape = tuple(shape)
+    if not isinstance(payload, bytes):
+        raise RuntimeError("Invalid remote tensor payload")
+    dtype = _dtype_from_wire(dtype_name)
+    expected = math.prod(shape) * _DTYPE_NBYTES[dtype]
+    if len(payload) != expected:
+        raise RuntimeError(
+            "Remote tensor payload size mismatch: "
+            f"got={len(payload)}, expected={expected}, shape={shape}, dtype={dtype}"
+        )
+    tensor = torch.empty(shape, dtype=dtype, device="cpu")
+    if payload:
+        source = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+        tensor.view(torch.uint8).reshape(-1).copy_(source)
+    return tensor
+
+
+def _split_tensor_payload(message: object) -> tuple[object, bytes]:
+    if not isinstance(message, dict):
+        return message, b""
+    tensor = message.get("tensor")
+    if not isinstance(tensor, dict):
+        return message, b""
+    payload = tensor.get("payload")
+    if not isinstance(payload, bytes):
+        return message, b""
+    header = dict(message)
+    tensor_header = dict(tensor)
+    tensor_header.pop("payload")
+    tensor_header["payload_size"] = len(payload)
+    header["tensor"] = tensor_header
+    return header, payload
+
+
+def _merge_tensor_payload(message: object, payload: bytes) -> object:
+    if not isinstance(message, dict) or not payload:
+        return message
+    tensor = message.get("tensor")
+    if not isinstance(tensor, dict):
+        raise RuntimeError("Remote weight source frame carried unexpected payload")
+    expected = tensor.get("payload_size")
+    if not isinstance(expected, int) or expected != len(payload):
+        raise RuntimeError(
+            "Remote weight source tensor payload size mismatch: "
+            f"header={expected!r}, actual={len(payload)}"
+        )
+    tensor = dict(tensor)
+    tensor.pop("payload_size", None)
+    tensor["payload"] = payload
+    message = dict(message)
+    message["tensor"] = tensor
+    return message
+
+
+def _send_frame(sock: socket.socket, message: object) -> None:
+    header, payload = _split_tensor_payload(message)
+    header_bytes = json.dumps(
+        header,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    sock.sendall(
+        len(header_bytes).to_bytes(8, "big")
+        + header_bytes
+        + len(payload).to_bytes(8, "big")
+        + payload
+    )
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = sock.recv(size - len(chunks))
+        if not chunk:
+            raise RuntimeError("Remote weight source connection closed mid-frame")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def _recv_frame(
+    sock: socket.socket,
+    *,
+    max_header_bytes: int = _REMOTE_MAX_HEADER_BYTES,
+    max_payload_bytes: int = 0,
+) -> object:
+    raw_size = _recv_exact(sock, 8)
+    size = int.from_bytes(raw_size, "big")
+    if size <= 0:
+        raise RuntimeError(f"Invalid remote weight source frame size: {size}")
+    if size > max_header_bytes:
+        raise RuntimeError(
+            "Remote weight source frame header is too large: "
+            f"{size} bytes > {max_header_bytes} bytes"
+        )
+    header = json.loads(_recv_exact(sock, size))
+    raw_payload_size = _recv_exact(sock, 8)
+    payload_size = int.from_bytes(raw_payload_size, "big")
+    if payload_size < 0:
+        raise RuntimeError(
+            f"Invalid remote weight source payload size: {payload_size}"
+        )
+    if payload_size > max_payload_bytes:
+        raise RuntimeError(
+            "Remote weight source frame payload is too large: "
+            f"{payload_size} bytes > {max_payload_bytes} bytes"
+        )
+    payload = _recv_exact(sock, payload_size) if payload_size else b""
+    return _merge_tensor_payload(header, payload)
 
 
 def _call_weight_loader(
@@ -1178,6 +1425,427 @@ class ODirectSafetensorsWeightSource:
     def _note_loaded_bytes(self, nbytes: int) -> None:
         self._bytes_since_gate += nbytes
         self._maybe_gate(f"after {self._bytes_since_gate} loaded bytes")
+
+
+@dataclass
+class _RemoteReadStats:
+    tensors_read: int = 0
+    tensors_read_full: int = 0
+    tensors_read_sliced: int = 0
+    tensors_skipped: int = 0
+    bytes_stream_recv: int = 0
+    bytes_tensor_payload: int = 0
+    bytes_full_tensor_payload: int = 0
+    bytes_sliced_tensor_payload: int = 0
+    bytes_skipped_payload: int = 0
+    time_alloc: float = 0.0
+    time_read: float = 0.0
+
+    def snapshot(self) -> dict[str, int | float]:
+        return {
+            "tensors_read": self.tensors_read,
+            "tensors_read_full": self.tensors_read_full,
+            "tensors_read_sliced": self.tensors_read_sliced,
+            "tensors_skipped": self.tensors_skipped,
+            "bytes_stream_recv": self.bytes_stream_recv,
+            "remote_stream_bytes_recv": self.bytes_stream_recv,
+            "bytes_tensor_payload": self.bytes_tensor_payload,
+            "bytes_full_tensor_payload": self.bytes_full_tensor_payload,
+            "bytes_sliced_tensor_payload": self.bytes_sliced_tensor_payload,
+            "bytes_skipped_payload": self.bytes_skipped_payload,
+            "time_alloc": self.time_alloc,
+            "time_read": self.time_read,
+        }
+
+
+class RemoteODirectSafetensorsWeightSourceServer:
+    """Dedicated TCP owner for Phase-1 remote UMA O_DIRECT reads.
+
+    The server wraps an already constructed ``ODirectSafetensorsWeightSource``.
+    It is intentionally narrow: requests name a WeightSource operation, the
+    owner validates through the local source/catalog path, reads with O_DIRECT,
+    and returns a CPU tensor payload.  It never serves arbitrary byte ranges.
+    """
+
+    def __init__(
+        self,
+        source: ODirectSafetensorsWeightSource,
+        *,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        auth_token: str,
+        request_timeout: float = 30.0,
+    ) -> None:
+        if not auth_token:
+            raise ValueError("Remote O_DIRECT weight source requires an auth token")
+        self.source = source
+        self.auth_token = auth_token
+        self.request_timeout = request_timeout
+        self._source_lock = threading.Lock()
+        outer = self
+
+        class _Handler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                self.request.settimeout(outer.request_timeout)
+                try:
+                    request = _recv_frame(self.request, max_payload_bytes=0)
+                    # ODirectSafetensorsWeightSource keeps one mutable O_DIRECT
+                    # file/window cache and shared counters.  Phase 1 is a
+                    # correctness-first sync RPC path, so serialize all owner
+                    # source access instead of letting handler threads race.
+                    with outer._source_lock:
+                        response = outer._handle_request(request)
+                except Exception as exc:  # noqa: BLE001 - propagate as RPC error.
+                    response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                _send_frame(self.request, response)
+
+        class _Server(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        self._server = _Server((host, port), _Handler)
+        self._thread: threading.Thread | None = None
+
+    @property
+    def address(self) -> tuple[str, int]:
+        host, port = self._server.server_address
+        return str(host), int(port)
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._server.serve_forever,
+            name="remote-odirect-weight-source",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
+
+    def __enter__(self) -> "RemoteODirectSafetensorsWeightSourceServer":
+        self.start()
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        self.close()
+
+    def _check_request(self, request: object) -> dict[str, object]:
+        if not isinstance(request, dict):
+            raise RuntimeError("Remote O_DIRECT request must be a dict")
+        auth_token = request.get("auth_token")
+        if not isinstance(auth_token, str) or not hmac.compare_digest(
+            auth_token,
+            self.auth_token,
+        ):
+            raise RuntimeError("Remote O_DIRECT request failed authentication")
+        op = request.get("op")
+        if not isinstance(op, str) or not op:
+            raise RuntimeError("Remote O_DIRECT request is missing op")
+        return request
+
+    def _handle_request(self, request_obj: object) -> dict[str, object]:
+        request = self._check_request(request_obj)
+        op = request["op"]
+        if op == "read_full":
+            name = self._request_name(request)
+            return {"ok": True, "tensor": _tensor_to_wire(self.source.read_full_cpu(name))}
+        if op == "read_slice":
+            name = self._request_name(request)
+            slices = _decode_slice_selection(  # type: ignore[arg-type]
+                request.get("source_slices")
+            )
+            if slices is None:
+                raise RuntimeError("read_slice request missing source_slices")
+            return {
+                "ok": True,
+                "tensor": _tensor_to_wire(self.source.read_slice_cpu(name, slices)),
+            }
+        if op == "read_segments":
+            name = self._request_name(request)
+            shape = request.get("staging_shape")
+            if (
+                not isinstance(shape, (list, tuple))
+                or not all(isinstance(dim, int) and dim >= 0 for dim in shape)
+            ):
+                raise RuntimeError(f"Invalid read_segments staging_shape: {shape!r}")
+            segments = _decode_segments(request.get("segments"))  # type: ignore[arg-type]
+            record = self.source.catalog.get(name)
+            entry = WeightPlanEntry(
+                checkpoint_name=name,
+                target_name=name,
+                read_segments=segments,
+                staging_shape=tuple(shape),
+                read_into_cpu=True,
+            )
+            validate_weight_plan_read_segments(record, entry)
+            tensor = self.source.empty_cpu_shape(name, tuple(shape))
+            self.source.read_segments_into_cpu(name, tensor, segments)
+            return {"ok": True, "tensor": _tensor_to_wire(tensor)}
+        if op == "skip":
+            name = self._request_name(request)
+            reason = request.get("reason")
+            if not isinstance(reason, str):
+                raise RuntimeError("skip request missing reason")
+            self.source.skip(name, reason)
+            return {"ok": True}
+        if op == "stats_snapshot":
+            return {"ok": True, "stats": self.source.stats_snapshot()}
+        if op == "close_files":
+            self.source.close_files()
+            return {"ok": True}
+        raise RuntimeError(f"Unknown remote O_DIRECT request op: {op!r}")
+
+    @staticmethod
+    def _request_name(request: dict[str, object]) -> str:
+        name = request.get("name")
+        if not isinstance(name, str) or not name:
+            raise RuntimeError("Remote O_DIRECT request is missing tensor name")
+        return name
+
+
+class RemoteODirectSafetensorsWeightSource:
+    """Remote rank WeightSource for Phase-1 TCP streaming.
+
+    The remote source owns only metadata and a TCP endpoint.  It never opens a
+    safetensors payload file; all payload materialization comes from the owner
+    server.  ``read_segment_group_into_cpu`` is deliberately omitted in Phase 1
+    so the executor falls back to per-entry ``read_segments_into_cpu``.
+    """
+
+    def __init__(
+        self,
+        catalog: TensorCatalog,
+        *,
+        host: str,
+        port: int,
+        auth_token: str,
+        request_timeout: float = 30.0,
+    ) -> None:
+        if not auth_token:
+            raise ValueError("Remote O_DIRECT weight source requires an auth token")
+        self.catalog = catalog
+        records = catalog.records()
+        self._max_payload_bytes = max((record.size for record in records), default=0)
+        self._host = host
+        self._port = port
+        self._auth_token = auth_token
+        self._request_timeout = request_timeout
+        self._stats = _RemoteReadStats()
+        self._expected_read_summary: ReadScheduleSummary | None = None
+
+    def read_full_cpu(self, name: str) -> torch.Tensor:
+        record = self.catalog.get(name)
+        t0 = time.perf_counter()
+        tensor = self._request_tensor(
+            {"op": "read_full", "name": name},
+            max_payload_bytes=record.size,
+        )
+        self._stats.time_read += time.perf_counter() - t0
+        self._record_tensor_read(record.size, sliced=False)
+        return tensor
+
+    def read_slice_cpu(
+        self,
+        name: str,
+        source_slices: tuple[slice | int, ...],
+    ) -> torch.Tensor:
+        record = self.catalog.get(name)
+        expected_shape = _source_tensor_shape(record, source_slices)
+        expected_payload = math.prod(expected_shape) * _DTYPE_NBYTES[record.dtype]
+        t0 = time.perf_counter()
+        tensor = self._request_tensor(
+            {
+                "op": "read_slice",
+                "name": name,
+                "source_slices": _encode_slice_selection(source_slices),
+            },
+            max_payload_bytes=expected_payload,
+        )
+        self._stats.time_read += time.perf_counter() - t0
+        if list(tensor.shape) != expected_shape:
+            raise RuntimeError(
+                f"Remote read_slice_cpu shape mismatch for {name}: "
+                f"got={list(tensor.shape)}, expected={expected_shape}"
+            )
+        self._record_tensor_read(tensor.numel() * tensor.element_size(), sliced=True)
+        return tensor
+
+    def read_into_cpu(
+        self,
+        name: str,
+        dst: torch.Tensor,
+        *,
+        source_slices: tuple[slice | int, ...] | None = None,
+        target_slices: tuple[slice | int, ...] | None = None,
+        force_gate: bool = True,
+    ) -> None:
+        del force_gate
+        record = self.catalog.get(name)
+        if dst.device.type != "cpu":
+            raise RuntimeError(
+                f"read_into_cpu requires a CPU destination for {name}, got {dst.device}"
+            )
+        if dst.dtype != record.dtype:
+            raise RuntimeError(
+                f"read_into_cpu dtype mismatch for {name}: "
+                f"dst={dst.dtype}, source={record.dtype}"
+            )
+        if not dst.is_contiguous():
+            raise RuntimeError(f"read_into_cpu requires a contiguous dst for {name}")
+        target = _select_contiguous_target_view(dst, target_slices, name)
+        tensor = (
+            self.read_full_cpu(name)
+            if source_slices is None
+            else self.read_slice_cpu(name, source_slices)
+        )
+        if tuple(target.shape) != tuple(tensor.shape):
+            raise RuntimeError(
+                f"Remote read_into_cpu shape mismatch for {name}: "
+                f"target={list(target.shape)}, tensor={list(tensor.shape)}"
+            )
+        target.copy_(tensor)
+
+    def read_segments_into_cpu(
+        self,
+        name: str,
+        dst: torch.Tensor,
+        segments: tuple[WeightPlanReadSegment, ...],
+    ) -> None:
+        record = self.catalog.get(name)
+        if dst.device.type != "cpu":
+            raise RuntimeError(
+                f"read_segments_into_cpu requires CPU destination for {name}, "
+                f"got {dst.device}"
+            )
+        if dst.dtype != record.dtype:
+            raise RuntimeError(
+                f"read_segments_into_cpu dtype mismatch for {name}: "
+                f"dst={dst.dtype}, source={record.dtype}"
+            )
+        if not dst.is_contiguous():
+            raise RuntimeError(
+                f"read_segments_into_cpu requires contiguous dst for {name}"
+            )
+        t0 = time.perf_counter()
+        expected_payload = dst.numel() * dst.element_size()
+        tensor = self._request_tensor(
+            {
+                "op": "read_segments",
+                "name": name,
+                "staging_shape": tuple(int(dim) for dim in dst.shape),
+                "segments": _encode_segments(segments),
+            },
+            max_payload_bytes=expected_payload,
+        )
+        self._stats.time_read += time.perf_counter() - t0
+        if tuple(tensor.shape) != tuple(dst.shape):
+            raise RuntimeError(
+                f"Remote read_segments_into_cpu shape mismatch for {name}: "
+                f"got={list(tensor.shape)}, expected={list(dst.shape)}"
+            )
+        dst.copy_(tensor)
+        self._record_tensor_read(dst.numel() * dst.element_size(), sliced=True)
+
+    def empty_cpu(
+        self,
+        name: str,
+        *,
+        source_slices: tuple[slice | int, ...] | None = None,
+    ) -> torch.Tensor:
+        record = self.catalog.get(name)
+        shape = _source_tensor_shape(record, source_slices)
+        return self.empty_cpu_shape(name, tuple(shape))
+
+    def empty_cpu_shape(self, name: str, shape: tuple[int, ...]) -> torch.Tensor:
+        record = self.catalog.get(name)
+        if not all(isinstance(dim, int) and dim >= 0 for dim in shape):
+            raise RuntimeError(f"Invalid CPU staging shape for {name}: {shape!r}")
+        t0 = time.perf_counter()
+        tensor = torch.empty(shape, dtype=record.dtype, device="cpu")
+        self._stats.time_alloc += time.perf_counter() - t0
+        return tensor
+
+    def skip(self, name: str, reason: str) -> None:
+        self._stats.tensors_skipped += 1
+        record = self.catalog.get(name) if self.catalog.has(name) else None
+        if record is not None:
+            self._stats.bytes_skipped_payload += record.size
+        self._request({"op": "skip", "name": name, "reason": reason})
+
+    def close_files(self) -> None:
+        self._request({"op": "close_files"})
+
+    def owner_stats_snapshot(self) -> dict[str, int | float]:
+        response = self._request({"op": "stats_snapshot"})
+        stats = response.get("stats")
+        if not isinstance(stats, dict):
+            raise RuntimeError("Remote O_DIRECT owner returned invalid stats")
+        return stats  # type: ignore[return-value]
+
+    def set_expected_read_summary(self, summary: ReadScheduleSummary) -> None:
+        self._expected_read_summary = summary
+
+    def stats_snapshot(self) -> dict[str, int | float]:
+        return self._stats.snapshot()
+
+    def _record_tensor_read(self, payload_bytes: int, *, sliced: bool) -> None:
+        self._stats.tensors_read += 1
+        self._stats.bytes_tensor_payload += payload_bytes
+        self._stats.bytes_stream_recv += payload_bytes
+        if sliced:
+            self._stats.tensors_read_sliced += 1
+            self._stats.bytes_sliced_tensor_payload += payload_bytes
+        else:
+            self._stats.tensors_read_full += 1
+            self._stats.bytes_full_tensor_payload += payload_bytes
+
+    def _request_tensor(
+        self,
+        request: dict[str, object],
+        *,
+        max_payload_bytes: int,
+    ) -> torch.Tensor:
+        if max_payload_bytes < 0 or max_payload_bytes > self._max_payload_bytes:
+            raise RuntimeError(
+                "Invalid remote tensor response limit: "
+                f"{max_payload_bytes} > catalog max {self._max_payload_bytes}"
+            )
+        response = self._request(request, max_payload_bytes=max_payload_bytes)
+        encoded = response.get("tensor")
+        if not isinstance(encoded, dict):
+            raise RuntimeError("Remote O_DIRECT owner returned no tensor")
+        return _tensor_from_wire(encoded)
+
+    def _request(
+        self,
+        request: dict[str, object],
+        *,
+        max_payload_bytes: int = 0,
+    ) -> dict[str, object]:
+        request = dict(request)
+        request["auth_token"] = self._auth_token
+        with socket.create_connection(
+            (self._host, self._port),
+            timeout=self._request_timeout,
+        ) as sock:
+            sock.settimeout(self._request_timeout)
+            _send_frame(sock, request)
+            response = _recv_frame(sock, max_payload_bytes=max_payload_bytes)
+        if not isinstance(response, dict):
+            raise RuntimeError("Remote O_DIRECT owner returned invalid response")
+        if not response.get("ok"):
+            error = response.get("error")
+            raise RuntimeError(
+                "Remote O_DIRECT owner rejected request"
+                + (f": {error}" if isinstance(error, str) else "")
+            )
+        return response
 
 
 class _ConsumerProfile:

@@ -1,9 +1,9 @@
 # 2node UMA O_DIRECT tensor streaming: RemoteWeightSource design
 
-Status: design draft, no implementation yet. See the "2node UMA O_DIRECT
-tensor streaming design" entry in `docs/uma-safe-weight-plan-ir-roadmap.md`
-(2026-07-04) for the problem statement and high-level shape this document
-expands on.
+Status: Phase 1 loopback implementation exists for the transport protocol and
+`WeightSource` surface. See the "2node UMA O_DIRECT tensor streaming design"
+entry in `docs/uma-safe-weight-plan-ir-roadmap.md` (2026-07-04) for the
+problem statement and high-level shape this document expands on.
 
 ## Problem recap
 
@@ -238,9 +238,51 @@ Extending `_SourceReadStats`/`stats_snapshot()` for the 2-rank case:
    local one.
 4. **Real 2-node checkpoint smoke**, following the same "small fixture first,
    then real checkpoint" progression this loader has used throughout: a
-   loopback-transport unit test (owner and remote in the same process/host)
-   before an actual 2-node DGX Spark run, mirroring how the segment fixtures
-   validated boundary math before the Hunyuan real-checkpoint smoke.
+  loopback-transport unit test (owner and remote in the same process/host)
+  before an actual 2-node DGX Spark run, mirroring how the segment fixtures
+  validated boundary math before the Hunyuan real-checkpoint smoke.
+
+## Phase 1 implementation note (2026-07-04)
+
+The first implementation cut adds:
+
+- `RemoteODirectSafetensorsWeightSourceServer`: a dedicated TCP owner process
+  wrapper around an existing `ODirectSafetensorsWeightSource`. Requests are
+  WeightSource-shaped operations (`read_full`, `read_slice`, `read_segments`,
+  `skip`, `stats_snapshot`, `close_files`) rather than arbitrary byte ranges,
+  so owner-side catalog/source validation remains in the existing local path.
+- Handler threads serialize all calls into the wrapped
+  `ODirectSafetensorsWeightSource` with a lock. The local source owns a single
+  mutable O_DIRECT file/window cache and shared counters, so Phase 1 treats
+  the owner as a correctness-first synchronous service rather than allowing
+  concurrent reads to race that state.
+- The wire frame is a length-prefixed JSON header plus an optional raw tensor
+  payload. The server parses authentication and operation fields from JSON
+  before touching payload bytes; it does not deserialize pickle or another
+  executable object format from the peer. Request frames allow no payload;
+  response payload size is bounded by the remote rank's catalog-derived
+  expected tensor size, and headers have a fixed small upper bound.
+- Auth tokens are compared with constant-time comparison before any owner read
+  is attempted.
+- `RemoteODirectSafetensorsWeightSource`: a remote-rank source with a local
+  `TensorCatalog` and no payload file handles. It implements
+  `read_full_cpu`, `read_slice_cpu`, `read_into_cpu`,
+  `read_segments_into_cpu`, `empty_cpu`, `empty_cpu_shape`, `skip`,
+  `set_expected_read_summary`, and `stats_snapshot`.
+- No remote `read_segment_group_into_cpu` yet by design. The executor's
+  optional-method probe therefore falls back to per-entry segment requests,
+  matching Migration step 1.
+- A loopback unit test using a real safetensors file and the actual
+  `_ODirectFile` path on the owner side. The test validates full, sliced, and
+  segmented reads; confirms the optional group method is absent; checks remote
+  stream accounting; verifies auth failure is rejected before payload serving;
+  rejects oversized frame headers/payloads before allocation; and confirms
+  concurrent TCP handler threads serialize access to the shared owner source.
+
+This implementation is intentionally not wired into distributed vLLM launch
+yet. The next step is a small 2-process harness that starts the owner server
+on the local-disk node and instantiates the remote source on the peer without
+letting the peer open the safetensors payload path.
 
 ## Open questions
 
