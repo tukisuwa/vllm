@@ -641,9 +641,10 @@ The manifest is intentionally rank-indexed and concrete:
 - an explicit env still wins for manual debugging, so the current
   `ROLE/HOST/PORT/OFFSET/TOKEN` path remains the low-level escape hatch.
 
-For the first implementation, rank discovery can read `RANK`, `LOCAL_RANK`, or
-an explicit `VLLM_UMA_ODIRECT_REMOTE_RANK` env, in that order, and fail closed
-if the manifest lacks an entry.  This is enough to remove shell-level
+For the first implementation, rank discovery should read the explicit
+`VLLM_UMA_ODIRECT_REMOTE_RANK` env first, then fall back to `RANK`, then
+`LOCAL_RANK`, and fail closed if the manifest lacks an entry.  This is enough
+to remove shell-level
 copy/paste mistakes without coupling the loader to a specific vLLM
 distributed backend.  True TP/PP ownership-by-layer remains out of scope until
 the manifest has proven useful for the simple single-owner case.
