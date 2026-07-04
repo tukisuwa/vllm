@@ -2576,3 +2576,39 @@ It is intentionally not automatic owner election: the launch layer still owns
 which ranks are owners/remotes and must pass matching offsets on both sides.
 The remaining topology work is a small topology file or launcher wrapper that
 sets role, host, base port, offset, and token consistently for all ranks.
+
+### 2026-07-05 RemoteWeightSource topology manifest design
+
+Topology configuration should move from ad hoc per-process env wiring to an
+explicit, small JSON manifest, while keeping the existing env variables as the
+manual override path.  The proposed manifest is rank-indexed and concrete:
+
+```json
+{
+  "version": 1,
+  "base_port": 32190,
+  "owners": {
+    "0": {"host": "192.168.100.11", "port_offset": 0}
+  },
+  "ranks": {
+    "0": {"role": "owner", "owner": "0"},
+    "1": {"role": "remote", "owner": "0"}
+  }
+}
+```
+
+Design constraints:
+
+- no automatic owner election in the loader;
+- every remote rank names exactly one owner endpoint;
+- every owner endpoint resolves through the same `base_port + port_offset`
+  validation added for `VLLM_UMA_ODIRECT_REMOTE_PORT_OFFSET`;
+- manual `ROLE/HOST/PORT/OFFSET/TOKEN` envs remain the debugging escape hatch
+  and should override the manifest;
+- rank lookup should be explicit (`VLLM_UMA_ODIRECT_REMOTE_RANK`) or use
+  standard distributed envs (`RANK`, then `LOCAL_RANK`) and fail closed if the
+  manifest has no entry.
+
+This closes the earlier "where should topology live" open question without
+coupling the loader to one vLLM distributed backend.  True TP/PP
+ownership-by-layer is still a later validation step.

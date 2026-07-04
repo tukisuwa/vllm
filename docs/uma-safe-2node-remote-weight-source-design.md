@@ -591,10 +591,6 @@ same settings as the `143.98s` persistent baseline and record:
   physically holds which checkpoint shard? A static ownership map may need to
   be keyed by (file, byte range) rather than by rank alone if a single
   checkpoint file's tensors end up needed by ranks on both nodes.
-- Where should ownership/topology configuration live -- new `LoadConfig`
-  fields, environment variables, or a small topology file? Given this fork's
-  intentionally narrow deployment target, the simplest option that avoids
-  inventing a discovery protocol is preferred.
 - Should `ExecutorCapability` (already used to describe O_DIRECT alignment
   requirements) grow a capability describing "this source can stream to a
   remote rank," so a future executor can query it the same way it queries
@@ -604,3 +600,50 @@ same settings as the `143.98s` persistent baseline and record:
   rather than hanging -- does this need to hook into vLLM's existing
   multi-process launch/teardown, or can it stay fully local to this loader's
   transport?
+
+## Proposed topology manifest
+
+The next implementation step should keep topology explicit rather than trying
+to infer it from vLLM internals.  Use a small JSON manifest selected by an env
+var such as `VLLM_UMA_ODIRECT_REMOTE_TOPOLOGY`:
+
+```json
+{
+  "version": 1,
+  "default_token_env": "VLLM_UMA_ODIRECT_REMOTE_TOKEN",
+  "base_port": 32190,
+  "owners": {
+    "0": {
+      "host": "192.168.100.11",
+      "port_offset": 0
+    }
+  },
+  "ranks": {
+    "0": {
+      "role": "owner",
+      "owner": "0"
+    },
+    "1": {
+      "role": "remote",
+      "owner": "0"
+    }
+  }
+}
+```
+
+The manifest is intentionally rank-indexed and concrete:
+
+- no automatic owner election;
+- no wildcard "serve any local checkpoint" rule;
+- every remote rank names exactly one owner endpoint;
+- every owner endpoint resolves to `base_port + port_offset`, with the same
+  fail-closed range validation as `VLLM_UMA_ODIRECT_REMOTE_PORT_OFFSET`;
+- an explicit env still wins for manual debugging, so the current
+  `ROLE/HOST/PORT/OFFSET/TOKEN` path remains the low-level escape hatch.
+
+For the first implementation, rank discovery can read `RANK`, `LOCAL_RANK`, or
+an explicit `VLLM_UMA_ODIRECT_REMOTE_RANK` env, in that order, and fail closed
+if the manifest lacks an entry.  This is enough to remove shell-level
+copy/paste mistakes without coupling the loader to a specific vLLM
+distributed backend.  True TP/PP ownership-by-layer remains out of scope until
+the manifest has proven useful for the simple single-owner case.
