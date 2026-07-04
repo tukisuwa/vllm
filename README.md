@@ -24,8 +24,9 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 This branch is a fork-local experiment for UMA-safe safetensors loading on
 systems such as DGX Spark.  See
 [docs/uma-safe-weight-source-readme.md](docs/uma-safe-weight-source-readme.md)
-for the supported loader format, safety model, validation status, and known
-gaps.  The upstream vLLM README continues below.
+for the supported loader format, safety model, validation status, 2-node
+remote O_DIRECT payload streaming constraints, and known gaps.  The upstream
+vLLM README continues below.
 
 ## About
 

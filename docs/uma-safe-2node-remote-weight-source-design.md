@@ -1,9 +1,10 @@
 # 2node UMA O_DIRECT tensor streaming: RemoteWeightSource design
 
-Status: Phase 1 loopback implementation exists for the transport protocol and
-`WeightSource` surface. See the "2node UMA O_DIRECT tensor streaming design"
-entry in `docs/uma-safe-weight-plan-ir-roadmap.md` (2026-07-04) for the
-problem statement and high-level shape this document expands on.
+Status: Phase 1 is implemented and validated through real 2-node model-load
+smokes. The path now has persistent TCP connections, batched full/sliced
+reads, batched segmented reads, and an eager owner-capability handshake for
+read-accounting correctness. See the 2026-07-04 entries in
+`docs/uma-safe-weight-plan-ir-roadmap.md` for measurements and artifacts.
 
 ## Problem recap
 
@@ -37,6 +38,9 @@ satisfy the same duck-typed `WeightSource` surface the executor already calls.
   same `WeightPlan` a local rank would; only how bytes are fetched changes.
 - No dynamic ownership discovery. Payload ownership is static configuration
   for this fork's fixed, small node topology.
+- No true distributed loading semantics. The remote source only changes where
+  payload bytes are read from; it does not decide TP/PP placement, elect
+  owners per rank, or integrate with vLLM's distributed process lifecycle.
 
 ## WeightSource surface to satisfy
 
@@ -93,10 +97,11 @@ class WeightSource(Protocol):
 
 `read_segment_group_into_cpu` is the one method `execute_weight_plan()`
 probes with `getattr(..., None)` rather than requiring unconditionally (Stage
-A coalescing degrades gracefully without it), so a first `RemoteWeightSource`
-cut can omit it and fall back to per-entry `read_segments_into_cpu` calls
-without breaking correctness -- only losing the coalescing optimization on
-the remote path until it is implemented.
+A coalescing degrades gracefully without it). The Phase 1 remote source still
+does not expose that method directly, but B2 preserves the same optimization
+inside batched `read_many` requests: the owner groups segmented batch items by
+`checkpoint_name` and calls the local source's group reader before returning
+one tensor per request item.
 
 ## Proposed shape
 
@@ -224,23 +229,37 @@ Extending `_SourceReadStats`/`stats_snapshot()` for the 2-rank case:
 
 ## Migration plan
 
-1. **Static single-owner, TCP transport, per-entry requests.** No
-   `read_segment_group_into_cpu` on the remote side yet (falls back to
-   per-entry `read_segments_into_cpu`, matching the existing optional-method
-   pattern in `execute_weight_plan()`). Metadata distributed via shared
-   filesystem header reads (option 1 above) to avoid building catalog
-   serialization on day one.
-2. **Catalog broadcast**, replacing the shared-filesystem metadata read with
+Completed Phase 1 work:
+
+1. **Static single-owner TCP transport.** The owner wraps a local
+   `ODirectSafetensorsWeightSource`; remote ranks fetch payload bytes through
+   a WeightSource-shaped TCP protocol and do not open payload files.
+2. **Persistent connection.** One remote source keeps one TCP connection open
+   for repeated request/response frames, avoiding per-entry TCP setup.
+3. **Bounded `read_many` batches for full/sliced entries.** Qwen35B remote
+   request count drops from one request per tensor to bounded payload batches.
+4. **Eager owner capability handshake.** Remote scheduling uses the owner's
+   actual O_DIRECT chunk/window/alignment values, so expected and actual read
+   stats match.
+5. **Bounded segmented batches.** TeleChat2-style `read_segments` entries are
+   batched, owner-validated, and grouped by source tensor so local Stage-A
+   read-window reuse is preserved across the network path.
+6. **Real 2-node checkpoint smokes.** Qwen35B and TeleChat2-35B have exercised
+   large full-read and segmented-read payloads over the DGX Spark QSFP link.
+
+Remaining migration steps:
+
+1. **Catalog broadcast.** Replace shared-filesystem header reads with
    owner-serialized `TensorCatalog` distribution, removing the NFS dependency
-   entirely (including for headers).
-3. **Segment-group requests**, adding `ReadSegmentGroupRequest` so Stage A
-   coalescing benefits extend across the remote path instead of only the
-   local one.
-4. **Real 2-node checkpoint smoke**, following the same "small fixture first,
-   then real checkpoint" progression this loader has used throughout: a
-  loopback-transport unit test (owner and remote in the same process/host)
-  before an actual 2-node DGX Spark run, mirroring how the segment fixtures
-  validated boundary math before the Hunyuan real-checkpoint smoke.
+   for metadata as well as payload.
+2. **Rank-aware topology.** Add explicit owner election/port assignment for
+   launches with more than one owner-capable worker on a node.
+3. **Distributed lifecycle integration.** Ensure owner or remote failure
+   aborts the peer ranks through vLLM's multiprocess launcher instead of
+   relying only on socket timeouts.
+4. **True TP/PP placement validation.** Exercise the remote source in a real
+   distributed topology where ranks own different model shards/layers, not
+   just a single remote payload consumer.
 
 ## Phase 1 implementation note (2026-07-04)
 
@@ -269,9 +288,10 @@ The first implementation cut adds:
   `read_full_cpu`, `read_slice_cpu`, `read_into_cpu`,
   `read_segments_into_cpu`, `empty_cpu`, `empty_cpu_shape`, `skip`,
   `set_expected_read_summary`, and `stats_snapshot`.
-- No remote `read_segment_group_into_cpu` yet by design. The executor's
-  optional-method probe therefore falls back to per-entry segment requests,
-  matching Migration step 1.
+- No remote `read_segment_group_into_cpu` method is exposed directly by
+  design. B2 handles grouped segmented reads inside `read_many` instead, so
+  the executor still sees the same optional-method shape while owner-side
+  window reuse is preserved for batched segment entries.
 - A loopback unit test using a real safetensors file and the actual
   `_ODirectFile` path on the owner side. The test validates full, sliced, and
   segmented reads; confirms the optional group method is absent; checks remote
@@ -299,11 +319,9 @@ will fail to bind; rank-aware owner election/topology files are intentionally
 left for the next harness step rather than hidden inside this first cut.
 
 This implementation is intentionally not wired into distributed vLLM launch
-automation yet. The next step is a small 2-process harness that starts one
-rank with the owner env and one rank with the remote env, verifies that the
-remote rank does not open the safetensors payload path, and records
-owner/remote `buff/cache`, swap, and PSI before trying a full two-node vLLM
-serve.
+automation yet. Manual owner/remote env wiring has been validated, but
+rank-aware launch integration, port assignment, and peer-failure propagation
+remain outside Phase 1.
 
 ## Phase 1 two-node smoke (2026-07-04)
 

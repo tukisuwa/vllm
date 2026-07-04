@@ -24,6 +24,43 @@ loader.  It is intentionally narrower than vLLM's general safetensors loaders:
 The older `uma_safetensors` Run:ai-streamer wrapper remains present, but the
 primary safe path for this fork is `uma_odirect_safetensors`.
 
+## 2-Node Remote O_DIRECT Payload Streaming
+
+This fork also has a 2-node remote payload path for the DGX Spark-style case
+where one node owns the checkpoint on local disk and a peer would otherwise
+read payload bytes over NFS.  The owner opens safetensors payload files with
+O_DIRECT; the remote rank reads only metadata locally and receives tensor
+payload bytes over a narrow TCP `WeightSource` protocol.
+
+Enable it with the fork-specific environment variables:
+
+- `VLLM_UMA_ODIRECT_REMOTE_ROLE=owner|remote`
+- `VLLM_UMA_ODIRECT_REMOTE_HOST`
+- `VLLM_UMA_ODIRECT_REMOTE_PORT`
+- `VLLM_UMA_ODIRECT_REMOTE_TOKEN`
+- `VLLM_UMA_ODIRECT_REMOTE_TIMEOUT_SECONDS` (optional)
+
+The remote path is deliberately limited:
+
+- it is a payload transport, not true tensor/pipeline-parallel distributed
+  loading;
+- ownership is static and manually configured;
+- one owner process binds one TCP port, so multi-owner same-node launches need
+  explicit port/topology management outside this first implementation;
+- remote ranks still read safetensors headers through the configured model
+  path; catalog broadcast is future work;
+- the TCP token is a private-network guard, not a replacement for a trusted
+  network boundary;
+- owner reads are serialized through one O_DIRECT source to preserve the
+  single-window cache invariants.
+
+The remote path now uses a persistent connection, batched full/sliced reads,
+batched segmented reads, and an eager owner capability handshake so expected
+read accounting is computed with the owner's O_DIRECT chunk/window/alignment
+settings.  `remote_batch_payload_mib` in loader extra config controls the
+maximum response payload per remote batch (default `128`; TeleChat2-35B used
+`256` in validation so K/V segment pairs could share a batch).
+
 ## Safety Model
 
 The fork follows fail-closed rules:
@@ -84,20 +121,27 @@ OpenPangu currently uses stacked/source-slice entries rather than
 
 As of 2026-07-04:
 
-- targeted loader/WeightPlan tests: `291 passed`;
+- targeted loader/WeightPlan/remote-source tests: `301 passed`;
 - `git diff --check` clean for the current branch;
 - three standard DGX Spark model-load smokes passed earlier with
   expected bytes equal to actual bytes and no swap or memory PSI;
-- tiny real-safetensors fixtures validate segmented byte boundaries and
-  O_DIRECT window behavior.
+- Hunyuan-A13B-Instruct-GPTQ-Int4 and TeleChat2-35B real-checkpoint smokes
+  covered the high-risk routed and segmented paths on a single node;
+- Qwen35B and TeleChat2-35B 2-node remote O_DIRECT smokes validated persistent
+  transport, batching, owner capability accounting, and low remote page-cache
+  growth.
 
 ## Known Gaps
 
-The segmented families still need at least one real-checkpoint model-load smoke
-when a suitable checkpoint is available.  The tiny fixtures validate byte
-boundaries and O_DIRECT execution, but they do not prove full model
-construction, quantization metadata, tokenizer/config compatibility, or
-end-to-end generation.
+The 2-node remote path has been validated as a payload transport, not as a
+complete distributed serving topology.  Pipeline-parallel layer distribution,
+rank-aware owner election, multi-owner port assignment, catalog broadcast, and
+cross-rank failure propagation are still explicit follow-up work.
+
+The tiny fixtures validate byte boundaries and O_DIRECT execution, and the
+TeleChat2-35B smoke exercises segmented remote reads on a real checkpoint.
+They still do not prove every segmented family, tokenizer/config compatibility
+across all models, or end-to-end generation under sustained serving load.
 
 FlashInfer/CUDA JIT memory spikes are a separate post-load issue on UMA
 systems.  Loader validation should continue to use `model_load` stop mode until
@@ -111,5 +155,7 @@ advanced.
 ## Pointers
 
 - Roadmap: `docs/uma-safe-weight-plan-ir-roadmap.md`
+- 2-node remote source design:
+  `docs/uma-safe-2node-remote-weight-source-design.md`
 - Upstream-style RFC draft: `docs/uma-safe-weight-plan-upstream-rfc.md`
 - Design background: `docs/uma-safe-weight-source-design.md`
