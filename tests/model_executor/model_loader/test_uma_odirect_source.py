@@ -427,14 +427,13 @@ def test_remote_odirect_weight_source_rejects_bad_auth(tmp_path, monkeypatch):
         auth_token="owner-token",
     ) as server:
         host, port = server.address
-        remote = L.RemoteODirectSafetensorsWeightSource(
-            owner_source.catalog,
-            host=host,
-            port=port,
-            auth_token="wrong-token",
-        )
         with pytest.raises(RuntimeError, match="failed authentication"):
-            remote.read_full_cpu(name)
+            L.RemoteODirectSafetensorsWeightSource(
+                owner_source.catalog,
+                host=host,
+                port=port,
+                auth_token="wrong-token",
+            )
 
 
 def test_remote_odirect_rejects_oversized_frame_before_payload_read():
@@ -473,6 +472,11 @@ def test_remote_odirect_owner_source_calls_are_serialized():
     class SlowSource:
         def __init__(self):
             self.catalog = catalog
+            self._loader = types.SimpleNamespace(
+                _chunk_size=4096,
+                _window_size=4096,
+                _alignment=4096,
+            )
             self.active = 0
             self.max_active = 0
             self.lock = threading.Lock()
@@ -518,6 +522,32 @@ def test_remote_odirect_owner_source_calls_are_serialized():
     assert errors == []
     assert source.max_active == 1
     assert server.connections_accepted == 1
+
+
+def test_remote_odirect_requires_owner_capability():
+    name = "weight"
+    catalog = L.TensorCatalog(
+        [
+            L.TensorMeta("model.safetensors", name, torch.float32, (1,), 0, 4),
+        ]
+    )
+
+    class NoCapabilitySource:
+        def __init__(self):
+            self.catalog = catalog
+
+    with L.RemoteODirectSafetensorsWeightSourceServer(
+        NoCapabilitySource(),
+        auth_token="owner-token",
+    ) as server:
+        host, port = server.address
+        with pytest.raises(RuntimeError, match="loader capability"):
+            L.RemoteODirectSafetensorsWeightSource(
+                catalog,
+                host=host,
+                port=port,
+                auth_token="owner-token",
+            )
 
 
 def test_execute_weight_plan_uses_remote_per_entry_segment_fallback(
@@ -571,6 +601,60 @@ def test_execute_weight_plan_uses_remote_per_entry_segment_fallback(
         torch.stack([source_tensor[1], source_tensor[6]]),
     )
     assert remote.stats_snapshot()["tensors_read_sliced"] == 1
+
+
+def test_execute_weight_plan_uses_remote_owner_capability_for_schedule(
+    tmp_path,
+    monkeypatch,
+):
+    name = "weight"
+    tensor = torch.arange(4, dtype=torch.float32)
+    owner_source = _real_source(tmp_path, monkeypatch, name, tensor)
+    captured = {}
+    original_schedule = L.schedule_weight_plan_reads
+
+    def capture_schedule(catalog, plan, *, chunk_size, window_size, alignment):
+        captured["chunk_size"] = chunk_size
+        captured["window_size"] = window_size
+        captured["alignment"] = alignment
+        return original_schedule(
+            catalog,
+            plan,
+            chunk_size=chunk_size,
+            window_size=window_size,
+            alignment=alignment,
+        )
+
+    monkeypatch.setattr(L, "schedule_weight_plan_reads", capture_schedule)
+
+    with L.RemoteODirectSafetensorsWeightSourceServer(
+        owner_source,
+        auth_token="owner-token",
+    ) as server:
+        host, port = server.address
+        remote = L.RemoteODirectSafetensorsWeightSource(
+            owner_source.catalog,
+            host=host,
+            port=port,
+            auth_token="owner-token",
+        )
+        model = torch.nn.Module()
+        model.weight = torch.nn.Parameter(torch.empty(4))
+        loaded = _remote_read_or_skip(
+            lambda: L.execute_weight_plan(
+                model,
+                remote,
+                L.WeightPlan((L.WeightPlanEntry(name, "weight"),)),
+            )
+        )
+
+    assert loaded == {"weight"}
+    assert captured == {
+        "chunk_size": 4096,
+        "window_size": 4096,
+        "alignment": 4096,
+    }
+    assert torch.equal(model.weight.detach(), tensor)
 
 
 def test_execute_weight_plan_uses_remote_read_many_for_full_reads(

@@ -2361,3 +2361,40 @@ source's `128 MiB` window capability, while owner actual remains `22.23 GiB`.
 Stage B3 should address that accounting gap.  Stage B2 remains useful for
 segment-family remote runs, but Qwen35B's full-read path no longer makes it
 urgent for throughput.
+
+### 2026-07-04 RemoteWeightSource B3 capability handshake
+
+B3 is implemented as an eager owner capability handshake during
+`RemoteODirectSafetensorsWeightSource` construction.  The owner exposes a
+`source_capability` op returning:
+
+- `chunk_size`
+- `window_size`
+- `alignment`
+- `supports_strided_read`
+- `max_batch_payload_bytes`
+- `max_batch_items`
+
+The remote source validates the response fail-closed, rejects malformed
+integer fields (including `bool` values), stores the owner O_DIRECT parameters
+as `_chunk_size`, `_window_size`, and `_alignment`, and clamps its batch caps to
+the owner-advertised limits.  `execute_weight_plan` now probes source-level
+O_DIRECT attributes before falling back to the local loader/default values, so
+remote schedule simulation uses the owner source's real window settings.
+
+Compatibility behavior is intentionally strict: if the owner does not support
+`source_capability`, remote source construction fails.  This avoids silently
+returning to local-default schedule accounting, which was the root of the
+Qwen35B `22.86 GiB expected` vs `22.23 GiB owner actual` mismatch.
+
+Unit coverage:
+
+- bad auth now fails during eager construction;
+- owner sources without loader capability are rejected;
+- `execute_weight_plan` captures and verifies the owner-advertised
+  `chunk_size/window_size/alignment` values during scheduling;
+- B1 item/payload caps remain covered.
+
+Remaining gate: repeat the Qwen35B 2-node smoke and confirm the remote
+schedule log now reports expected bytes close to the owner actual
+`22.23 GiB` while preserving the B1 model-load and memory results.

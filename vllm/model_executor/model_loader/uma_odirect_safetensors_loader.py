@@ -587,19 +587,31 @@ def execute_weight_plan(
         source.catalog,
         plan,
         chunk_size=getattr(
-            loader,
+            source,
             "_chunk_size",
-            UmaODirectSafetensorsModelLoader.DEFAULT_CHUNK_SIZE,
+            getattr(
+                loader,
+                "_chunk_size",
+                UmaODirectSafetensorsModelLoader.DEFAULT_CHUNK_SIZE,
+            ),
         ),
         window_size=getattr(
-            loader,
+            source,
             "_window_size",
-            UmaODirectSafetensorsModelLoader.DEFAULT_WINDOW_SIZE,
+            getattr(
+                loader,
+                "_window_size",
+                UmaODirectSafetensorsModelLoader.DEFAULT_WINDOW_SIZE,
+            ),
         ),
         alignment=getattr(
-            loader,
+            source,
             "_alignment",
-            UmaODirectSafetensorsModelLoader.DEFAULT_ALIGNMENT,
+            getattr(
+                loader,
+                "_alignment",
+                UmaODirectSafetensorsModelLoader.DEFAULT_ALIGNMENT,
+            ),
         ),
     )
     schedule_summary = schedule.summary
@@ -1737,6 +1749,23 @@ class RemoteODirectSafetensorsWeightSourceServer:
     def _handle_request(self, request_obj: object) -> dict[str, object]:
         request = self._check_request(request_obj)
         op = request["op"]
+        if op == "source_capability":
+            loader = getattr(self.source, "_loader", None)
+            if loader is None:
+                raise RuntimeError(
+                    "Remote O_DIRECT owner source does not expose loader capability"
+                )
+            return {
+                "ok": True,
+                "capability": {
+                    "chunk_size": int(loader._chunk_size),
+                    "window_size": int(loader._window_size),
+                    "alignment": int(loader._alignment),
+                    "supports_strided_read": True,
+                    "max_batch_payload_bytes": int(self.max_batch_payload_bytes),
+                    "max_batch_items": int(_REMOTE_MAX_BATCH_ITEMS),
+                },
+            }
         if op == "read_full":
             name = self._request_name(request)
             return {"ok": True, "tensor": _tensor_to_wire(self.source.read_full_cpu(name))}
@@ -1865,6 +1894,16 @@ class RemoteODirectSafetensorsWeightSource:
         self._expected_read_summary: ReadScheduleSummary | None = None
         self._sock: socket.socket | None = None
         self._sock_lock = threading.Lock()
+        capability = self._request_capability()
+        self._chunk_size = capability["chunk_size"]
+        self._window_size = capability["window_size"]
+        self._alignment = capability["alignment"]
+        self._supports_strided_read = capability["supports_strided_read"]
+        self._max_batch_payload_bytes = min(
+            self._max_batch_payload_bytes,
+            capability["max_batch_payload_bytes"],
+        )
+        self._max_batch_items = capability["max_batch_items"]
 
     def read_full_cpu(self, name: str) -> torch.Tensor:
         record = self.catalog.get(name)
@@ -1919,7 +1958,7 @@ class RemoteODirectSafetensorsWeightSource:
         return self._max_batch_payload_bytes
 
     def read_many_max_items(self) -> int:
-        return _REMOTE_MAX_BATCH_ITEMS
+        return self._max_batch_items
 
     def read_many_cpu(
         self,
@@ -1927,10 +1966,10 @@ class RemoteODirectSafetensorsWeightSource:
     ) -> tuple[torch.Tensor, ...]:
         if not requests:
             return ()
-        if len(requests) > _REMOTE_MAX_BATCH_ITEMS:
+        if len(requests) > self._max_batch_items:
             raise RuntimeError(
                 "Remote read_many_cpu request item count exceeds limit: "
-                f"{len(requests)} > {_REMOTE_MAX_BATCH_ITEMS}"
+                f"{len(requests)} > {self._max_batch_items}"
             )
         items: list[dict[str, object]] = []
         expected_payloads: list[int] = []
@@ -1992,6 +2031,50 @@ class RemoteODirectSafetensorsWeightSource:
         self._stats.batch_requests += 1
         self._stats.batch_tensors += len(tensors)
         return tuple(tensors)
+
+    def _request_capability(self) -> dict[str, int | bool]:
+        response = self._request({"op": "source_capability"})
+        capability = response.get("capability")
+        if not isinstance(capability, dict):
+            raise RuntimeError("Remote O_DIRECT owner returned no source capability")
+
+        def _required_positive_int(key: str) -> int:
+            value = capability.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise RuntimeError(
+                    f"Remote O_DIRECT owner returned invalid capability {key}: "
+                    f"{value!r}"
+                )
+            return value
+
+        chunk_size = _required_positive_int("chunk_size")
+        window_size = _required_positive_int("window_size")
+        alignment = _required_positive_int("alignment")
+        max_batch_payload_bytes = _required_positive_int("max_batch_payload_bytes")
+        max_batch_items = _required_positive_int("max_batch_items")
+        supports_strided_read = capability.get("supports_strided_read")
+        if not isinstance(supports_strided_read, bool):
+            raise RuntimeError(
+                "Remote O_DIRECT owner returned invalid capability "
+                f"supports_strided_read: {supports_strided_read!r}"
+            )
+        if alignment & (alignment - 1) != 0:
+            raise RuntimeError(
+                f"Remote O_DIRECT owner returned non-power-of-two alignment: {alignment}"
+            )
+        if window_size < chunk_size:
+            raise RuntimeError(
+                "Remote O_DIRECT owner returned window_size smaller than chunk_size: "
+                f"{window_size} < {chunk_size}"
+            )
+        return {
+            "chunk_size": chunk_size,
+            "window_size": window_size,
+            "alignment": alignment,
+            "supports_strided_read": supports_strided_read,
+            "max_batch_payload_bytes": max_batch_payload_bytes,
+            "max_batch_items": max_batch_items,
+        }
 
     def read_into_cpu(
         self,

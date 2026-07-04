@@ -523,10 +523,11 @@ O_DIRECT settings and should make Qwen35B expected bytes match owner actual
 bytes (`22.23 GiB` with the 128 MiB window) instead of the conservative
 `22.86 GiB` computed with local defaults.
 
-The handshake should run lazily before `set_expected_read_summary` is needed,
-or eagerly when constructing the remote source.  If the owner does not support
-the handshake, fail closed for the batch/schedule-aware path and retain the
-older remote path only when explicitly allowed for compatibility tests.
+The handshake runs eagerly when constructing the remote source.  This avoids a
+timing hazard where `schedule_weight_plan_reads` could run before the remote
+source has learned the owner source's O_DIRECT settings.  If the owner does
+not support the handshake, fail closed; silently falling back to local defaults
+would reintroduce hidden expected/actual accounting drift.
 
 ### Tests
 
