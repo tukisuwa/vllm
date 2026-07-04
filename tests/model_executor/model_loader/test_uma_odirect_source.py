@@ -288,8 +288,8 @@ def test_remote_odirect_weight_source_loopback_reads_real_odirect_payload(
             auth_token=token,
         )
 
-        # Phase 1 intentionally omits the optional grouped segment method so
-        # execute_weight_plan falls back to per-entry read_segments requests.
+        # The remote source intentionally omits the optional direct grouped
+        # segment method; grouped segment reads are tunneled through read_many.
         assert getattr(remote, "read_segment_group_into_cpu", None) is None
 
         full = _remote_read_or_skip(lambda: remote.read_full_cpu(name))
@@ -601,6 +601,108 @@ def test_execute_weight_plan_uses_remote_per_entry_segment_fallback(
         torch.stack([source_tensor[1], source_tensor[6]]),
     )
     assert remote.stats_snapshot()["tensors_read_sliced"] == 1
+
+
+def test_execute_weight_plan_batches_remote_segment_entries_by_source(
+    tmp_path,
+    monkeypatch,
+):
+    name = "fused.qkv.weight"
+    source_tensor = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    owner_source = _real_source(tmp_path, monkeypatch, name, source_tensor)
+    original_group_read = owner_source.read_segment_group_into_cpu
+    group_calls = []
+
+    def record_group_read(group_name, requests):
+        group_calls.append((group_name, len(requests)))
+        return original_group_read(group_name, requests)
+
+    monkeypatch.setattr(owner_source, "read_segment_group_into_cpu", record_group_read)
+
+    q_segments = (
+        L.WeightPlanReadSegment(
+            (slice(0, 1), slice(None)),
+            (slice(0, 1), slice(None)),
+        ),
+        L.WeightPlanReadSegment(
+            (slice(3, 4), slice(None)),
+            (slice(1, 2), slice(None)),
+        ),
+    )
+    k_segments = (
+        L.WeightPlanReadSegment(
+            (slice(1, 2), slice(None)),
+            (slice(0, 1), slice(None)),
+        ),
+        L.WeightPlanReadSegment(
+            (slice(4, 5), slice(None)),
+            (slice(1, 2), slice(None)),
+        ),
+    )
+    v_segments = (
+        L.WeightPlanReadSegment(
+            (slice(2, 3), slice(None)),
+            (slice(0, 1), slice(None)),
+        ),
+        L.WeightPlanReadSegment(
+            (slice(5, 6), slice(None)),
+            (slice(1, 2), slice(None)),
+        ),
+    )
+
+    with L.RemoteODirectSafetensorsWeightSourceServer(
+        owner_source,
+        auth_token="owner-token",
+    ) as server:
+        host, port = server.address
+        remote = L.RemoteODirectSafetensorsWeightSource(
+            owner_source.catalog,
+            host=host,
+            port=port,
+            auth_token="owner-token",
+        )
+        model = torch.nn.Module()
+        model.q = torch.nn.Parameter(torch.empty(2, 4))
+        model.k = torch.nn.Parameter(torch.empty(2, 4))
+        model.v = torch.nn.Parameter(torch.empty(2, 4))
+        plan = L.WeightPlan(
+            (
+                L.WeightPlanEntry(
+                    checkpoint_name=name,
+                    target_name="q",
+                    read_segments=q_segments,
+                    staging_shape=(2, 4),
+                    read_into_cpu=True,
+                ),
+                L.WeightPlanEntry(
+                    checkpoint_name=name,
+                    target_name="k",
+                    read_segments=k_segments,
+                    staging_shape=(2, 4),
+                    read_into_cpu=True,
+                ),
+                L.WeightPlanEntry(
+                    checkpoint_name=name,
+                    target_name="v",
+                    read_segments=v_segments,
+                    staging_shape=(2, 4),
+                    read_into_cpu=True,
+                ),
+            )
+        )
+
+        loaded = _remote_read_or_skip(lambda: L.execute_weight_plan(model, remote, plan))
+
+    assert loaded == {"q", "k", "v"}
+    assert torch.equal(model.q.detach(), torch.stack([source_tensor[0], source_tensor[3]]))
+    assert torch.equal(model.k.detach(), torch.stack([source_tensor[1], source_tensor[4]]))
+    assert torch.equal(model.v.detach(), torch.stack([source_tensor[2], source_tensor[5]]))
+    assert group_calls == [(name, 3)]
+    stats = remote.stats_snapshot()
+    assert stats["batch_requests"] == 1
+    assert stats["batch_tensors"] == 3
+    assert stats["tensors_read_sliced"] == 3
+    assert server.connections_accepted == 1
 
 
 def test_execute_weight_plan_uses_remote_owner_capability_for_schedule(

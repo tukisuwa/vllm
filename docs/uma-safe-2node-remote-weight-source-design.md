@@ -506,6 +506,14 @@ but it does not yet coalesce multiple segment entries into a single owner-side
 staging tensor.  That can remain a later optimization if B2 still leaves a
 measurable segment-family gap.
 
+Implementation note: the initial B2 implementation does preserve the local
+Stage-A read-window reuse for the common fused-source case.  The owner-side
+`read_many` handler groups segmented items by `checkpoint_name` and calls the
+existing `read_segment_group_into_cpu` path for each group.  This keeps
+HunYuan-style Q/K/V entries that share one fused checkpoint tensor from
+devolving into independent owner sweeps.  Response tensors are still returned
+in the original request order, so executor dispatch order remains unchanged.
+
 ### Stage B3: owner capability handshake
 
 Add a small owner op, for example `source_capability`, returning:

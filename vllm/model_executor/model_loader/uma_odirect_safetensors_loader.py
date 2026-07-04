@@ -322,6 +322,8 @@ def _tensor_to_wire(tensor: torch.Tensor) -> dict[str, object]:
 class _RemoteReadRequest:
     checkpoint_name: str
     source_slices: tuple[slice | int, ...] | None = None
+    read_segments: tuple[WeightPlanReadSegment, ...] | None = None
+    staging_shape: tuple[int, ...] | None = None
 
 
 def _tensor_from_wire(encoded: dict[str, object]) -> torch.Tensor:
@@ -820,11 +822,13 @@ def execute_weight_plan(
 
     def batchable_entry_payload(prepared) -> int | None:
         entry, _param, _weight_loader, record = prepared
-        if (
-            entry.read_segments is not None
-            or entry.read_into_cpu
-            or entry.target_slices is not None
-        ):
+        if entry.target_slices is not None:
+            return None
+        if entry.read_segments is not None:
+            if not entry.read_into_cpu or entry.staging_shape is None:
+                return None
+            return math.prod(entry.staging_shape) * _DTYPE_NBYTES[record.dtype]
+        if entry.read_into_cpu:
             return None
         return _source_tensor_payload_bytes(record, entry.source_slices)
 
@@ -889,8 +893,6 @@ def execute_weight_plan(
                     if (
                         not next_entry.required
                         or next_entry.ignore_missing
-                        or next_entry.read_segments is not None
-                        or next_entry.read_into_cpu
                         or next_entry.target_slices is not None
                     ):
                         break
@@ -909,6 +911,8 @@ def execute_weight_plan(
                         _RemoteReadRequest(
                             group_entry.checkpoint_name,
                             group_entry.source_slices,
+                            group_entry.read_segments,
+                            group_entry.staging_shape,
                         )
                         for group_entry, _param, _weight_loader, _record in group
                     )
@@ -1799,22 +1803,103 @@ class RemoteODirectSafetensorsWeightSourceServer:
                     item.get("source_slices")
                 )
                 record = self.source.catalog.get(name)
-                total_payload += _source_tensor_payload_bytes(record, slices)
+                raw_segments = item.get("segments")
+                if raw_segments is not None:
+                    if slices is not None:
+                        raise RuntimeError(
+                            "read_many item cannot combine source_slices and segments"
+                        )
+                    shape = item.get("staging_shape")
+                    if (
+                        not isinstance(shape, (list, tuple))
+                        or not all(isinstance(dim, int) and dim >= 0 for dim in shape)
+                    ):
+                        raise RuntimeError(
+                            f"Invalid read_many staging_shape for {name}: {shape!r}"
+                        )
+                    segments = _decode_segments(raw_segments)  # type: ignore[arg-type]
+                    staging_shape = tuple(shape)
+                    validate_weight_plan_read_segments(
+                        record,
+                        WeightPlanEntry(
+                            checkpoint_name=name,
+                            target_name=name,
+                            read_segments=segments,
+                            staging_shape=staging_shape,
+                            read_into_cpu=True,
+                        ),
+                    )
+                    payload_bytes = (
+                        math.prod(staging_shape) * _DTYPE_NBYTES[record.dtype]
+                    )
+                    decoded.append(
+                        _RemoteReadRequest(
+                            name,
+                            read_segments=segments,
+                            staging_shape=staging_shape,
+                        )
+                    )
+                else:
+                    payload_bytes = _source_tensor_payload_bytes(record, slices)
+                    decoded.append(_RemoteReadRequest(name, slices))
+                total_payload += payload_bytes
                 if total_payload > self.max_batch_payload_bytes:
                     raise RuntimeError(
                         "read_many request payload exceeds limit: "
                         f"{total_payload} > {self.max_batch_payload_bytes}"
                     )
-                decoded.append(_RemoteReadRequest(name, slices))
-            tensors = [
-                self.source.read_full_cpu(item.checkpoint_name)
-                if item.source_slices is None
-                else self.source.read_slice_cpu(item.checkpoint_name, item.source_slices)
-                for item in decoded
-            ]
+            tensors: list[torch.Tensor | None] = [None] * len(decoded)
+            segment_groups: dict[
+                str,
+                list[
+                    tuple[
+                        int,
+                        torch.Tensor,
+                        tuple[WeightPlanReadSegment, ...],
+                    ]
+                ],
+            ] = defaultdict(list)
+            for index, item in enumerate(decoded):
+                if item.read_segments is not None:
+                    if item.staging_shape is None:
+                        raise RuntimeError(
+                            f"read_many segmented item missing shape: {item}"
+                        )
+                    tensor = self.source.empty_cpu_shape(
+                        item.checkpoint_name,
+                        item.staging_shape,
+                    )
+                    tensors[index] = tensor
+                    segment_groups[item.checkpoint_name].append(
+                        (index, tensor, item.read_segments)
+                    )
+                elif item.source_slices is None:
+                    tensors[index] = self.source.read_full_cpu(item.checkpoint_name)
+                else:
+                    tensors[index] = self.source.read_slice_cpu(
+                        item.checkpoint_name,
+                        item.source_slices,
+                    )
+            read_segment_group_into_cpu = getattr(
+                self.source,
+                "read_segment_group_into_cpu",
+                None,
+            )
+            for name, group in segment_groups.items():
+                requests = tuple((tensor, segments) for _index, tensor, segments in group)
+                if callable(read_segment_group_into_cpu):
+                    read_segment_group_into_cpu(name, requests)
+                else:
+                    for _index, tensor, segments in group:
+                        self.source.read_segments_into_cpu(name, tensor, segments)
+            concrete_tensors = []
+            for tensor in tensors:
+                if tensor is None:
+                    raise RuntimeError("Internal read_many tensor was not populated")
+                concrete_tensors.append(tensor)
             return {
                 "ok": True,
-                "tensors": [_tensor_to_wire(tensor) for tensor in tensors],
+                "tensors": [_tensor_to_wire(tensor) for tensor in concrete_tensors],
             }
         if op == "read_segments":
             name = self._request_name(request)
@@ -1977,7 +2062,29 @@ class RemoteODirectSafetensorsWeightSource:
         total_payload = 0
         for request in requests:
             record = self.catalog.get(request.checkpoint_name)
-            expected_shape = _source_tensor_shape(record, request.source_slices)
+            if request.read_segments is not None:
+                if request.source_slices is not None:
+                    raise RuntimeError(
+                        "Remote read_many_cpu request cannot combine "
+                        "source_slices and read_segments"
+                    )
+                if request.staging_shape is None:
+                    raise RuntimeError(
+                        "Remote read_many_cpu segmented request missing staging_shape"
+                    )
+                validate_weight_plan_read_segments(
+                    record,
+                    WeightPlanEntry(
+                        checkpoint_name=request.checkpoint_name,
+                        target_name=request.checkpoint_name,
+                        read_segments=request.read_segments,
+                        staging_shape=request.staging_shape,
+                        read_into_cpu=True,
+                    ),
+                )
+                expected_shape = list(request.staging_shape)
+            else:
+                expected_shape = _source_tensor_shape(record, request.source_slices)
             expected_payload = math.prod(expected_shape) * _DTYPE_NBYTES[record.dtype]
             total_payload += expected_payload
             if total_payload > self._max_batch_payload_bytes:
@@ -1985,12 +2092,14 @@ class RemoteODirectSafetensorsWeightSource:
                     "Remote read_many_cpu payload exceeds limit: "
                     f"{total_payload} > {self._max_batch_payload_bytes}"
                 )
-            items.append(
-                {
-                    "name": request.checkpoint_name,
-                    "source_slices": _encode_slice_selection(request.source_slices),
-                }
-            )
+            item: dict[str, object] = {
+                "name": request.checkpoint_name,
+                "source_slices": _encode_slice_selection(request.source_slices),
+            }
+            if request.read_segments is not None:
+                item["segments"] = _encode_segments(request.read_segments)
+                item["staging_shape"] = tuple(request.staging_shape or ())
+            items.append(item)
             expected_shapes.append(expected_shape)
             expected_payloads.append(expected_payload)
 
@@ -2026,7 +2135,10 @@ class RemoteODirectSafetensorsWeightSource:
             tensors.append(tensor)
             self._record_tensor_read(
                 expected_payload,
-                sliced=request.source_slices is not None,
+                sliced=(
+                    request.source_slices is not None
+                    or request.read_segments is not None
+                ),
             )
         self._stats.batch_requests += 1
         self._stats.batch_tensors += len(tensors)

@@ -2444,3 +2444,38 @@ on direct-read counts, window-load counts, window-hit counts, and total direct
 bytes.  The slight load-time variation versus the B1 run (`87.38s`) is within
 the runtime/JIT/system noise band; the B3 objective was metric correctness, not
 additional throughput.
+
+### 2026-07-04 RemoteWeightSource B2 segment batching
+
+B2 is implemented by extending the same `read_many` request used by B1 with
+optional `read_segments` and `staging_shape` fields.  The executor now allows
+segmented entries into remote batches when they are otherwise simple
+`read_into_cpu` staging reads.  Unsupported entries still fall back to the
+existing per-entry path.
+
+Owner-side behavior:
+
+- each segmented item is resolved through the owner catalog;
+- `staging_shape` is validated before allocation;
+- `validate_weight_plan_read_segments` runs for every item before any segment
+  payload is materialized;
+- segmented items are grouped by `checkpoint_name` and read via the existing
+  `read_segment_group_into_cpu` path, preserving Stage-A source-offset sorting
+  and read-window reuse for fused-source patterns such as HunYuan Q/K/V;
+- response tensor order remains the original request order, so executor
+  dispatch order is unchanged.
+
+Remote-side behavior:
+
+- batch payload and item caps apply to segmented staging tensors as well as
+  full/sliced reads;
+- tensor shapes returned by the owner are checked against the local
+  catalog-derived staging shape;
+- remote stats count segmented batch tensors as sliced payload.
+
+Loopback coverage now includes a real O_DIRECT fixture with three segmented
+entries sharing one fused source tensor.  The test verifies value equality,
+one remote batch request, and one owner `read_segment_group_into_cpu` call with
+all three entries.  Remaining gate: run a segment-family 2-node smoke
+(TeleChat2/HunYuan/Llama4) to confirm request reduction and read accounting on
+a real checkpoint.
