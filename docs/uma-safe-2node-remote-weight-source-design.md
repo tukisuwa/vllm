@@ -278,11 +278,32 @@ The first implementation cut adds:
   stream accounting; verifies auth failure is rejected before payload serving;
   rejects oversized frame headers/payloads before allocation; and confirms
   concurrent TCP handler threads serialize access to the shared owner source.
+- Initial vLLM loader wiring via environment variables:
+  - `VLLM_UMA_ODIRECT_REMOTE_ROLE=owner|remote`
+  - `VLLM_UMA_ODIRECT_REMOTE_HOST`
+  - `VLLM_UMA_ODIRECT_REMOTE_PORT`
+  - `VLLM_UMA_ODIRECT_REMOTE_TOKEN`
+  - `VLLM_UMA_ODIRECT_REMOTE_TIMEOUT_SECONDS` (optional, default `30`)
+
+The owner role creates the normal local `ODirectSafetensorsWeightSource`,
+starts the TCP owner server, and keeps the server/source alive on the loader
+instance after local rank load returns so remote ranks can still fetch payload
+bytes. The remote role builds a local `TensorCatalog` from safetensors headers
+only, then uses `RemoteODirectSafetensorsWeightSource` for payload reads. This
+preserves the Phase 1 assumption that shared/NFS metadata reads are acceptable
+while payload bytes must come from the owner transport.
+
+The env wiring is still a single-owner-process contract. A launch that starts
+multiple owner-role worker processes on the same node with the same host/port
+will fail to bind; rank-aware owner election/topology files are intentionally
+left for the next harness step rather than hidden inside this first cut.
 
 This implementation is intentionally not wired into distributed vLLM launch
-yet. The next step is a small 2-process harness that starts the owner server
-on the local-disk node and instantiates the remote source on the peer without
-letting the peer open the safetensors payload path.
+automation yet. The next step is a small 2-process harness that starts one
+rank with the owner env and one rank with the remote env, verifies that the
+remote rank does not open the safetensors payload path, and records
+owner/remote `buff/cache`, swap, and PSI before trying a full two-node vLLM
+serve.
 
 ## Open questions
 

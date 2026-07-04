@@ -1650,6 +1650,18 @@ class RemoteODirectSafetensorsWeightSource:
         self._record_tensor_read(record.size, sliced=False)
         return tensor
 
+    def iter_full_tensors(
+        self,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        logger.info(
+            "uma_odirect_safetensors using remote source iterator: tensors=%d "
+            "total=%s",
+            len(self.catalog.records()),
+            _format_gib(self.catalog.total_bytes()),
+        )
+        for record in self.catalog.records():
+            yield record.name, self.read_full_cpu(record.name)
+
     def read_slice_cpu(
         self,
         name: str,
@@ -1793,6 +1805,52 @@ class RemoteODirectSafetensorsWeightSource:
 
     def stats_snapshot(self) -> dict[str, int | float]:
         return self._stats.snapshot()
+
+    def log_stats(self, label: str) -> None:
+        stats = self._stats.snapshot()
+        logger.info(
+            "uma_odirect_safetensors remote source stats (%s): "
+            "tensors_read=%d tensors_read_full=%d tensors_read_sliced=%d "
+            "tensors_skipped=%d stream_recv=%s tensor_payload=%s "
+            "full_payload=%s sliced_payload=%s skipped_payload=%s",
+            label,
+            stats["tensors_read"],
+            stats["tensors_read_full"],
+            stats["tensors_read_sliced"],
+            stats["tensors_skipped"],
+            _format_gib(stats["remote_stream_bytes_recv"]),
+            _format_gib(stats["bytes_tensor_payload"]),
+            _format_gib(stats["bytes_full_tensor_payload"]),
+            _format_gib(stats["bytes_sliced_tensor_payload"]),
+            _format_gib(stats["bytes_skipped_payload"]),
+        )
+        try:
+            owner_stats = self.owner_stats_snapshot()
+        except Exception:
+            logger.warning(
+                "uma_odirect_safetensors remote source could not fetch owner "
+                "stats (%s)",
+                label,
+                exc_info=True,
+            )
+            return
+        logger.info(
+            "uma_odirect_safetensors remote owner stats (%s): "
+            "files_opened=%d tensors_read=%d tensors_read_full=%d "
+            "tensors_read_sliced=%d tensors_skipped=%d direct_reads=%d "
+            "window_loads=%d window_hits=%d bytes_read=%s bytes_copied=%s",
+            label,
+            owner_stats["files_opened"],
+            owner_stats["tensors_read"],
+            owner_stats["tensors_read_full"],
+            owner_stats["tensors_read_sliced"],
+            owner_stats["tensors_skipped"],
+            owner_stats["direct_reads"],
+            owner_stats["window_loads"],
+            owner_stats["window_hits"],
+            _format_gib(owner_stats["bytes_read"]),
+            _format_gib(owner_stats["bytes_copied"]),
+        )
 
     def _record_tensor_read(self, payload_bytes: int, *, sliced: bool) -> None:
         self._stats.tensors_read += 1
@@ -2120,6 +2178,11 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
     DEFAULT_PSI_GATE_SECONDS = 30.0
     DEFAULT_GATE_INTERVAL_MIB = 64
     DEFAULT_ALLOCATION_GATE_MIN_MIB = 16
+    REMOTE_ROLE_ENV = "VLLM_UMA_ODIRECT_REMOTE_ROLE"
+    REMOTE_HOST_ENV = "VLLM_UMA_ODIRECT_REMOTE_HOST"
+    REMOTE_PORT_ENV = "VLLM_UMA_ODIRECT_REMOTE_PORT"
+    REMOTE_TOKEN_ENV = "VLLM_UMA_ODIRECT_REMOTE_TOKEN"
+    REMOTE_TIMEOUT_ENV = "VLLM_UMA_ODIRECT_REMOTE_TIMEOUT_SECONDS"
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
@@ -2189,6 +2252,10 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
             * 1024
             * 1024
         )
+        self._remote_owner_server: (
+            RemoteODirectSafetensorsWeightSourceServer | None
+        ) = None
+        self._remote_owner_source: ODirectSafetensorsWeightSource | None = None
         if self._alignment & (self._alignment - 1) != 0:
             raise ValueError("alignment must be a power of two")
         if self._window_size < self._chunk_size:
@@ -2261,11 +2328,122 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
             metadata_limit_bytes=self._metadata_limit_bytes,
         )
 
+    def _remote_timeout(self) -> float:
+        raw = os.environ.get(self.REMOTE_TIMEOUT_ENV, "30")
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{self.REMOTE_TIMEOUT_ENV} must be a number, got {raw!r}"
+            ) from exc
+        if value <= 0:
+            raise RuntimeError(
+                f"{self.REMOTE_TIMEOUT_ENV} must be positive, got {raw!r}"
+            )
+        return value
+
+    def _remote_auth_token(self) -> str:
+        token = os.environ.get(self.REMOTE_TOKEN_ENV, "")
+        if not token:
+            raise RuntimeError(
+                f"{self.REMOTE_TOKEN_ENV} is required for "
+                "uma_odirect_safetensors remote owner/remote roles"
+            )
+        return token
+
+    def _remote_port(self) -> int:
+        raw = os.environ.get(self.REMOTE_PORT_ENV, "")
+        try:
+            port = int(raw)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{self.REMOTE_PORT_ENV} must be an integer, got {raw!r}"
+            ) from exc
+        if port <= 0 or port > 65535:
+            raise RuntimeError(
+                f"{self.REMOTE_PORT_ENV} must be a TCP port, got {raw!r}"
+            )
+        return port
+
+    def _create_weight_source(
+        self,
+        model_or_path: str,
+    ) -> ODirectSafetensorsWeightSource | RemoteODirectSafetensorsWeightSource:
+        role = os.environ.get(self.REMOTE_ROLE_ENV, "").strip().lower()
+        if not role:
+            return ODirectSafetensorsWeightSource(self, model_or_path)
+        if role not in {"owner", "remote"}:
+            raise RuntimeError(
+                f"{self.REMOTE_ROLE_ENV} must be 'owner' or 'remote', got {role!r}"
+            )
+        token = self._remote_auth_token()
+        timeout = self._remote_timeout()
+        port = self._remote_port()
+
+        if role == "owner":
+            source = ODirectSafetensorsWeightSource(self, model_or_path)
+            host = os.environ.get(self.REMOTE_HOST_ENV)
+            if not host:
+                host = "127.0.0.1"
+                logger.warning(
+                    "uma_odirect_safetensors remote owner role did not set %s; "
+                    "binding to loopback %s. This is safe for local loopback "
+                    "tests but remote nodes will not be able to connect.",
+                    self.REMOTE_HOST_ENV,
+                    host,
+                )
+            if self._remote_owner_server is not None:
+                self._remote_owner_server.close()
+            server = RemoteODirectSafetensorsWeightSourceServer(
+                source,
+                host=host,
+                port=port,
+                auth_token=token,
+                request_timeout=timeout,
+            )
+            server.start()
+            actual_host, actual_port = server.address
+            logger.info(
+                "uma_odirect_safetensors remote owner server listening: %s:%d",
+                actual_host,
+                actual_port,
+            )
+            # Keep the server/source alive after this rank's local load returns:
+            # a remote rank may still be fetching payload bytes.
+            self._remote_owner_server = server
+            self._remote_owner_source = source
+            return source
+
+        host = os.environ.get(self.REMOTE_HOST_ENV, "")
+        if not host:
+            raise RuntimeError(
+                f"{self.REMOTE_HOST_ENV} is required when "
+                f"{self.REMOTE_ROLE_ENV}=remote"
+            )
+        files = self._prepare_files(model_or_path)
+        catalog = self._build_catalog(files)
+        logger.info(
+            "uma_odirect_safetensors using remote owner source: %s:%d "
+            "files=%d tensors=%d payload=%s",
+            host,
+            port,
+            len(files),
+            len(catalog.records()),
+            _format_gib(catalog.total_bytes()),
+        )
+        return RemoteODirectSafetensorsWeightSource(
+            catalog,
+            host=host,
+            port=port,
+            auth_token=token,
+            request_timeout=timeout,
+        )
+
     def _get_weights_iterator(
         self,
         model_or_path: str,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        source = ODirectSafetensorsWeightSource(self, model_or_path)
+        source = self._create_weight_source(model_or_path)
         yield from source.iter_full_tensors()
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -2275,7 +2453,7 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
         model_weights = model_config.model
         if model_weights_override := model_config.model_weights:
             model_weights = model_weights_override
-        source = ODirectSafetensorsWeightSource(self, model_weights)
+        source = self._create_weight_source(model_weights)
         source_hooks = resolve_weight_plan_source_hooks(model)
         if source_hooks is not None:
             build_weight_plan, load_weights_from_source = source_hooks

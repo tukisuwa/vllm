@@ -2011,7 +2011,7 @@ Targeted validation:
 ```text
 PYTHONPATH=$PWD .venv-host/bin/python -m pytest \
   tests/model_executor/model_loader/test_uma_odirect_source.py -q
-  -> 12 passed
+  -> 14 passed
 
 PYTHONPATH=$PWD .venv-host/bin/python -m pytest \
   tests/model_executor/model_loader/test_registry.py \
@@ -2022,3 +2022,47 @@ PYTHONPATH=$PWD .venv-host/bin/python -m pytest \
 The next step is a small two-process harness on one host, then a real
 two-node smoke where the remote rank is verified not to open the NFS-visible
 payload path and receives tensor bytes only from the owner transport.
+
+### 2026-07-04 RemoteWeightSource Phase 1 vLLM loader wiring
+
+The first process-level wiring is now available through explicit environment
+variables rather than new public `LoadConfig` fields:
+
+- `VLLM_UMA_ODIRECT_REMOTE_ROLE=owner|remote`
+- `VLLM_UMA_ODIRECT_REMOTE_HOST`
+- `VLLM_UMA_ODIRECT_REMOTE_PORT`
+- `VLLM_UMA_ODIRECT_REMOTE_TOKEN`
+- `VLLM_UMA_ODIRECT_REMOTE_TIMEOUT_SECONDS` (optional, default `30`)
+
+Owner role creates the normal local `ODirectSafetensorsWeightSource`, starts
+the TCP owner server, and keeps the server/source alive on the loader object
+after local rank load returns. Remote role builds a `TensorCatalog` from local
+headers only and uses `RemoteODirectSafetensorsWeightSource` for payload
+reads. This preserves Phase 1's intentional compromise: NFS/shared-FS header
+reads are acceptable, payload reads are not.
+
+This is still a single-owner-process contract. Launches that spawn multiple
+owner-role workers on the same node with the same host/port are expected to
+fail to bind; rank-aware owner election and topology files are left to the
+next harness step.
+
+The compatibility iterator path also works with the remote source via
+`RemoteODirectSafetensorsWeightSource.iter_full_tensors()`, so a small dense
+checkpoint can be used for the first wiring smoke before involving
+TeleChat2/Hunyuan-sized models.
+
+Additional targeted validation:
+
+```text
+PYTHONPATH=$PWD .venv-host/bin/python -m pytest \
+  tests/model_executor/model_loader/test_uma_odirect_source.py -q
+  -> 13 passed
+```
+
+Remaining before a real two-node vLLM serve:
+
+- build a small 2-process harness using the env contract above,
+- prove the remote process does not open safetensors payload files (only
+  header metadata reads),
+- record owner and remote `buff/cache`, swap, memory PSI, and IO PSI on a
+  small checkpoint before attempting larger model loads.

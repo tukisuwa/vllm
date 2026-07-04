@@ -91,6 +91,12 @@ def _remote_read_or_skip(fn):
         raise
 
 
+def _free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 def test_open_file_reuses_handle_for_same_path(monkeypatch):
     source = _make_source(monkeypatch)
 
@@ -473,3 +479,87 @@ def test_execute_weight_plan_uses_remote_per_entry_segment_fallback(
         torch.stack([source_tensor[1], source_tensor[6]]),
     )
     assert remote.stats_snapshot()["tensors_read_sliced"] == 1
+
+
+def test_uma_odirect_loader_env_wires_owner_and_remote_sources(
+    tmp_path,
+    monkeypatch,
+):
+    name = "weight"
+    tensor = torch.arange(4, dtype=torch.float32)
+    _write_single_tensor_safetensors(tmp_path / "model.safetensors", name, tensor)
+    port = _free_tcp_port()
+    token = "env-token"
+
+    owner_loader = L.UmaODirectSafetensorsModelLoader(
+        LoadConfig(
+            load_format="uma_odirect_safetensors",
+            model_loader_extra_config={
+                "chunk_size": 4096,
+                "window_size": 4096,
+                "gate_interval_mib": 1,
+            },
+        )
+    )
+    monkeypatch.setattr(owner_loader, "_gate_memory", lambda _reason: None)
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_ROLE_ENV, "owner")
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_HOST_ENV, "127.0.0.1")
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_PORT_ENV, str(port))
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_TOKEN_ENV, token)
+
+    owner_source = owner_loader._create_weight_source(str(tmp_path))
+    try:
+        assert isinstance(owner_source, L.ODirectSafetensorsWeightSource)
+        assert owner_loader._remote_owner_server is not None
+
+        remote_loader = L.UmaODirectSafetensorsModelLoader(
+            LoadConfig(load_format="uma_odirect_safetensors")
+        )
+        monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_ROLE_ENV, "remote")
+        remote_source = remote_loader._create_weight_source(str(tmp_path))
+        assert isinstance(remote_source, L.RemoteODirectSafetensorsWeightSource)
+        loaded = _remote_read_or_skip(lambda: remote_source.read_full_cpu(name))
+        assert torch.equal(loaded, tensor)
+    finally:
+        if owner_loader._remote_owner_server is not None:
+            owner_loader._remote_owner_server.close()
+
+
+def test_uma_odirect_owner_role_warns_when_host_defaults_to_loopback(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    name = "weight"
+    _write_single_tensor_safetensors(
+        tmp_path / "model.safetensors",
+        name,
+        torch.arange(4, dtype=torch.float32),
+    )
+    loader = L.UmaODirectSafetensorsModelLoader(
+        LoadConfig(
+            load_format="uma_odirect_safetensors",
+            model_loader_extra_config={
+                "chunk_size": 4096,
+                "window_size": 4096,
+                "gate_interval_mib": 1,
+            },
+        )
+    )
+    monkeypatch.setattr(loader, "_gate_memory", lambda _reason: None)
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_ROLE_ENV, "owner")
+    monkeypatch.setenv(
+        L.UmaODirectSafetensorsModelLoader.REMOTE_PORT_ENV,
+        str(_free_tcp_port()),
+    )
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_TOKEN_ENV, "token")
+    monkeypatch.delenv(L.UmaODirectSafetensorsModelLoader.REMOTE_HOST_ENV, raising=False)
+
+    caplog.set_level("WARNING")
+    source = loader._create_weight_source(str(tmp_path))
+    try:
+        assert isinstance(source, L.ODirectSafetensorsWeightSource)
+        assert "binding to loopback 127.0.0.1" in caplog.text
+    finally:
+        if loader._remote_owner_server is not None:
+            loader._remote_owner_server.close()
