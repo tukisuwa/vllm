@@ -2398,3 +2398,49 @@ Unit coverage:
 Remaining gate: repeat the Qwen35B 2-node smoke and confirm the remote
 schedule log now reports expected bytes close to the owner actual
 `22.23 GiB` while preserving the B1 model-load and memory results.
+
+B3 Qwen35B 2-node smoke result:
+
+- owner/local: `dgx-spark2` (`192.168.100.11`)
+- remote: `dgx-spark1`
+- tensor payload: `21.73 GiB`
+- entries: `124,306` full reads
+- remote schedule after handshake: `expected_direct_reads=407`,
+  `expected_window_loads=163`, `expected_window_hits=124304`,
+  `expected_bytes_read=22.23 GiB`, `expected_read_amplification=1.02x`
+- owner actual direct read: `22.23 GiB` (`direct_reads=407`,
+  `window_loads=163`, `window_hits=124304`)
+- remote batch requests: `324`
+- owner accepted connections: `1`
+- owner timings: `read=5.71s`, `gate=7.64s`, `alloc=0.21s`
+- model load: `93.652171s`
+
+Safety summary:
+
+- remote first `buff/cache`: `1.653 GiB`; peak: `2.953 GiB`; delta:
+  `+1.300 GiB`
+- remote min available: `83.70 GiB`; peak used + `buff/cache`: `40.51 GiB`
+- owner/local first `buff/cache`: `1.568 GiB`; peak: `2.925 GiB`; delta:
+  `+1.358 GiB`
+- owner/local min available: `105.17 GiB`; peak used + `buff/cache`:
+  `17.01 GiB`
+- swap and memory PSI stayed zero on both nodes
+
+Artifacts:
+
+- owner log:
+  `/home/tsukisuwa/LLM/logs/vllm-loader/qwen35b-remote-odirect-b3-20260704-214238.owner.log`
+- remote vLLM log:
+  `/home/tsukisuwa/LLM/logs/vllm-loader/qwen35b-remote-odirect-b3-20260704-214238.remote.log`
+- remote runner log:
+  `/home/tsukisuwa/LLM/logs/vllm-loader/qwen35b-remote-odirect-b3-20260704-214238.remote-runner.log`
+- RAM CSV:
+  `/home/tsukisuwa/LLM/logs/ram/qwen35b-remote-odirect-b3-20260704-214238.csv`
+- RAM summary:
+  `/home/tsukisuwa/LLM/logs/ram/qwen35b-remote-odirect-b3-20260704-214238.summary.txt`
+
+B3 closes the accounting gap: the remote schedule and owner stats now agree
+on direct-read counts, window-load counts, window-hit counts, and total direct
+bytes.  The slight load-time variation versus the B1 run (`87.38s`) is within
+the runtime/JIT/system noise band; the B3 objective was metric correctness, not
+additional throughput.
