@@ -301,6 +301,8 @@ The first implementation cut adds:
   - `VLLM_UMA_ODIRECT_REMOTE_HOST`
   - `VLLM_UMA_ODIRECT_REMOTE_PORT`
   - `VLLM_UMA_ODIRECT_REMOTE_PORT_OFFSET` (optional, added to the base port)
+  - `VLLM_UMA_ODIRECT_REMOTE_TOPOLOGY` (optional JSON manifest)
+  - `VLLM_UMA_ODIRECT_REMOTE_RANK` (optional explicit manifest rank)
   - `VLLM_UMA_ODIRECT_REMOTE_TOKEN`
   - `VLLM_UMA_ODIRECT_REMOTE_TIMEOUT_SECONDS` (optional, default `30`)
 
@@ -603,9 +605,8 @@ same settings as the `143.98s` persistent baseline and record:
 
 ## Proposed topology manifest
 
-The next implementation step should keep topology explicit rather than trying
-to infer it from vLLM internals.  Use a small JSON manifest selected by an env
-var such as `VLLM_UMA_ODIRECT_REMOTE_TOPOLOGY`:
+Topology is kept explicit rather than inferred from vLLM internals.  A small
+JSON manifest can be selected by `VLLM_UMA_ODIRECT_REMOTE_TOPOLOGY`:
 
 ```json
 {
@@ -641,10 +642,9 @@ The manifest is intentionally rank-indexed and concrete:
 - an explicit env still wins for manual debugging, so the current
   `ROLE/HOST/PORT/OFFSET/TOKEN` path remains the low-level escape hatch.
 
-For the first implementation, rank discovery should read the explicit
-`VLLM_UMA_ODIRECT_REMOTE_RANK` env first, then fall back to `RANK`, then
-`LOCAL_RANK`, and fail closed if the manifest lacks an entry.  This is enough
-to remove shell-level
-copy/paste mistakes without coupling the loader to a specific vLLM
+The first implementation reads the explicit
+`VLLM_UMA_ODIRECT_REMOTE_RANK` env first, then falls back to `RANK`, then
+`LOCAL_RANK`, and fails closed if the manifest lacks an entry.  This removes
+shell-level copy/paste mistakes without coupling the loader to a specific vLLM
 distributed backend.  True TP/PP ownership-by-layer remains out of scope until
 the manifest has proven useful for the simple single-owner case.

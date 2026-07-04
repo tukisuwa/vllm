@@ -2612,3 +2612,16 @@ Design constraints:
 This closes the earlier "where should topology live" open question without
 coupling the loader to one vLLM distributed backend.  True TP/PP
 ownership-by-layer is still a later validation step.
+
+Implementation follow-up:
+
+- `VLLM_UMA_ODIRECT_REMOTE_TOPOLOGY` now points at the JSON manifest;
+- rank lookup order is `VLLM_UMA_ODIRECT_REMOTE_RANK`, then `RANK`, then
+  `LOCAL_RANK`;
+- explicit manual env wiring with `VLLM_UMA_ODIRECT_REMOTE_ROLE` still wins
+  and bypasses manifest parsing for debugging;
+- manifest parsing validates version, base port, owner references, role, host,
+  and port offsets fail-closed before bind/connect.
+
+Covered tests: manifest-only resolution, explicit env override precedence,
+and missing-rank fail-closed behavior.

@@ -973,3 +973,85 @@ def test_uma_odirect_remote_port_offset(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="out of range"):
         loader._remote_port()
+
+
+def test_uma_odirect_remote_topology_manifest(monkeypatch, tmp_path):
+    manifest = {
+        "version": 1,
+        "base_port": 9000,
+        "owners": {"0": {"host": "192.0.2.10", "port_offset": 2}},
+        "ranks": {
+            "0": {"role": "owner", "owner": "0"},
+            "1": {"role": "remote", "owner": "0"},
+        },
+    }
+    path = tmp_path / "topology.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    loader = L.UmaODirectSafetensorsModelLoader(
+        LoadConfig(
+            load_format="uma_odirect_safetensors",
+            model_loader_extra_config={},
+        )
+    )
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_TOPOLOGY_ENV, str(path))
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_RANK_ENV, "1")
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_TOKEN_ENV, "token")
+
+    resolved = loader._remote_env()
+
+    assert resolved.role == "remote"
+    assert resolved.host == "192.0.2.10"
+    assert resolved.port == 9002
+    assert resolved.token == "token"
+
+
+def test_uma_odirect_remote_topology_explicit_env_wins(monkeypatch, tmp_path):
+    manifest = {
+        "version": 1,
+        "base_port": 9000,
+        "owners": {"0": {"host": "192.0.2.10", "port_offset": 2}},
+        "ranks": {"1": {"role": "remote", "owner": "0"}},
+    }
+    path = tmp_path / "topology.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    loader = L.UmaODirectSafetensorsModelLoader(
+        LoadConfig(
+            load_format="uma_odirect_safetensors",
+            model_loader_extra_config={},
+        )
+    )
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_TOPOLOGY_ENV, str(path))
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_RANK_ENV, "1")
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_ROLE_ENV, "owner")
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_HOST_ENV, "127.0.0.1")
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_PORT_ENV, "9100")
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_TOKEN_ENV, "token")
+
+    resolved = loader._remote_env()
+
+    assert resolved.role == "owner"
+    assert resolved.host == "127.0.0.1"
+    assert resolved.port == 9100
+
+
+def test_uma_odirect_remote_topology_missing_rank_fails(monkeypatch, tmp_path):
+    manifest = {
+        "version": 1,
+        "base_port": 9000,
+        "owners": {"0": {"host": "192.0.2.10", "port_offset": 0}},
+        "ranks": {"0": {"role": "owner", "owner": "0"}},
+    }
+    path = tmp_path / "topology.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    loader = L.UmaODirectSafetensorsModelLoader(
+        LoadConfig(
+            load_format="uma_odirect_safetensors",
+            model_loader_extra_config={},
+        )
+    )
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_TOPOLOGY_ENV, str(path))
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_RANK_ENV, "2")
+    monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_TOKEN_ENV, "token")
+
+    with pytest.raises(RuntimeError, match="has no rank entry"):
+        loader._remote_env()

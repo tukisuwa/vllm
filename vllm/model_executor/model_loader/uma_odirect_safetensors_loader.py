@@ -405,6 +405,15 @@ class _RemoteReadRequest:
     staging_shape: tuple[int, ...] | None = None
 
 
+@dataclass(frozen=True)
+class _RemoteTopologyEnv:
+    role: str
+    host: str
+    port: int
+    token: str
+    timeout: float
+
+
 def _tensor_from_wire(encoded: dict[str, object]) -> torch.Tensor:
     dtype_name = encoded.get("dtype")
     shape = encoded.get("shape")
@@ -2861,6 +2870,8 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
     REMOTE_HOST_ENV = "VLLM_UMA_ODIRECT_REMOTE_HOST"
     REMOTE_PORT_ENV = "VLLM_UMA_ODIRECT_REMOTE_PORT"
     REMOTE_PORT_OFFSET_ENV = "VLLM_UMA_ODIRECT_REMOTE_PORT_OFFSET"
+    REMOTE_RANK_ENV = "VLLM_UMA_ODIRECT_REMOTE_RANK"
+    REMOTE_TOPOLOGY_ENV = "VLLM_UMA_ODIRECT_REMOTE_TOPOLOGY"
     REMOTE_TOKEN_ENV = "VLLM_UMA_ODIRECT_REMOTE_TOKEN"
     REMOTE_TIMEOUT_ENV = "VLLM_UMA_ODIRECT_REMOTE_TIMEOUT_SECONDS"
 
@@ -3041,65 +3052,181 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
             )
         return token
 
-    def _remote_port(self) -> int:
-        raw = os.environ.get(self.REMOTE_PORT_ENV, "")
+    def _remote_rank_key(self) -> str:
+        for env_name in (self.REMOTE_RANK_ENV, "RANK", "LOCAL_RANK"):
+            value = os.environ.get(env_name, "")
+            if value:
+                return value
+        raise RuntimeError(
+            f"{self.REMOTE_TOPOLOGY_ENV} requires a rank from "
+            f"{self.REMOTE_RANK_ENV}, RANK, or LOCAL_RANK"
+        )
+
+    @staticmethod
+    def _validate_remote_port(raw: str, *, env_name: str) -> int:
         try:
             port = int(raw)
         except ValueError as exc:
-            raise RuntimeError(
-                f"{self.REMOTE_PORT_ENV} must be an integer, got {raw!r}"
-            ) from exc
+            raise RuntimeError(f"{env_name} must be an integer, got {raw!r}") from exc
         if port <= 0 or port > 65535:
-            raise RuntimeError(
-                f"{self.REMOTE_PORT_ENV} must be a TCP port, got {raw!r}"
-            )
-        raw_offset = os.environ.get(self.REMOTE_PORT_OFFSET_ENV, "0")
+            raise RuntimeError(f"{env_name} must be a TCP port, got {raw!r}")
+        return port
+
+    @staticmethod
+    def _validate_remote_port_offset(raw: str, *, env_name: str) -> int:
         try:
-            offset = int(raw_offset)
+            offset = int(raw)
         except ValueError as exc:
-            raise RuntimeError(
-                f"{self.REMOTE_PORT_OFFSET_ENV} must be an integer, "
-                f"got {raw_offset!r}"
-            ) from exc
+            raise RuntimeError(f"{env_name} must be an integer, got {raw!r}") from exc
         if offset < 0:
-            raise RuntimeError(
-                f"{self.REMOTE_PORT_OFFSET_ENV} must be non-negative, "
-                f"got {raw_offset!r}"
-            )
-        if port + offset > 65535:
+            raise RuntimeError(f"{env_name} must be non-negative, got {raw!r}")
+        return offset
+
+    @staticmethod
+    def _combine_remote_port(base_port: int, offset: int) -> int:
+        if base_port + offset > 65535:
             raise RuntimeError(
                 "Remote O_DIRECT resolved TCP port is out of range: "
-                f"{port} + {offset} > 65535"
+                f"{base_port} + {offset} > 65535"
             )
+        return base_port + offset
+
+    def _remote_port(self) -> int:
+        port = self._validate_remote_port(
+            os.environ.get(self.REMOTE_PORT_ENV, ""),
+            env_name=self.REMOTE_PORT_ENV,
+        )
+        offset = self._validate_remote_port_offset(
+            os.environ.get(self.REMOTE_PORT_OFFSET_ENV, "0"),
+            env_name=self.REMOTE_PORT_OFFSET_ENV,
+        )
+        resolved = self._combine_remote_port(port, offset)
         if offset:
             logger.info(
                 "uma_odirect_safetensors remote port offset: base=%d offset=%d "
                 "resolved=%d",
                 port,
                 offset,
-                port + offset,
+                resolved,
             )
-            port += offset
-        return port
+        return resolved
+
+    def _remote_env_from_topology(self) -> _RemoteTopologyEnv | None:
+        path = os.environ.get(self.REMOTE_TOPOLOGY_ENV, "")
+        if not path:
+            return None
+        try:
+            with open(path, encoding="utf-8") as f:
+                manifest = json.load(f)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Failed to read {self.REMOTE_TOPOLOGY_ENV}={path!r}"
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Invalid JSON in {self.REMOTE_TOPOLOGY_ENV}={path!r}"
+            ) from exc
+        if not isinstance(manifest, dict):
+            raise RuntimeError("Remote O_DIRECT topology manifest must be an object")
+        version = manifest.get("version")
+        if isinstance(version, bool) or version != 1:
+            raise RuntimeError(
+                f"Remote O_DIRECT topology manifest version must be 1, got {version!r}"
+            )
+        base_port_raw = manifest.get("base_port")
+        if isinstance(base_port_raw, bool) or not isinstance(base_port_raw, int):
+            raise RuntimeError("Remote O_DIRECT topology base_port must be an integer")
+        base_port = self._validate_remote_port(
+            str(base_port_raw),
+            env_name="topology.base_port",
+        )
+        owners = manifest.get("owners")
+        ranks = manifest.get("ranks")
+        if not isinstance(owners, dict) or not owners:
+            raise RuntimeError("Remote O_DIRECT topology owners must be non-empty")
+        if not isinstance(ranks, dict) or not ranks:
+            raise RuntimeError("Remote O_DIRECT topology ranks must be non-empty")
+        rank = self._remote_rank_key()
+        rank_entry = ranks.get(rank)
+        if not isinstance(rank_entry, dict):
+            raise RuntimeError(
+                f"Remote O_DIRECT topology has no rank entry for {rank!r}"
+            )
+        role = rank_entry.get("role")
+        owner_id = rank_entry.get("owner")
+        if role not in {"owner", "remote"}:
+            raise RuntimeError(
+                f"Remote O_DIRECT topology rank {rank!r} has invalid role {role!r}"
+            )
+        if not isinstance(owner_id, str) or not owner_id:
+            raise RuntimeError(
+                f"Remote O_DIRECT topology rank {rank!r} must name an owner"
+            )
+        owner = owners.get(owner_id)
+        if not isinstance(owner, dict):
+            raise RuntimeError(
+                f"Remote O_DIRECT topology rank {rank!r} references unknown "
+                f"owner {owner_id!r}"
+            )
+        host = owner.get("host")
+        if not isinstance(host, str) or not host:
+            raise RuntimeError(
+                f"Remote O_DIRECT topology owner {owner_id!r} must define host"
+            )
+        raw_offset = owner.get("port_offset", 0)
+        if isinstance(raw_offset, bool) or not isinstance(raw_offset, int):
+            raise RuntimeError(
+                f"Remote O_DIRECT topology owner {owner_id!r} port_offset "
+                "must be an integer"
+            )
+        offset = self._validate_remote_port_offset(
+            str(raw_offset),
+            env_name=f"topology.owners.{owner_id}.port_offset",
+        )
+        return _RemoteTopologyEnv(
+            role=role,
+            host=host,
+            port=self._combine_remote_port(base_port, offset),
+            token=self._remote_auth_token(),
+            timeout=self._remote_timeout(),
+        )
+
+    def _remote_env(self) -> _RemoteTopologyEnv | None:
+        role = os.environ.get(self.REMOTE_ROLE_ENV, "").strip().lower()
+        if role:
+            if role not in {"owner", "remote"}:
+                raise RuntimeError(
+                    f"{self.REMOTE_ROLE_ENV} must be 'owner' or 'remote', "
+                    f"got {role!r}"
+                )
+            return _RemoteTopologyEnv(
+                role=role,
+                host=os.environ.get(self.REMOTE_HOST_ENV, ""),
+                port=self._remote_port(),
+                token=self._remote_auth_token(),
+                timeout=self._remote_timeout(),
+            )
+        topology = self._remote_env_from_topology()
+        if topology is None:
+            return None
+        role = topology.role
+        if role not in {"owner", "remote"}:
+            raise RuntimeError(
+                f"{self.REMOTE_ROLE_ENV} must be 'owner' or 'remote', got {role!r}"
+            )
+        return topology
 
     def _create_weight_source(
         self,
         model_or_path: str,
     ) -> ODirectSafetensorsWeightSource | RemoteODirectSafetensorsWeightSource:
-        role = os.environ.get(self.REMOTE_ROLE_ENV, "").strip().lower()
-        if not role:
+        remote_env = self._remote_env()
+        if remote_env is None:
             return ODirectSafetensorsWeightSource(self, model_or_path)
-        if role not in {"owner", "remote"}:
-            raise RuntimeError(
-                f"{self.REMOTE_ROLE_ENV} must be 'owner' or 'remote', got {role!r}"
-            )
-        token = self._remote_auth_token()
-        timeout = self._remote_timeout()
-        port = self._remote_port()
 
-        if role == "owner":
+        if remote_env.role == "owner":
             source = ODirectSafetensorsWeightSource(self, model_or_path)
-            host = os.environ.get(self.REMOTE_HOST_ENV)
+            host = remote_env.host
             if not host:
                 host = "127.0.0.1"
                 logger.warning(
@@ -3114,9 +3241,9 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
             server = RemoteODirectSafetensorsWeightSourceServer(
                 source,
                 host=host,
-                port=port,
-                auth_token=token,
-                request_timeout=timeout,
+                port=remote_env.port,
+                auth_token=remote_env.token,
+                request_timeout=remote_env.timeout,
                 max_batch_payload_bytes=self._remote_batch_payload_bytes,
             )
             server.start()
@@ -3132,8 +3259,7 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
             self._remote_owner_source = source
             return source
 
-        host = os.environ.get(self.REMOTE_HOST_ENV, "")
-        if not host:
+        if not remote_env.host:
             raise RuntimeError(
                 f"{self.REMOTE_HOST_ENV} is required when "
                 f"{self.REMOTE_ROLE_ENV}=remote"
@@ -3141,15 +3267,15 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
         logger.info(
             "uma_odirect_safetensors using remote owner source: %s:%d "
             "catalog=broadcast",
-            host,
-            port,
+            remote_env.host,
+            remote_env.port,
         )
         return RemoteODirectSafetensorsWeightSource(
             None,
-            host=host,
-            port=port,
-            auth_token=token,
-            request_timeout=timeout,
+            host=remote_env.host,
+            port=remote_env.port,
+            auth_token=remote_env.token,
+            request_timeout=remote_env.timeout,
             max_batch_payload_bytes=self._remote_batch_payload_bytes,
         )
 

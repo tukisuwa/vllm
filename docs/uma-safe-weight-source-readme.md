@@ -39,6 +39,8 @@ Enable it with the fork-specific environment variables:
 - `VLLM_UMA_ODIRECT_REMOTE_PORT`
 - `VLLM_UMA_ODIRECT_REMOTE_PORT_OFFSET` (optional; resolved port is
   `PORT + OFFSET`)
+- `VLLM_UMA_ODIRECT_REMOTE_TOPOLOGY` (optional JSON manifest)
+- `VLLM_UMA_ODIRECT_REMOTE_RANK` (optional explicit manifest rank)
 - `VLLM_UMA_ODIRECT_REMOTE_TOKEN`
 - `VLLM_UMA_ODIRECT_REMOTE_TIMEOUT_SECONDS` (optional)
 
