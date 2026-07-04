@@ -1,9 +1,10 @@
 # 2node UMA O_DIRECT tensor streaming: RemoteWeightSource design
 
 Status: Phase 1 is implemented and validated through real 2-node model-load
-smokes. The path now has persistent TCP connections, batched full/sliced
-reads, batched segmented reads, and an eager owner-capability handshake for
-read-accounting correctness. See the 2026-07-04 entries in
+smokes. The path now has owner-broadcast `TensorCatalog` metadata, persistent
+TCP connections, batched full/sliced reads, batched segmented reads, and an
+eager owner-capability handshake for read-accounting correctness. See the
+2026-07-04 entries in
 `docs/uma-safe-weight-plan-ir-roadmap.md` for measurements and artifacts.
 
 ## Problem recap
@@ -147,18 +148,13 @@ translating them into something vaguer at a process boundary.
 
 ### Metadata (`TensorCatalog`) distribution
 
-Two acceptable options, deliberately left pluggable since this is not the
-safety-critical path (headers are KB-scale, not the multi-GB payload path
-O_DIRECT protects):
-
-1. Every rank reads the safetensors headers itself over whatever shared
-   filesystem is available (NFS is fine here -- only payload bytes are
-   forbidden over NFS, not headers).
-2. The owner rank builds `TensorCatalog` once and serializes it to remote
-   ranks over the same connection used for tensor requests, before any
-   `WeightPlan` construction. This avoids a shared-filesystem dependency
-   entirely and is the better long-term default once the transport exists,
-   but (1) is enough to unblock the first working version.
+The owner rank builds `TensorCatalog` once from local safetensors headers and
+serializes it to remote ranks over the same authenticated TCP connection used
+for tensor requests, before any remote `WeightPlan` construction.  This keeps
+remote ranks from enumerating the model directory or reading safetensors
+headers through NFS/shared storage.  Catalog responses are transported as a
+bounded JSON payload rather than a large frame header, so large MoE catalogs
+do not bypass the frame-size guard.
 
 ### Transport candidates
 
@@ -234,30 +230,30 @@ Completed Phase 1 work:
 1. **Static single-owner TCP transport.** The owner wraps a local
    `ODirectSafetensorsWeightSource`; remote ranks fetch payload bytes through
    a WeightSource-shaped TCP protocol and do not open payload files.
-2. **Persistent connection.** One remote source keeps one TCP connection open
+2. **Catalog broadcast.** Remote ranks fetch owner-serialized `TensorCatalog`
+   metadata over the same authenticated TCP transport and do not need a local
+   or NFS-visible safetensors directory for headers.
+3. **Persistent connection.** One remote source keeps one TCP connection open
    for repeated request/response frames, avoiding per-entry TCP setup.
-3. **Bounded `read_many` batches for full/sliced entries.** Qwen35B remote
+4. **Bounded `read_many` batches for full/sliced entries.** Qwen35B remote
    request count drops from one request per tensor to bounded payload batches.
-4. **Eager owner capability handshake.** Remote scheduling uses the owner's
+5. **Eager owner capability handshake.** Remote scheduling uses the owner's
    actual O_DIRECT chunk/window/alignment values, so expected and actual read
    stats match.
-5. **Bounded segmented batches.** TeleChat2-style `read_segments` entries are
+6. **Bounded segmented batches.** TeleChat2-style `read_segments` entries are
    batched, owner-validated, and grouped by source tensor so local Stage-A
    read-window reuse is preserved across the network path.
-6. **Real 2-node checkpoint smokes.** Qwen35B and TeleChat2-35B have exercised
+7. **Real 2-node checkpoint smokes.** Qwen35B and TeleChat2-35B have exercised
    large full-read and segmented-read payloads over the DGX Spark QSFP link.
 
 Remaining migration steps:
 
-1. **Catalog broadcast.** Replace shared-filesystem header reads with
-   owner-serialized `TensorCatalog` distribution, removing the NFS dependency
-   for metadata as well as payload.
-2. **Rank-aware topology.** Add explicit owner election/port assignment for
+1. **Rank-aware topology.** Add explicit owner election/port assignment for
    launches with more than one owner-capable worker on a node.
-3. **Distributed lifecycle integration.** Ensure owner or remote failure
+2. **Distributed lifecycle integration.** Ensure owner or remote failure
    aborts the peer ranks through vLLM's multiprocess launcher instead of
    relying only on socket timeouts.
-4. **True TP/PP placement validation.** Exercise the remote source in a real
+3. **True TP/PP placement validation.** Exercise the remote source in a real
    distributed topology where ranks own different model shards/layers, not
    just a single remote payload consumer.
 
@@ -287,7 +283,9 @@ The first implementation cut adds:
   `TensorCatalog` and no payload file handles. It implements
   `read_full_cpu`, `read_slice_cpu`, `read_into_cpu`,
   `read_segments_into_cpu`, `empty_cpu`, `empty_cpu_shape`, `skip`,
-  `set_expected_read_summary`, and `stats_snapshot`.
+  `set_expected_read_summary`, and `stats_snapshot`. If no catalog is passed
+  to the constructor, it requests the owner's serialized `TensorCatalog`
+  before capability negotiation and read scheduling.
 - No remote `read_segment_group_into_cpu` method is exposed directly by
   design. B2 handles grouped segmented reads inside `read_many` instead, so
   the executor still sees the same optional-method shape while owner-side
@@ -307,11 +305,11 @@ The first implementation cut adds:
 
 The owner role creates the normal local `ODirectSafetensorsWeightSource`,
 starts the TCP owner server, and keeps the server/source alive on the loader
-instance after local rank load returns so remote ranks can still fetch payload
-bytes. The remote role builds a local `TensorCatalog` from safetensors headers
-only, then uses `RemoteODirectSafetensorsWeightSource` for payload reads. This
-preserves the Phase 1 assumption that shared/NFS metadata reads are acceptable
-while payload bytes must come from the owner transport.
+instance after local rank load returns so remote ranks can still fetch catalog
+metadata and payload bytes. The remote role no longer calls `_prepare_files()`
+or reads safetensors headers from the configured model path; it fetches the
+owner catalog first, then uses `RemoteODirectSafetensorsWeightSource` for
+payload reads.
 
 The env wiring is still a single-owner-process contract. A launch that starts
 multiple owner-role worker processes on the same node with the same host/port

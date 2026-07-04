@@ -891,11 +891,15 @@ def test_uma_odirect_loader_env_wires_owner_and_remote_sources(
             )
         )
         monkeypatch.setenv(L.UmaODirectSafetensorsModelLoader.REMOTE_ROLE_ENV, "remote")
-        remote_source = remote_loader._create_weight_source(str(tmp_path))
+        remote_source = remote_loader._create_weight_source(str(tmp_path / "missing"))
         assert isinstance(remote_source, L.RemoteODirectSafetensorsWeightSource)
+        assert remote_source.catalog.names() == owner_source.catalog.names()
         assert remote_source.read_many_max_payload_bytes() == 2 * 1024 * 1024
         loaded = _remote_read_or_skip(lambda: remote_source.read_full_cpu(name))
         assert torch.equal(loaded, tensor)
+        remote_loader.download_model(
+            types.SimpleNamespace(model=str(tmp_path / "missing"))
+        )
     finally:
         if owner_loader._remote_owner_server is not None:
             owner_loader._remote_owner_server.close()

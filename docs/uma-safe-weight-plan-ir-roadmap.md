@@ -2533,3 +2533,32 @@ cache growth.  The high model-load time relative to local O_DIRECT is expected
 for a 66 GiB payload streamed through the synchronous TCP transport; B2's goal
 was functional coverage and read-accounting correctness for segment-family
 models, not full distributed loading.
+
+### 2026-07-05 RemoteWeightSource catalog broadcast
+
+The remote O_DIRECT path no longer requires remote ranks to enumerate the
+model directory or read safetensors headers through NFS/shared storage.  The
+owner now serves an authenticated `catalog` RPC that returns a serialized
+`TensorCatalog` as a bounded frame payload (`256 MiB` cap), and
+`RemoteODirectSafetensorsWeightSource` fetches it during construction before
+the eager capability handshake and any read scheduling.
+
+Implementation details:
+
+- catalog serialization uses the same wire dtype names as tensor payloads and
+  validates shape/dtype/size consistency when reconstructing `TensorMeta`
+  records on the remote rank;
+- catalog bytes travel in the frame payload, not the JSON header, so large MoE
+  catalogs do not bypass the existing header-size guard;
+- remote loader role skips local `_prepare_files()` in both
+  `_create_weight_source()` and `download_model()`, so a remote process can
+  start with a placeholder/nonexistent model path as long as the owner is
+  already listening;
+- the existing loopback env-wiring test now uses a missing remote path and
+  verifies that the remote catalog names match the owner catalog before
+  reading payload bytes.
+
+This removes the remaining NFS dependency for metadata.  Remaining 2-node
+work is now rank/topology oriented: owner election and port assignment for
+multi-worker launches, failure propagation through vLLM's distributed
+lifecycle, and true TP/PP placement validation.

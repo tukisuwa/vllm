@@ -63,6 +63,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 logger = init_logger(__name__)
 
 _REMOTE_MAX_HEADER_BYTES = 4 * 1024 * 1024
+_REMOTE_MAX_CATALOG_BYTES = 256 * 1024 * 1024
 _REMOTE_DEFAULT_MAX_BATCH_PAYLOAD_BYTES = 128 * 1024 * 1024
 _REMOTE_MAX_BATCH_ITEMS = 16_384
 
@@ -305,6 +306,84 @@ def _dtype_from_wire(name: str) -> torch.dtype:
         raise RuntimeError(f"Unsupported remote tensor dtype {name!r}") from exc
 
 
+def _catalog_to_wire(catalog: TensorCatalog) -> bytes:
+    records = [
+        {
+            "file_path": record.file_path,
+            "name": record.name,
+            "dtype": _dtype_to_wire(record.dtype),
+            "shape": tuple(int(dim) for dim in record.shape),
+            "offset": int(record.offset),
+            "size": int(record.size),
+        }
+        for record in catalog.records()
+    ]
+    return json.dumps(
+        records,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _catalog_from_wire(payload: bytes) -> TensorCatalog:
+    try:
+        raw = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "Remote O_DIRECT owner returned invalid catalog JSON"
+        ) from exc
+    if not isinstance(raw, list):
+        raise RuntimeError("Remote O_DIRECT owner catalog must be a list")
+    records: list[TensorMeta] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise RuntimeError(f"Invalid remote catalog record: {item!r}")
+        file_path = item.get("file_path")
+        name = item.get("name")
+        dtype_name = item.get("dtype")
+        shape = item.get("shape")
+        offset = item.get("offset")
+        size = item.get("size")
+        if not isinstance(file_path, str) or not file_path:
+            raise RuntimeError(f"Invalid remote catalog file_path: {item!r}")
+        if not isinstance(name, str) or not name:
+            raise RuntimeError(f"Invalid remote catalog tensor name: {item!r}")
+        if not isinstance(dtype_name, str):
+            raise RuntimeError(f"Invalid remote catalog dtype: {item!r}")
+        if (
+            not isinstance(shape, (list, tuple))
+            or not all(isinstance(dim, int) and dim >= 0 for dim in shape)
+        ):
+            raise RuntimeError(f"Invalid remote catalog shape: {item!r}")
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or offset < 0
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+        ):
+            raise RuntimeError(f"Invalid remote catalog byte range: {item!r}")
+        dtype = _dtype_from_wire(dtype_name)
+        expected_size = math.prod(tuple(shape)) * _DTYPE_NBYTES[dtype]
+        if expected_size != size:
+            raise RuntimeError(
+                "Remote catalog tensor size mismatch: "
+                f"{name} has size={size}, shape={tuple(shape)}, dtype={dtype_name}"
+            )
+        records.append(
+            TensorMeta(
+                file_path=file_path,
+                name=name,
+                dtype=dtype,
+                shape=tuple(shape),
+                offset=offset,
+                size=size,
+            )
+        )
+    return TensorCatalog(records)
+
+
 def _tensor_to_wire(tensor: torch.Tensor) -> dict[str, object]:
     if tensor.device.type != "cpu":
         raise RuntimeError(
@@ -356,6 +435,12 @@ def _tensor_from_wire(encoded: dict[str, object]) -> torch.Tensor:
 def _split_tensor_payload(message: object) -> tuple[object, bytes]:
     if not isinstance(message, dict):
         return message, b""
+    catalog_payload = message.get("catalog_payload")
+    if isinstance(catalog_payload, bytes):
+        header = dict(message)
+        header.pop("catalog_payload")
+        header["catalog_payload_size"] = len(catalog_payload)
+        return header, catalog_payload
     tensors = message.get("tensors")
     if isinstance(tensors, (list, tuple)):
         header = dict(message)
@@ -393,6 +478,17 @@ def _split_tensor_payload(message: object) -> tuple[object, bytes]:
 
 def _merge_tensor_payload(message: object, payload: bytes) -> object:
     if not isinstance(message, dict):
+        return message
+    if "catalog_payload_size" in message:
+        expected = message.get("catalog_payload_size")
+        if not isinstance(expected, int) or expected != len(payload):
+            raise RuntimeError(
+                "Remote weight source catalog payload size mismatch: "
+                f"header={expected!r}, actual={len(payload)}"
+            )
+        message = dict(message)
+        message.pop("catalog_payload_size", None)
+        message["catalog_payload"] = payload
         return message
     tensors = message.get("tensors")
     if isinstance(tensors, list):
@@ -1770,6 +1866,19 @@ class RemoteODirectSafetensorsWeightSourceServer:
                     "max_batch_items": int(_REMOTE_MAX_BATCH_ITEMS),
                 },
             }
+        if op == "catalog":
+            payload = _catalog_to_wire(self.source.catalog)
+            if len(payload) > _REMOTE_MAX_CATALOG_BYTES:
+                raise RuntimeError(
+                    "Remote O_DIRECT catalog payload exceeds limit: "
+                    f"{len(payload)} > {_REMOTE_MAX_CATALOG_BYTES}"
+                )
+            return {
+                "ok": True,
+                "catalog_payload": payload,
+                "record_count": len(self.source.catalog.records()),
+                "total_bytes": int(self.source.catalog.total_bytes()),
+            }
         if op == "read_full":
             name = self._request_name(request)
             return {"ok": True, "tensor": _tensor_to_wire(self.source.read_full_cpu(name))}
@@ -1949,13 +2058,15 @@ class RemoteODirectSafetensorsWeightSource:
 
     The remote source owns only metadata and a TCP endpoint.  It never opens a
     safetensors payload file; all payload materialization comes from the owner
-    server.  ``read_segment_group_into_cpu`` is deliberately omitted in Phase 1
-    so the executor falls back to per-entry ``read_segments_into_cpu``.
+    server.  If metadata is not provided, it fetches the owner catalog over the
+    same authenticated transport.  ``read_segment_group_into_cpu`` is
+    deliberately omitted as a direct method; B2 preserves grouped segmented
+    reads inside ``read_many_cpu`` instead.
     """
 
     def __init__(
         self,
-        catalog: TensorCatalog,
+        catalog: TensorCatalog | None = None,
         *,
         host: str,
         port: int,
@@ -1965,9 +2076,6 @@ class RemoteODirectSafetensorsWeightSource:
     ) -> None:
         if not auth_token:
             raise ValueError("Remote O_DIRECT weight source requires an auth token")
-        self.catalog = catalog
-        records = catalog.records()
-        self._max_payload_bytes = max((record.size for record in records), default=0)
         if max_batch_payload_bytes <= 0:
             raise ValueError("Remote O_DIRECT batch payload limit must be positive")
         self._max_batch_payload_bytes = max_batch_payload_bytes
@@ -1979,6 +2087,8 @@ class RemoteODirectSafetensorsWeightSource:
         self._expected_read_summary: ReadScheduleSummary | None = None
         self._sock: socket.socket | None = None
         self._sock_lock = threading.Lock()
+        if catalog is None:
+            catalog = self._request_catalog()
         capability = self._request_capability()
         self._chunk_size = capability["chunk_size"]
         self._window_size = capability["window_size"]
@@ -1989,6 +2099,14 @@ class RemoteODirectSafetensorsWeightSource:
             capability["max_batch_payload_bytes"],
         )
         self._max_batch_items = capability["max_batch_items"]
+        self.catalog = catalog
+        records = catalog.records()
+        self._max_payload_bytes = max((record.size for record in records), default=0)
+        logger.info(
+            "uma_odirect_safetensors remote source catalog: tensors=%d payload=%s",
+            len(records),
+            _format_gib(catalog.total_bytes()),
+        )
 
     def read_full_cpu(self, name: str) -> torch.Tensor:
         record = self.catalog.get(name)
@@ -2187,6 +2305,37 @@ class RemoteODirectSafetensorsWeightSource:
             "max_batch_payload_bytes": max_batch_payload_bytes,
             "max_batch_items": max_batch_items,
         }
+
+    def _request_catalog(self) -> TensorCatalog:
+        response = self._request(
+            {"op": "catalog"},
+            max_payload_bytes=_REMOTE_MAX_CATALOG_BYTES,
+        )
+        payload = response.get("catalog_payload")
+        if not isinstance(payload, bytes):
+            raise RuntimeError("Remote O_DIRECT owner returned no catalog payload")
+        catalog = _catalog_from_wire(payload)
+        record_count = response.get("record_count")
+        total_bytes = response.get("total_bytes")
+        if (
+            isinstance(record_count, bool)
+            or not isinstance(record_count, int)
+            or record_count != len(catalog.records())
+        ):
+            raise RuntimeError(
+                "Remote O_DIRECT owner catalog record count mismatch: "
+                f"header={record_count!r}, actual={len(catalog.records())}"
+            )
+        if (
+            isinstance(total_bytes, bool)
+            or not isinstance(total_bytes, int)
+            or total_bytes != catalog.total_bytes()
+        ):
+            raise RuntimeError(
+                "Remote O_DIRECT owner catalog payload size mismatch: "
+                f"header={total_bytes!r}, actual={catalog.total_bytes()}"
+            )
+        return catalog
 
     def read_into_cpu(
         self,
@@ -2961,19 +3110,14 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
                 f"{self.REMOTE_HOST_ENV} is required when "
                 f"{self.REMOTE_ROLE_ENV}=remote"
             )
-        files = self._prepare_files(model_or_path)
-        catalog = self._build_catalog(files)
         logger.info(
             "uma_odirect_safetensors using remote owner source: %s:%d "
-            "files=%d tensors=%d payload=%s",
+            "catalog=broadcast",
             host,
             port,
-            len(files),
-            len(catalog.records()),
-            _format_gib(catalog.total_bytes()),
         )
         return RemoteODirectSafetensorsWeightSource(
-            catalog,
+            None,
             host=host,
             port=port,
             auth_token=token,
@@ -2989,6 +3133,13 @@ class UmaODirectSafetensorsModelLoader(BaseModelLoader):
         yield from source.iter_full_tensors()
 
     def download_model(self, model_config: ModelConfig) -> None:
+        role = os.environ.get(self.REMOTE_ROLE_ENV, "").strip().lower()
+        if role == "remote":
+            logger.info(
+                "uma_odirect_safetensors remote role skips local safetensors "
+                "payload/header validation; catalog will be fetched from owner"
+            )
+            return
         self._prepare_files(model_config.model)
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:

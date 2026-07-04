@@ -29,7 +29,7 @@ primary safe path for this fork is `uma_odirect_safetensors`.
 This fork also has a 2-node remote payload path for the DGX Spark-style case
 where one node owns the checkpoint on local disk and a peer would otherwise
 read payload bytes over NFS.  The owner opens safetensors payload files with
-O_DIRECT; the remote rank reads only metadata locally and receives tensor
+O_DIRECT; the remote rank receives both `TensorCatalog` metadata and tensor
 payload bytes over a narrow TCP `WeightSource` protocol.
 
 Enable it with the fork-specific environment variables:
@@ -47,8 +47,8 @@ The remote path is deliberately limited:
 - ownership is static and manually configured;
 - one owner process binds one TCP port, so multi-owner same-node launches need
   explicit port/topology management outside this first implementation;
-- remote ranks still read safetensors headers through the configured model
-  path; catalog broadcast is future work;
+- remote ranks depend on the owner for catalog metadata and payload bytes, so
+  the owner must be listening before remote load starts;
 - the TCP token is a private-network guard, not a replacement for a trusted
   network boundary;
 - owner reads are serialized through one O_DIRECT source to preserve the
@@ -57,9 +57,11 @@ The remote path is deliberately limited:
 The remote path now uses a persistent connection, batched full/sliced reads,
 batched segmented reads, and an eager owner capability handshake so expected
 read accounting is computed with the owner's O_DIRECT chunk/window/alignment
-settings.  `remote_batch_payload_mib` in loader extra config controls the
-maximum response payload per remote batch (default `128`; TeleChat2-35B used
-`256` in validation so K/V segment pairs could share a batch).
+settings.  Catalog metadata is also broadcast from the owner, so the remote
+rank no longer needs to enumerate local/shared safetensors headers.
+`remote_batch_payload_mib` in loader extra config controls the maximum
+response payload per remote batch (default `128`; TeleChat2-35B used `256` in
+validation so K/V segment pairs could share a batch).
 
 ## Safety Model
 
@@ -133,9 +135,9 @@ As of 2026-07-04:
 
 ## Known Gaps
 
-The 2-node remote path has been validated as a payload transport, not as a
-complete distributed serving topology.  Pipeline-parallel layer distribution,
-rank-aware owner election, multi-owner port assignment, catalog broadcast, and
+The 2-node remote path has been validated as a catalog/payload transport, not
+as a complete distributed serving topology.  Pipeline-parallel layer
+distribution, rank-aware owner election, multi-owner port assignment, and
 cross-rank failure propagation are still explicit follow-up work.
 
 The tiny fixtures validate byte boundaries and O_DIRECT execution, and the
