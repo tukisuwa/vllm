@@ -50,22 +50,36 @@ def _make_source(monkeypatch):
 
 
 def _write_single_tensor_safetensors(path, name: str, tensor: torch.Tensor) -> None:
-    payload = tensor.contiguous().numpy().tobytes()
-    metadata = {
-        name: {
+    _write_tensors_safetensors(path, {name: tensor})
+
+
+def _write_tensors_safetensors(path, tensors: dict[str, torch.Tensor]) -> None:
+    metadata = {}
+    payloads = []
+    offset = 0
+    for name, tensor in tensors.items():
+        payload = tensor.contiguous().numpy().tobytes()
+        metadata[name] = {
             "dtype": "F32",
             "shape": list(tensor.shape),
-            "data_offsets": [0, len(payload)],
-        },
-    }
+            "data_offsets": [offset, offset + len(payload)],
+        }
+        payloads.append(payload)
+        offset += len(payload)
     metadata_raw = json.dumps(metadata).encode("utf-8")
-    path.write_bytes(len(metadata_raw).to_bytes(8, "little") + metadata_raw + payload)
+    path.write_bytes(
+        len(metadata_raw).to_bytes(8, "little") + metadata_raw + b"".join(payloads)
+    )
 
 
 def _real_source(tmp_path, monkeypatch, name: str, tensor: torch.Tensor):
+    return _real_source_many(tmp_path, monkeypatch, {name: tensor})
+
+
+def _real_source_many(tmp_path, monkeypatch, tensors: dict[str, torch.Tensor]):
     if not hasattr(os, "O_DIRECT"):
         pytest.skip("O_DIRECT is not available on this platform")
-    _write_single_tensor_safetensors(tmp_path / "model.safetensors", name, tensor)
+    _write_tensors_safetensors(tmp_path / "model.safetensors", tensors)
     loader = L.UmaODirectSafetensorsModelLoader(
         LoadConfig(
             load_format="uma_odirect_safetensors",
@@ -324,6 +338,82 @@ def test_remote_odirect_weight_source_loopback_reads_real_odirect_payload(
         assert server.connections_accepted == 1
 
 
+def test_remote_odirect_read_many_batches_real_odirect_payload(
+    tmp_path,
+    monkeypatch,
+):
+    tensors = {
+        "a.weight": torch.arange(16, dtype=torch.float32).reshape(4, 4),
+        "b.weight": torch.arange(32, dtype=torch.float32).reshape(8, 4),
+        "c.weight": torch.arange(8, dtype=torch.float32),
+    }
+    owner_source = _real_source_many(tmp_path, monkeypatch, tensors)
+    token = "read-many-token"
+
+    with L.RemoteODirectSafetensorsWeightSourceServer(
+        owner_source,
+        auth_token=token,
+    ) as server:
+        host, port = server.address
+        remote = L.RemoteODirectSafetensorsWeightSource(
+            owner_source.catalog,
+            host=host,
+            port=port,
+            auth_token=token,
+        )
+
+        loaded = _remote_read_or_skip(
+            lambda: remote.read_many_cpu(
+                (
+                    L._RemoteReadRequest("a.weight"),
+                    L._RemoteReadRequest("b.weight", (slice(2, 5), slice(None))),
+                    L._RemoteReadRequest("c.weight"),
+                )
+            )
+        )
+
+    assert len(loaded) == 3
+    assert torch.equal(loaded[0], tensors["a.weight"])
+    assert torch.equal(loaded[1], tensors["b.weight"][2:5])
+    assert torch.equal(loaded[2], tensors["c.weight"])
+    stats = remote.stats_snapshot()
+    assert stats["batch_requests"] == 1
+    assert stats["batch_tensors"] == 3
+    assert stats["tensors_read"] == 3
+    assert stats["tensors_read_full"] == 2
+    assert stats["tensors_read_sliced"] == 1
+    assert server.connections_accepted == 1
+
+
+def test_remote_odirect_read_many_owner_rejects_oversized_batch(
+    tmp_path,
+    monkeypatch,
+):
+    name = "weight"
+    owner_source = _real_source(
+        tmp_path,
+        monkeypatch,
+        name,
+        torch.arange(16, dtype=torch.float32),
+    )
+    with L.RemoteODirectSafetensorsWeightSourceServer(
+        owner_source,
+        auth_token="owner-token",
+        max_batch_payload_bytes=8,
+    ) as server:
+        host, port = server.address
+        remote = L.RemoteODirectSafetensorsWeightSource(
+            owner_source.catalog,
+            host=host,
+            port=port,
+            auth_token="owner-token",
+        )
+        with pytest.raises(RuntimeError, match="payload exceeds limit"):
+            remote.read_many_cpu((L._RemoteReadRequest(name),))
+
+    assert owner_source.stats_snapshot()["tensors_read"] == 0
+
+
 def test_remote_odirect_weight_source_rejects_bad_auth(tmp_path, monkeypatch):
     name = "weight"
     owner_source = _real_source(
@@ -481,6 +571,53 @@ def test_execute_weight_plan_uses_remote_per_entry_segment_fallback(
         torch.stack([source_tensor[1], source_tensor[6]]),
     )
     assert remote.stats_snapshot()["tensors_read_sliced"] == 1
+
+
+def test_execute_weight_plan_uses_remote_read_many_for_full_reads(
+    tmp_path,
+    monkeypatch,
+):
+    tensors = {
+        "a.weight": torch.arange(4, dtype=torch.float32),
+        "b.weight": torch.arange(4, 8, dtype=torch.float32),
+        "c.weight": torch.arange(8, 12, dtype=torch.float32),
+    }
+    owner_source = _real_source_many(tmp_path, monkeypatch, tensors)
+
+    with L.RemoteODirectSafetensorsWeightSourceServer(
+        owner_source,
+        auth_token="owner-token",
+    ) as server:
+        host, port = server.address
+        remote = L.RemoteODirectSafetensorsWeightSource(
+            owner_source.catalog,
+            host=host,
+            port=port,
+            auth_token="owner-token",
+        )
+        model = torch.nn.Module()
+        model.a = torch.nn.Parameter(torch.empty(4))
+        model.b = torch.nn.Parameter(torch.empty(4))
+        model.c = torch.nn.Parameter(torch.empty(4))
+        plan = L.WeightPlan(
+            (
+                L.WeightPlanEntry("a.weight", "a"),
+                L.WeightPlanEntry("b.weight", "b"),
+                L.WeightPlanEntry("c.weight", "c"),
+            )
+        )
+
+        loaded = _remote_read_or_skip(lambda: L.execute_weight_plan(model, remote, plan))
+
+    assert loaded == {"a", "b", "c"}
+    assert torch.equal(model.a.detach(), tensors["a.weight"])
+    assert torch.equal(model.b.detach(), tensors["b.weight"])
+    assert torch.equal(model.c.detach(), tensors["c.weight"])
+    stats = remote.stats_snapshot()
+    assert stats["batch_requests"] == 1
+    assert stats["batch_tensors"] == 3
+    assert stats["tensors_read"] == 3
+    assert server.connections_accepted == 1
 
 
 def test_uma_odirect_loader_env_wires_owner_and_remote_sources(

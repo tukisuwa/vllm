@@ -63,6 +63,8 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 logger = init_logger(__name__)
 
 _REMOTE_MAX_HEADER_BYTES = 4 * 1024 * 1024
+_REMOTE_DEFAULT_MAX_BATCH_PAYLOAD_BYTES = 128 * 1024 * 1024
+_REMOTE_MAX_BATCH_ITEMS = 16_384
 
 
 __all__ = [
@@ -188,6 +190,17 @@ def _source_tensor_shape(
         return strided[4]
 
 
+def _source_tensor_payload_bytes(
+    record: TensorMeta,
+    source_slices: tuple[slice | int, ...] | None,
+) -> int:
+    if source_slices is None:
+        return record.size
+    return math.prod(_source_tensor_shape(record, source_slices)) * _DTYPE_NBYTES[
+        record.dtype
+    ]
+
+
 def _encode_slice_selection(
     selection: tuple[slice | int, ...] | None,
 ) -> tuple[dict[str, int | None | str], ...] | None:
@@ -305,6 +318,12 @@ def _tensor_to_wire(tensor: torch.Tensor) -> dict[str, object]:
     }
 
 
+@dataclass(frozen=True)
+class _RemoteReadRequest:
+    checkpoint_name: str
+    source_slices: tuple[slice | int, ...] | None = None
+
+
 def _tensor_from_wire(encoded: dict[str, object]) -> torch.Tensor:
     dtype_name = encoded.get("dtype")
     shape = encoded.get("shape")
@@ -335,6 +354,27 @@ def _tensor_from_wire(encoded: dict[str, object]) -> torch.Tensor:
 def _split_tensor_payload(message: object) -> tuple[object, bytes]:
     if not isinstance(message, dict):
         return message, b""
+    tensors = message.get("tensors")
+    if isinstance(tensors, (list, tuple)):
+        header = dict(message)
+        tensor_headers: list[dict[str, object]] = []
+        payload_parts: list[bytes] = []
+        payload_offset = 0
+        for tensor in tensors:
+            if not isinstance(tensor, dict):
+                return message, b""
+            payload = tensor.get("payload")
+            if not isinstance(payload, bytes):
+                return message, b""
+            tensor_header = dict(tensor)
+            tensor_header.pop("payload")
+            tensor_header["payload_offset"] = payload_offset
+            tensor_header["payload_size"] = len(payload)
+            tensor_headers.append(tensor_header)
+            payload_parts.append(payload)
+            payload_offset += len(payload)
+        header["tensors"] = tensor_headers
+        return header, b"".join(payload_parts)
     tensor = message.get("tensor")
     if not isinstance(tensor, dict):
         return message, b""
@@ -350,7 +390,31 @@ def _split_tensor_payload(message: object) -> tuple[object, bytes]:
 
 
 def _merge_tensor_payload(message: object, payload: bytes) -> object:
-    if not isinstance(message, dict) or not payload:
+    if not isinstance(message, dict):
+        return message
+    tensors = message.get("tensors")
+    if isinstance(tensors, list):
+        message = dict(message)
+        decoded: list[dict[str, object]] = []
+        for tensor in tensors:
+            if not isinstance(tensor, dict):
+                raise RuntimeError("Remote weight source frame carried invalid tensors")
+            offset = tensor.get("payload_offset")
+            size = tensor.get("payload_size")
+            if not isinstance(offset, int) or not isinstance(size, int):
+                raise RuntimeError("Remote weight source tensor payload metadata invalid")
+            if offset < 0 or size < 0 or offset + size > len(payload):
+                raise RuntimeError(
+                    "Remote weight source tensor payload range is invalid"
+                )
+            tensor = dict(tensor)
+            tensor.pop("payload_offset", None)
+            tensor.pop("payload_size", None)
+            tensor["payload"] = payload[offset : offset + size]
+            decoded.append(tensor)
+        message["tensors"] = decoded
+        return message
+    if not payload:
         return message
     tensor = message.get("tensor")
     if not isinstance(tensor, dict):
@@ -730,6 +794,23 @@ def execute_weight_plan(
         )
         loaded.add(entry.target_name)
 
+    read_many_cpu = getattr(source, "read_many_cpu", None)
+    read_many_max_payload_bytes = getattr(source, "read_many_max_payload_bytes", None)
+    if callable(read_many_cpu) and callable(read_many_max_payload_bytes):
+        batch_payload_cap = int(read_many_max_payload_bytes())
+    else:
+        batch_payload_cap = 0
+
+    def batchable_entry_payload(prepared) -> int | None:
+        entry, _param, _weight_loader, record = prepared
+        if (
+            entry.read_segments is not None
+            or entry.read_into_cpu
+            or entry.target_slices is not None
+        ):
+            return None
+        return _source_tensor_payload_bytes(record, entry.source_slices)
+
     index = 0
     while index < len(scheduled_entries):
         entry = scheduled_entries[index]
@@ -777,6 +858,51 @@ def execute_weight_plan(
                     load_entry_tensor(group_prepared, tensor)
                 index = next_index
                 continue
+
+        if callable(read_many_cpu) and batch_payload_cap > 0:
+            first_payload = batchable_entry_payload(prepared)
+            if first_payload is not None and first_payload <= batch_payload_cap:
+                group = [prepared]
+                total_payload = first_payload
+                next_index = index + 1
+                while next_index < len(scheduled_entries):
+                    next_entry = scheduled_entries[next_index]
+                    if (
+                        not next_entry.required
+                        or next_entry.ignore_missing
+                        or next_entry.read_segments is not None
+                        or next_entry.read_into_cpu
+                        or next_entry.target_slices is not None
+                    ):
+                        break
+                    next_prepared = prepare_entry(next_entry)
+                    next_payload = batchable_entry_payload(next_prepared)
+                    if next_payload is None or next_payload > batch_payload_cap:
+                        break
+                    if total_payload + next_payload > batch_payload_cap:
+                        break
+                    group.append(next_prepared)
+                    total_payload += next_payload
+                    next_index += 1
+
+                if len(group) > 1:
+                    requests = tuple(
+                        _RemoteReadRequest(
+                            group_entry.checkpoint_name,
+                            group_entry.source_slices,
+                        )
+                        for group_entry, _param, _weight_loader, _record in group
+                    )
+                    tensors = read_many_cpu(requests)
+                    if len(tensors) != len(group):
+                        raise RuntimeError(
+                            "WeightSource.read_many_cpu returned an unexpected "
+                            f"tensor count: got={len(tensors)}, expected={len(group)}"
+                        )
+                    for group_prepared, tensor in zip(group, tensors):
+                        load_entry_tensor(group_prepared, tensor)
+                    index = next_index
+                    continue
 
         tensor = read_entry_tensor(prepared)
         load_entry_tensor(prepared, tensor)
@@ -1456,6 +1582,8 @@ class _RemoteReadStats:
     tensors_read_full: int = 0
     tensors_read_sliced: int = 0
     tensors_skipped: int = 0
+    batch_requests: int = 0
+    batch_tensors: int = 0
     bytes_stream_recv: int = 0
     bytes_tensor_payload: int = 0
     bytes_full_tensor_payload: int = 0
@@ -1470,6 +1598,8 @@ class _RemoteReadStats:
             "tensors_read_full": self.tensors_read_full,
             "tensors_read_sliced": self.tensors_read_sliced,
             "tensors_skipped": self.tensors_skipped,
+            "batch_requests": self.batch_requests,
+            "batch_tensors": self.batch_tensors,
             "bytes_stream_recv": self.bytes_stream_recv,
             "remote_stream_bytes_recv": self.bytes_stream_recv,
             "bytes_tensor_payload": self.bytes_tensor_payload,
@@ -1498,12 +1628,16 @@ class RemoteODirectSafetensorsWeightSourceServer:
         port: int = 0,
         auth_token: str,
         request_timeout: float = 30.0,
+        max_batch_payload_bytes: int = _REMOTE_DEFAULT_MAX_BATCH_PAYLOAD_BYTES,
     ) -> None:
         if not auth_token:
             raise ValueError("Remote O_DIRECT weight source requires an auth token")
         self.source = source
         self.auth_token = auth_token
         self.request_timeout = request_timeout
+        if max_batch_payload_bytes <= 0:
+            raise ValueError("Remote O_DIRECT batch payload limit must be positive")
+        self.max_batch_payload_bytes = max_batch_payload_bytes
         self._source_lock = threading.Lock()
         self._connection_lock = threading.Lock()
         self._connections_accepted = 0
@@ -1610,6 +1744,42 @@ class RemoteODirectSafetensorsWeightSourceServer:
                 "ok": True,
                 "tensor": _tensor_to_wire(self.source.read_slice_cpu(name, slices)),
             }
+        if op == "read_many":
+            items = request.get("items")
+            if not isinstance(items, list) or not items:
+                raise RuntimeError("read_many request must carry non-empty items")
+            if len(items) > _REMOTE_MAX_BATCH_ITEMS:
+                raise RuntimeError(
+                    "read_many request item count exceeds limit: "
+                    f"{len(items)} > {_REMOTE_MAX_BATCH_ITEMS}"
+                )
+            decoded: list[_RemoteReadRequest] = []
+            total_payload = 0
+            for item in items:
+                if not isinstance(item, dict):
+                    raise RuntimeError(f"Invalid read_many item: {item!r}")
+                name = self._request_name(item)
+                slices = _decode_slice_selection(  # type: ignore[arg-type]
+                    item.get("source_slices")
+                )
+                record = self.source.catalog.get(name)
+                total_payload += _source_tensor_payload_bytes(record, slices)
+                if total_payload > self.max_batch_payload_bytes:
+                    raise RuntimeError(
+                        "read_many request payload exceeds limit: "
+                        f"{total_payload} > {self.max_batch_payload_bytes}"
+                    )
+                decoded.append(_RemoteReadRequest(name, slices))
+            tensors = [
+                self.source.read_full_cpu(item.checkpoint_name)
+                if item.source_slices is None
+                else self.source.read_slice_cpu(item.checkpoint_name, item.source_slices)
+                for item in decoded
+            ]
+            return {
+                "ok": True,
+                "tensors": [_tensor_to_wire(tensor) for tensor in tensors],
+            }
         if op == "read_segments":
             name = self._request_name(request)
             shape = request.get("staging_shape")
@@ -1670,12 +1840,16 @@ class RemoteODirectSafetensorsWeightSource:
         port: int,
         auth_token: str,
         request_timeout: float = 30.0,
+        max_batch_payload_bytes: int = _REMOTE_DEFAULT_MAX_BATCH_PAYLOAD_BYTES,
     ) -> None:
         if not auth_token:
             raise ValueError("Remote O_DIRECT weight source requires an auth token")
         self.catalog = catalog
         records = catalog.records()
         self._max_payload_bytes = max((record.size for record in records), default=0)
+        if max_batch_payload_bytes <= 0:
+            raise ValueError("Remote O_DIRECT batch payload limit must be positive")
+        self._max_batch_payload_bytes = max_batch_payload_bytes
         self._host = host
         self._port = port
         self._auth_token = auth_token
@@ -1733,6 +1907,81 @@ class RemoteODirectSafetensorsWeightSource:
             )
         self._record_tensor_read(tensor.numel() * tensor.element_size(), sliced=True)
         return tensor
+
+    def read_many_max_payload_bytes(self) -> int:
+        return self._max_batch_payload_bytes
+
+    def read_many_cpu(
+        self,
+        requests: tuple[_RemoteReadRequest, ...],
+    ) -> tuple[torch.Tensor, ...]:
+        if not requests:
+            return ()
+        if len(requests) > _REMOTE_MAX_BATCH_ITEMS:
+            raise RuntimeError(
+                "Remote read_many_cpu request item count exceeds limit: "
+                f"{len(requests)} > {_REMOTE_MAX_BATCH_ITEMS}"
+            )
+        items: list[dict[str, object]] = []
+        expected_payloads: list[int] = []
+        expected_shapes: list[list[int]] = []
+        total_payload = 0
+        for request in requests:
+            record = self.catalog.get(request.checkpoint_name)
+            expected_shape = _source_tensor_shape(record, request.source_slices)
+            expected_payload = math.prod(expected_shape) * _DTYPE_NBYTES[record.dtype]
+            total_payload += expected_payload
+            if total_payload > self._max_batch_payload_bytes:
+                raise RuntimeError(
+                    "Remote read_many_cpu payload exceeds limit: "
+                    f"{total_payload} > {self._max_batch_payload_bytes}"
+                )
+            items.append(
+                {
+                    "name": request.checkpoint_name,
+                    "source_slices": _encode_slice_selection(request.source_slices),
+                }
+            )
+            expected_shapes.append(expected_shape)
+            expected_payloads.append(expected_payload)
+
+        t0 = time.perf_counter()
+        response = self._request(
+            {"op": "read_many", "items": items},
+            max_payload_bytes=total_payload,
+        )
+        self._stats.time_read += time.perf_counter() - t0
+        encoded = response.get("tensors")
+        if not isinstance(encoded, list):
+            raise RuntimeError("Remote O_DIRECT owner returned no tensor batch")
+        if len(encoded) != len(requests):
+            raise RuntimeError(
+                "Remote O_DIRECT owner returned unexpected tensor batch size: "
+                f"got={len(encoded)}, expected={len(requests)}"
+            )
+        tensors: list[torch.Tensor] = []
+        for request, item, expected_shape, expected_payload in zip(
+            requests,
+            encoded,
+            expected_shapes,
+            expected_payloads,
+        ):
+            if not isinstance(item, dict):
+                raise RuntimeError("Remote O_DIRECT owner returned invalid tensor batch")
+            tensor = _tensor_from_wire(item)
+            if list(tensor.shape) != expected_shape:
+                raise RuntimeError(
+                    "Remote read_many_cpu shape mismatch: "
+                    f"got={list(tensor.shape)}, expected={expected_shape}"
+                )
+            tensors.append(tensor)
+            self._record_tensor_read(
+                expected_payload,
+                sliced=request.source_slices is not None,
+            )
+        self._stats.batch_requests += 1
+        self._stats.batch_tensors += len(tensors)
+        return tuple(tensors)
 
     def read_into_cpu(
         self,
@@ -1857,13 +2106,16 @@ class RemoteODirectSafetensorsWeightSource:
         logger.info(
             "uma_odirect_safetensors remote source stats (%s): "
             "tensors_read=%d tensors_read_full=%d tensors_read_sliced=%d "
-            "tensors_skipped=%d stream_recv=%s tensor_payload=%s "
+            "tensors_skipped=%d batch_requests=%d batch_tensors=%d "
+            "stream_recv=%s tensor_payload=%s "
             "full_payload=%s sliced_payload=%s skipped_payload=%s",
             label,
             stats["tensors_read"],
             stats["tensors_read_full"],
             stats["tensors_read_sliced"],
             stats["tensors_skipped"],
+            stats["batch_requests"],
+            stats["batch_tensors"],
             _format_gib(stats["remote_stream_bytes_recv"]),
             _format_gib(stats["bytes_tensor_payload"]),
             _format_gib(stats["bytes_full_tensor_payload"]),

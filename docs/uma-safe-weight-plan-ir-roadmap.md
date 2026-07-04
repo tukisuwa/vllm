@@ -2284,3 +2284,20 @@ Gate for B1 completion:
 - Qwen35B remote smoke is repeated against the `143.98s` persistent baseline,
   recording batch count, model-load time, owner read stats, remote stream
   bytes, `buff/cache`, swap, and PSI.
+
+Implementation status (2026-07-04):
+
+- B1 code is in place with a `128 MiB` default batch payload cap and a
+  `16,384` item hard cap.  The executor batches only consecutive full/sliced
+  entries that do not require `read_into_cpu`, `read_segments`, or
+  `target_slices`; unsupported entries continue through the existing
+  per-entry path.
+- The remote wire format now supports ordered multi-tensor payloads while
+  preserving the existing single-tensor frame shape.  Owner-side `read_many`
+  validates item count and total expected payload against the local catalog
+  before issuing any O_DIRECT reads.
+- Loopback coverage now includes real O_DIRECT `read_many` value checks,
+  owner reject-before-read for oversized batches, and an `execute_weight_plan`
+  integration test that verifies three full entries are served by one batch.
+  The remaining B1 gate is the Qwen35B 2-node smoke against the persistent
+  connection baseline.
